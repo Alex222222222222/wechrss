@@ -298,8 +298,14 @@ sampling, quiet-window boundaries, timezone/DST behavior, and interruption
 between page operations. Add a browser-sidecar test that checks the browser's
 reported timezone. Real WeChat access must not be required in CI.
 
-## Current scope
+## Current implementation scope
 
-This initial tree intentionally contains no migrations, route handlers,
+The first implemented slice is the pure pacing and quiet-hours policy in
+`src/domain/pacing.rs`. It validates delay distributions and scroll limits,
+samples bounded delays with injectable randomness, and evaluates local quiet
+windows using IANA timezones. It has no network, browser, database, scheduler,
+or sleeping side effects.
+
+The remaining tree intentionally contains no migrations, route handlers,
 browser calls, database calls, scheduler loops, or business implementation.
-Each Rust file explains the contract it will eventually implement.
+Each remaining Rust file explains the contract it will eventually implement.
