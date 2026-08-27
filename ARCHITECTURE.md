@@ -262,7 +262,8 @@ DATABASE_URL
 WEBDRIVER_URL / BROWSER_ENGINE
 APP_INSTANCE_ID / HTTP_BIND / HTTP_PORT
 APP_TIMEZONE / QUIET_HOURS_START / QUIET_HOURS_END
-JOB_POLL_SECONDS / JOB_LEASE_SECONDS / JOB_MAX_ATTEMPTS
+JOB_POLL_SECONDS / JOB_LEASE_SECONDS / JOB_HEARTBEAT_SECONDS /
+JOB_MAX_ATTEMPTS
 RSS_CACHE_TTL_SECONDS
 PACING_* / SCROLL_*
 ARCHIVE_BACKEND / ARCHIVE_LOCAL_PATH / object-storage settings
@@ -270,10 +271,15 @@ ADMIN_PASSWORD / CREDENTIAL_ENCRYPTION_KEY
 ```
 
 `APP_TIMEZONE` is an IANA timezone name and defaults only when a safe default
-is explicitly documented. Required secrets and connection strings must fail
-startup when absent or invalid. Diagnostics expose names and validation errors,
-never secret values. Environment parsing should use typed deserialization (for
-example, the `envy` dependency) followed by domain validation.
+is explicitly documented. `APP_INSTANCE_ID` may be omitted for local use; the
+loader then generates a random per-process UUID so application replicas do not
+share job-lease ownership. Required secrets and connection strings must fail
+startup when absent or invalid. `JOB_LEASE_SECONDS` must exceed the heartbeat
+interval plus the maximum page-operation duration. Pacing and page-operation
+values have practical upper bounds before conversion to runtime durations.
+Diagnostics expose names and validation errors, never secret values.
+Environment parsing should use typed deserialization (for example, the `envy`
+dependency) followed by domain validation.
 
 ## Security and operations
 
@@ -300,11 +306,12 @@ reported timezone. Real WeChat access must not be required in CI.
 
 ## Current implementation scope
 
-The first implemented slice is the pure pacing and quiet-hours policy in
-`src/domain/pacing.rs`. It validates delay distributions and scroll limits,
-samples bounded delays with injectable randomness, and evaluates local quiet
-windows using IANA timezones. It has no network, browser, database, scheduler,
-or sleeping side effects.
+The first implemented slices are the pure pacing and quiet-hours policy in
+`src/domain/pacing.rs` and the environment-only typed configuration loader in
+`src/config.rs`. They validate delay distributions, scroll limits, URLs,
+durations, secrets, browser settings, and local quiet windows using IANA
+timezones. They have no network, browser, database, scheduler, or sleeping
+side effects.
 
 The remaining tree intentionally contains no migrations, route handlers,
 browser calls, database calls, scheduler loops, or business implementation.
