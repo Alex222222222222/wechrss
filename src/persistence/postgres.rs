@@ -1,13 +1,13 @@
 //! PostgreSQL pool and transaction policy.
 //!
-//! Defines the future SQLx pool configuration, connectivity checks, migration
-//! startup policy, isolation expectations, and graceful shutdown behavior.
+//! Defines the SQLx pool configuration, connectivity checks, embedded schema
+//! migrations, isolation expectations, and graceful shutdown behavior.
 //!
 //! High availability responsibilities include connection-pool sizing,
 //! transaction timeouts, row-lock behavior, and safe use of `FOR UPDATE SKIP
 //! LOCKED` for jobs. It does not define individual repository queries.
 //!
-//! Pool construction will apply the validated minimum and maximum connection
+//! Pool construction applies the validated minimum and maximum connection
 //! counts from `AppConfig` to SQLx `PoolOptions`. PostgreSQL SSL mode, CA/client
 //! certificates, private keys, passwords, and other connection options are not
 //! separate application settings: they remain in `DATABASE_URL` and are passed
@@ -17,9 +17,19 @@
 //! Credentials must be encrypted before they reach this layer.
 
 use secrecy::ExposeSecret;
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{
+    migrate::{MigrateError, Migrator},
+    postgres::PgPoolOptions,
+    PgPool,
+};
 
 use crate::config::AppConfig;
+
+/// Embedded migrations compiled from the repository's `migrations` directory.
+///
+/// The integration-test harness references this same value so tests exercise
+/// the migration set used by application startup.
+pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 /// Builds the SQLx PostgreSQL pool options from validated application settings.
 ///
@@ -45,6 +55,18 @@ pub async fn connect_pool(config: &AppConfig) -> Result<PgPool, sqlx::Error> {
     pool_options(config)
         .connect(config.database_url.expose_secret())
         .await
+}
+
+/// Applies pending checked-in PostgreSQL schema migrations.
+///
+/// SQLx records applied migration versions and checksums in its
+/// `_sqlx_migrations` table, so repeated calls are idempotent and edits to an
+/// already-applied migration are rejected. The helper is intentionally explicit
+/// rather than called by [`connect_pool`], allowing deployment policy to decide
+/// whether migrations run automatically during startup or as a separately
+/// authorized release step.
+pub async fn migrate(pool: &PgPool) -> Result<(), MigrateError> {
+    MIGRATOR.run(pool).await
 }
 
 #[cfg(test)]

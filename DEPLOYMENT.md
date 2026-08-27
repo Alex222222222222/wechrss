@@ -35,6 +35,72 @@ Kubernetes Secret.
 
 ## Kubernetes
 
+### Development PostgreSQL in Kubernetes
+
+The repository's development PostgreSQL manifest is
+`k8s/dev/postgres.yaml`. It creates a single-replica, ephemeral PostgreSQL
+Deployment and ClusterIP Service in the `dev` namespace. It has no persistent
+volume and is for integration testing only; deleting or recreating the Pod
+loses its data. Keep cluster contexts, node names, endpoints, and credentials
+outside the repository.
+
+Create the namespace and its development-only credentials, then apply the
+namespaced workload:
+
+```sh
+kubectl create namespace dev
+kubectl -n dev create secret generic wechrss-postgres-dev \
+  --from-literal=POSTGRES_DB=wechrss \
+  --from-literal=POSTGRES_USER=wechrss \
+  --from-literal=POSTGRES_PASSWORD=wechrss-dev-only
+kubectl apply -f k8s/dev/postgres.yaml
+kubectl -n dev rollout status deployment/wechrss-postgres-dev --timeout=180s
+```
+
+If the namespace or Secret already exists, use the idempotent forms below;
+the Secret command does not print the password:
+
+```sh
+kubectl get namespace dev >/dev/null 2>&1 || kubectl create namespace dev
+kubectl -n dev create secret generic wechrss-postgres-dev \
+  --from-literal=POSTGRES_DB=wechrss \
+  --from-literal=POSTGRES_USER=wechrss \
+  --from-literal=POSTGRES_PASSWORD=wechrss-dev-only \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f k8s/dev/postgres.yaml
+kubectl -n dev rollout status deployment/wechrss-postgres-dev --timeout=180s
+```
+
+Port-forward only the `dev` Service to a local port and run the SQLx test
+harness. `DATABASE_URL` must point to the administrative database connection;
+`#[sqlx::test]` creates an isolated temporary database and applies the checked-
+in migrations automatically:
+
+```sh
+kubectl -n dev port-forward service/wechrss-postgres-dev 55432:5432
+DATABASE_URL='postgresql://wechrss:wechrss-dev-only@127.0.0.1:55432/wechrss' \
+  cargo test --locked --test postgres_job_repository -- --nocapture
+```
+
+Remove the development-only resources when testing is complete:
+
+```sh
+kubectl -n dev delete -f k8s/dev/postgres.yaml
+kubectl -n dev delete secret wechrss-postgres-dev
+```
+
+Delete the namespace only if it was created solely for this test and contains
+no unrelated workloads:
+
+```sh
+kubectl delete namespace dev
+```
+
+Do not use these credentials, the ephemeral storage policy, or this
+port-forward workflow for production. Production PostgreSQL SSL, certificate,
+private-key, password, and related connection options remain in `DATABASE_URL`
+and its query parameters.
+
 For a sidecar in the same Pod, set `TZ` and install `tzdata` in the browser
 image. Do not rely on the node timezone. The application should expose a
 readiness diagnostic that reports its configured timezone and the browser

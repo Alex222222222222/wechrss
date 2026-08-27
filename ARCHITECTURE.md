@@ -1,10 +1,11 @@
 # WechRss Rust Architecture
 
 This document describes the planned Rust implementation of the existing
-`wechrss-main` Python service. The current Rust tree is intentionally a
-documentation-first skeleton: it defines boundaries and ownership without
-implementing network access, browser automation, persistence, scheduling, or
-HTTP behavior.
+`wechrss-main` Python service. The current Rust tree remains intentionally
+incremental: it defines boundaries and ownership, with the domain/configuration
+policies and the first PostgreSQL job-persistence slice implemented while
+network access, browser automation, scheduling, and HTTP behavior remain
+unimplemented.
 
 ## Goals
 
@@ -184,13 +185,25 @@ docker rm --force wechrss-postgres-dev
 docker volume rm wechrss-postgres-dev-data
 ```
 
-The current implementation has no SQL migrations or repository queries, so
-the container currently provides readiness and connection infrastructure only.
-Once migrations and PostgreSQL repositories are implemented, integration tests
-should use an isolated database name/schema, apply migrations explicitly, and
-verify job claiming, lease fencing, recovery, active-job deduplication, and
-feed-cache updates against real PostgreSQL. CI should start an equivalent
-ephemeral service rather than depend on a developer's named volume.
+The current implementation includes the `jobs` migration and PostgreSQL job
+repository. The application uses SQLx's embedded `Migrator` to discover files
+under `migrations/`, record applied versions and checksums in
+`_sqlx_migrations`, and apply only pending migrations. The PostgreSQL
+integration test uses `#[sqlx::test]`, which creates an isolated temporary
+database and applies the application's embedded migrator automatically. Set
+`DATABASE_URL` to a PostgreSQL administrative connection and run it with:
+
+```sh
+export DATABASE_URL='postgresql://wechrss:wechrss-dev-only@127.0.0.1:5432/wechrss'
+cargo test --locked --test postgres_job_repository -- --nocapture
+```
+
+Each successful test run cleans up its temporary database; a failed run may
+leave it in place for diagnosis. The configured PostgreSQL role must be allowed
+to create databases. Future integration tests should use the same harness and
+verify feed-cache updates alongside job claiming, lease fencing, recovery, and
+active-job deduplication. CI should start an equivalent ephemeral service
+rather than depend on a developer's named volume.
 
 Transient browser/network errors use bounded exponential retry. Authentication
 expiry allows one refresh and one retry. Risk-control or verification states
@@ -307,12 +320,13 @@ and refresh credentials are never serialized into API responses or logs.
 
 ## Planned dependencies
 
-The manifest declares architectural dependencies only. Their APIs are not
-used by this skeleton yet.
+The manifest declares the dependencies used by the implemented foundation and
+reserved for the remaining modules.
 
 - Tokio for asynchronous runtime and task coordination.
 - Axum and Tower HTTP middleware for the API boundary.
-- SQLx with PostgreSQL for the pool, transactions, and repositories.
+- SQLx with PostgreSQL for the pool, transactions, repositories, and embedded
+  migrations (`postgres`, `runtime-tokio-rustls`, and `migrate` features).
 - Fantoccini for WebDriver browser sessions.
 - Serde, URL, Base64, and HTML/XML libraries for parsing and rendering.
 - Tracing for structured diagnostics.
@@ -388,13 +402,17 @@ reported timezone. Real WeChat access must not be required in CI.
 
 ## Current implementation scope
 
-The first implemented slices are the pure pacing and quiet-hours policy in
-`src/domain/pacing.rs` and the environment-only typed configuration loader in
-`src/config.rs`. They validate delay distributions, scroll limits, URLs,
-durations, secrets, browser settings, and local quiet windows using IANA
-timezones. They have no network, browser, database, scheduler, or sleeping
-side effects.
+The implemented foundation includes the pure pacing and quiet-hours policy in
+`src/domain/pacing.rs`, the environment-only typed configuration loader in
+`src/config.rs`, SQLx PostgreSQL pool/migration helpers in
+`src/persistence/postgres.rs`, and the domain plus PostgreSQL/in-memory job
+repositories in `src/domain/job.rs` and
+`src/persistence/repositories/job_repository.rs`. The job repository supports
+durable claim leases, fencing, retries, cancellation, recovery, and active-job
+deduplication. The pacing and configuration modules have no network, browser,
+database, scheduler, or sleeping side effects.
 
-The remaining tree intentionally contains no migrations, route handlers,
-browser calls, database queries, scheduler loops, or business implementation.
-Each remaining Rust file explains the contract it will eventually implement.
+The remaining tree intentionally contains no route handlers, browser calls,
+article/source/feed-cache queries, scheduler loops, or business
+implementation. Each remaining Rust file explains the contract it will
+eventually implement.

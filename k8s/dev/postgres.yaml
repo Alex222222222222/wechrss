@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wechrss-postgres-dev
+  namespace: dev
+  labels:
+    app.kubernetes.io/name: wechrss-postgres
+    app.kubernetes.io/part-of: wechrss
+    app.kubernetes.io/component: development-database
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: wechrss-postgres
+      app.kubernetes.io/part-of: wechrss
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wechrss-postgres
+        app.kubernetes.io/part-of: wechrss
+        app.kubernetes.io/component: development-database
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: wechrss-postgres-dev
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: postgres-data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wechrss-postgres-dev
+  namespace: dev
+  labels:
+    app.kubernetes.io/name: wechrss-postgres
+    app.kubernetes.io/part-of: wechrss
+    app.kubernetes.io/component: development-database
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: wechrss-postgres
+    app.kubernetes.io/part-of: wechrss
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP

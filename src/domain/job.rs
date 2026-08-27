@@ -172,9 +172,25 @@ pub struct PersistedJob {
 pub struct LeaseToken(Uuid);
 
 impl LeaseToken {
+    /// Creates a fresh fencing token for a new lease incarnation.
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Wraps a token read from durable storage.
+    pub const fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+
     /// Returns the UUID persisted with the job lease.
     pub const fn as_uuid(self) -> Uuid {
         self.0
+    }
+}
+
+impl Default for LeaseToken {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -383,7 +399,7 @@ impl Job {
             return Err(JobError::AttemptsExhausted);
         }
 
-        let lease_token = LeaseToken(Uuid::new_v4());
+        let lease_token = LeaseToken::new();
         self.attempts += 1;
         self.status = JobStatus::Running;
         self.lease_owner = Some(owner.to_owned());
