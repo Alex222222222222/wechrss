@@ -114,6 +114,54 @@ pub struct NewJob {
     pub now: DateTime<Utc>,
 }
 
+/// Complete job state read from durable storage.
+///
+/// Persistence adapters use this value to rehydrate a [`Job`] without
+/// generating a new identifier or resetting attempts and lease fields. The
+/// conversion is validated so malformed rows cannot silently enter application
+/// orchestration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersistedJob {
+    /// Durable job identifier.
+    pub id: Uuid,
+    /// Kind of work represented by the row.
+    pub job_type: JobType,
+    /// Optional associated source.
+    pub source_id: Option<Uuid>,
+    /// Persisted lifecycle state.
+    pub status: JobStatus,
+    /// Scheduling priority.
+    pub priority: i32,
+    /// Earliest next claim time.
+    pub run_after: DateTime<Utc>,
+    /// Number of claims already made.
+    pub attempts: u32,
+    /// Maximum number of permitted claims.
+    pub max_attempts: u32,
+    /// Instance currently holding the lease.
+    pub lease_owner: Option<String>,
+    /// Fencing token for the current lease.
+    pub lease_token: Option<LeaseToken>,
+    /// Current lease expiry.
+    pub lease_until: Option<DateTime<Utc>>,
+    /// Most recent lease heartbeat.
+    pub heartbeat_at: Option<DateTime<Utc>>,
+    /// First time a worker claimed the job.
+    pub started_at: Option<DateTime<Utc>>,
+    /// Terminal completion time, if any.
+    pub finished_at: Option<DateTime<Utc>>,
+    /// Most recent safe error summary.
+    pub last_error: Option<String>,
+    /// Worker parameters.
+    pub payload: Value,
+    /// Active-job deduplication key.
+    pub dedupe_key: String,
+    /// Insertion timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Most recent mutation timestamp.
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Unforgeable identity for one claim of a job lease.
 ///
 /// The owner identifies an application instance, while this token identifies
@@ -185,6 +233,33 @@ impl Job {
             created_at: spec.now,
             updated_at: spec.now,
         })
+    }
+
+    /// Rehydrates a job from a persisted row while checking state invariants.
+    pub fn from_persisted(record: PersistedJob) -> Result<Self, JobError> {
+        let job = Self {
+            id: record.id,
+            job_type: record.job_type,
+            source_id: record.source_id,
+            status: record.status,
+            priority: record.priority,
+            run_after: record.run_after,
+            attempts: record.attempts,
+            max_attempts: record.max_attempts,
+            lease_owner: record.lease_owner,
+            lease_token: record.lease_token,
+            lease_until: record.lease_until,
+            heartbeat_at: record.heartbeat_at,
+            started_at: record.started_at,
+            finished_at: record.finished_at,
+            last_error: record.last_error,
+            payload: record.payload,
+            dedupe_key: record.dedupe_key,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        };
+        job.validate_persisted_state()?;
+        Ok(job)
     }
 
     /// Returns the immutable job identifier.
@@ -494,6 +569,75 @@ impl Job {
         self.lease_token = None;
         self.lease_until = None;
     }
+
+    fn validate_persisted_state(&self) -> Result<(), JobError> {
+        if self.max_attempts == 0 || self.attempts > self.max_attempts {
+            return Err(JobError::InvalidPersistedState {
+                reason: "attempts must be within a non-zero max_attempts limit",
+            });
+        }
+        if self.dedupe_key.trim().is_empty() {
+            return Err(JobError::InvalidPersistedState {
+                reason: "dedupe_key must not be empty",
+            });
+        }
+
+        let has_lease_owner = self.lease_owner.is_some();
+        let has_lease_token = self.lease_token.is_some();
+        let has_lease_expiry = self.lease_until.is_some();
+        let lease_is_complete = has_lease_owner && has_lease_token && has_lease_expiry;
+        let lease_is_empty = !has_lease_owner && !has_lease_token && !has_lease_expiry;
+
+        match self.status {
+            JobStatus::Running if self.attempts == 0 => Err(JobError::InvalidPersistedState {
+                reason: "running jobs require at least one attempt",
+            }),
+            JobStatus::Running if !lease_is_complete => Err(JobError::InvalidPersistedState {
+                reason: "running jobs require owner, token, and lease expiry",
+            }),
+            JobStatus::Running
+                if self
+                    .lease_owner
+                    .as_deref()
+                    .is_some_and(|owner| owner.trim().is_empty()) =>
+            {
+                Err(JobError::InvalidPersistedState {
+                    reason: "running job lease owner must not be empty",
+                })
+            }
+            JobStatus::Running if self.finished_at.is_some() => {
+                Err(JobError::InvalidPersistedState {
+                    reason: "running jobs cannot have finished_at",
+                })
+            }
+            JobStatus::Queued | JobStatus::RetryWait if !lease_is_empty => {
+                Err(JobError::InvalidPersistedState {
+                    reason: "queued jobs cannot retain a lease",
+                })
+            }
+            JobStatus::Queued | JobStatus::RetryWait if self.finished_at.is_some() => {
+                Err(JobError::InvalidPersistedState {
+                    reason: "non-terminal jobs cannot have finished_at",
+                })
+            }
+            JobStatus::Queued | JobStatus::RetryWait if self.attempts >= self.max_attempts => {
+                Err(JobError::InvalidPersistedState {
+                    reason: "active jobs must have an attempt remaining",
+                })
+            }
+            JobStatus::Succeeded | JobStatus::Failed if !lease_is_empty => {
+                Err(JobError::InvalidPersistedState {
+                    reason: "terminal jobs cannot retain a lease",
+                })
+            }
+            JobStatus::Succeeded | JobStatus::Failed if self.finished_at.is_none() => {
+                Err(JobError::InvalidPersistedState {
+                    reason: "terminal jobs require finished_at",
+                })
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Errors raised when a job violates a domain invariant or transition rule.
@@ -537,6 +681,12 @@ pub enum JobError {
     /// A running job was missing its lease expiry.
     #[error("running job has no lease expiry")]
     LeaseMissing,
+    /// A persisted row violates the job state invariants.
+    #[error("invalid persisted job state: {reason}")]
+    InvalidPersistedState {
+        /// Invariant that the row violated.
+        reason: &'static str,
+    },
     /// A terminal operation needs a non-empty persisted error summary.
     #[error("job error summary must not be empty")]
     EmptyError,
@@ -789,5 +939,73 @@ mod tests {
             .expect("retry-wait job should be cancellable");
         assert_eq!(retry_wait.status(), JobStatus::Failed);
         assert_eq!(retry_wait.finished_at(), Some(at(120)));
+    }
+
+    fn persisted_record(job: &Job) -> PersistedJob {
+        PersistedJob {
+            id: job.id(),
+            job_type: job.job_type(),
+            source_id: job.source_id(),
+            status: job.status(),
+            priority: job.priority(),
+            run_after: job.run_after(),
+            attempts: job.attempts(),
+            max_attempts: job.max_attempts(),
+            lease_owner: job.lease_owner().map(str::to_owned),
+            lease_token: job.lease_token(),
+            lease_until: job.lease_until(),
+            heartbeat_at: job.heartbeat_at(),
+            started_at: job.started_at(),
+            finished_at: job.finished_at(),
+            last_error: job.last_error().map(str::to_owned),
+            payload: job.payload().clone(),
+            dedupe_key: job.dedupe_key().to_owned(),
+            created_at: job.created_at(),
+            updated_at: job.updated_at(),
+        }
+    }
+
+    #[test]
+    fn rehydrates_persisted_state_without_resetting_lease_fields() {
+        let mut job = new_job(2);
+        job.claim(OWNER, at(100), Duration::seconds(30)).unwrap();
+        let record = persisted_record(&job);
+
+        let rehydrated = Job::from_persisted(record).expect("valid row should rehydrate");
+        assert_eq!(rehydrated, job);
+    }
+
+    #[test]
+    fn rejects_malformed_persisted_state() {
+        let job = new_job(2);
+        let mut record = persisted_record(&job);
+        record.status = JobStatus::Running;
+
+        assert!(matches!(
+            Job::from_persisted(record),
+            Err(JobError::InvalidPersistedState { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_persisted_jobs_with_no_valid_attempt_remaining() {
+        let job = new_job(1);
+        let mut queued = persisted_record(&job);
+        queued.attempts = queued.max_attempts;
+        assert!(matches!(
+            Job::from_persisted(queued),
+            Err(JobError::InvalidPersistedState { .. })
+        ));
+
+        let mut running = persisted_record(&job);
+        running.status = JobStatus::Running;
+        running.attempts = 0;
+        running.lease_owner = Some(OWNER.to_owned());
+        running.lease_token = Some(LeaseToken(Uuid::new_v4()));
+        running.lease_until = Some(at(130));
+        assert!(matches!(
+            Job::from_persisted(running),
+            Err(JobError::InvalidPersistedState { .. })
+        ));
     }
 }
