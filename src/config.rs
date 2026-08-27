@@ -13,6 +13,7 @@
 //!
 //! ```text
 //! DATABASE_URL
+//! DATABASE_POOL_MIN_CONNECTIONS / DATABASE_POOL_MAX_CONNECTIONS
 //! WEBDRIVER_URL / BROWSER_ENGINE
 //! APP_INSTANCE_ID / HTTP_BIND / HTTP_PORT
 //! APP_TIMEZONE / QUIET_HOURS_START / QUIET_HOURS_END
@@ -29,6 +30,11 @@
 //! lease must exceed the heartbeat interval plus the maximum page-operation
 //! duration. Pacing delays and page-operation duration are also capped by the
 //! loader before they can be converted to runtime durations.
+//!
+//! PostgreSQL SSL mode, CA certificates, client certificates, private keys,
+//! passwords, and other connection options belong in `DATABASE_URL` (including
+//! its query parameters) and are passed through to SQLx. This module should not
+//! introduce separate PostgreSQL SSL or certificate environment variables.
 //!
 //! Kubernetes ConfigMaps and Secrets may inject these values, but the
 //! application still consumes them through its environment. Diagnostics must
@@ -101,6 +107,10 @@ pub enum ConfigError {
 pub struct AppConfig {
     /// PostgreSQL URL, retained as a secret because it may contain a password.
     pub database_url: SecretString,
+    /// Minimum number of PostgreSQL connections kept in the pool.
+    pub database_pool_min_connections: u32,
+    /// Maximum number of PostgreSQL connections allowed in the pool.
+    pub database_pool_max_connections: u32,
     /// Internal WebDriver endpoint.
     pub webdriver_url: Url,
     /// Browser implementation expected behind the WebDriver endpoint.
@@ -168,6 +178,21 @@ impl AppConfig {
             return Err(ConfigError::InvalidValue {
                 variable: "DATABASE_URL",
                 reason: "expected a postgres or postgresql URL scheme",
+            });
+        }
+
+        let database_pool_min_connections = raw.database_pool_min_connections.unwrap_or(1);
+        let database_pool_max_connections = raw.database_pool_max_connections.unwrap_or(10);
+        if database_pool_max_connections == 0 {
+            return Err(ConfigError::InvalidValue {
+                variable: "DATABASE_POOL_MAX_CONNECTIONS",
+                reason: "must be greater than zero",
+            });
+        }
+        if database_pool_min_connections > database_pool_max_connections {
+            return Err(ConfigError::InvalidValue {
+                variable: "DATABASE_POOL_MIN_CONNECTIONS",
+                reason: "must not exceed DATABASE_POOL_MAX_CONNECTIONS",
             });
         }
 
@@ -326,6 +351,8 @@ impl AppConfig {
 
         Ok(Self {
             database_url: SecretString::new(database_url.into_boxed_str()),
+            database_pool_min_connections,
+            database_pool_max_connections,
             webdriver_url,
             browser_engine,
             instance_id: raw
@@ -358,6 +385,8 @@ impl AppConfig {
 #[derive(Debug, Deserialize, Default)]
 struct RawConfig {
     database_url: Option<String>,
+    database_pool_min_connections: Option<u32>,
+    database_pool_max_connections: Option<u32>,
     webdriver_url: Option<String>,
     browser_engine: Option<String>,
     app_instance_id: Option<String>,
@@ -469,6 +498,8 @@ mod tests {
             ("DATABASE_URL", "postgres://user:password@db/wechrss"),
             ("CREDENTIAL_ENCRYPTION_KEY", "test-encryption-key"),
             ("WEBDRIVER_URL", "http://webdriver:4444"),
+            ("DATABASE_POOL_MIN_CONNECTIONS", "2"),
+            ("DATABASE_POOL_MAX_CONNECTIONS", "12"),
             ("APP_TIMEZONE", "Asia/Shanghai"),
             ("QUIET_HOURS_START", "23:00"),
             ("QUIET_HOURS_END", "07:00"),
@@ -503,6 +534,8 @@ mod tests {
         let config = AppConfig::from_env_iter(valid_environment()).unwrap();
 
         assert_eq!(config.browser_engine, BrowserEngine::Chromium);
+        assert_eq!(config.database_pool_min_connections, 2);
+        assert_eq!(config.database_pool_max_connections, 12);
         assert_eq!(config.http_bind, "0.0.0.0");
         assert_eq!(config.http_port, 8088);
         assert_eq!(config.timezone, chrono_tz::Asia::Shanghai);
@@ -608,6 +641,29 @@ mod tests {
             AppConfig::from_env_iter(environment),
             Err(ConfigError::InvalidValue {
                 variable: "DATABASE_URL",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_database_pool_ranges() {
+        let environment =
+            replace_environment(valid_environment(), "DATABASE_POOL_MIN_CONNECTIONS", "13");
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "DATABASE_POOL_MIN_CONNECTIONS",
+                ..
+            })
+        ));
+
+        let environment =
+            replace_environment(valid_environment(), "DATABASE_POOL_MAX_CONNECTIONS", "0");
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "DATABASE_POOL_MAX_CONNECTIONS",
                 ..
             })
         ));

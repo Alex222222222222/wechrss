@@ -259,6 +259,7 @@ categories:
 
 ```text
 DATABASE_URL
+DATABASE_POOL_MIN_CONNECTIONS / DATABASE_POOL_MAX_CONNECTIONS
 WEBDRIVER_URL / BROWSER_ENGINE
 APP_INSTANCE_ID / HTTP_BIND / HTTP_PORT
 APP_TIMEZONE / QUIET_HOURS_START / QUIET_HOURS_END
@@ -280,6 +281,14 @@ values have practical upper bounds before conversion to runtime durations.
 Diagnostics expose names and validation errors, never secret values.
 Environment parsing should use typed deserialization (for example, the `envy`
 dependency) followed by domain validation.
+
+PostgreSQL pool sizing is configured with
+`DATABASE_POOL_MIN_CONNECTIONS` and `DATABASE_POOL_MAX_CONNECTIONS`, then
+applied to SQLx `PoolOptions`. All PostgreSQL SSL, certificate, private-key,
+password, and related connection settings are carried through `DATABASE_URL`
+and its query parameters. The application does not define separate PostgreSQL
+SSL/certificate environment variables and must pass the URL through to SQLx
+without exposing it in logs.
 
 ## Security and operations
 
