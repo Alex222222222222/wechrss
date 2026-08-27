@@ -41,14 +41,11 @@
 //! and job completion within the transaction boundaries defined by the
 //! application layer.
 
-use std::{
-    cmp::Ordering,
-    collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard},
-};
+use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
+use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 use crate::domain::job::{Job, JobError, JobStatus, LeaseToken, NewJob};
@@ -276,12 +273,6 @@ impl MemoryJobRepository {
         Self::default()
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, HashMap<Uuid, Job>>, JobRepositoryError> {
-        self.jobs
-            .lock()
-            .map_err(|_| JobRepositoryError::Storage("job store lock poisoned".to_owned()))
-    }
-
     fn get_mut(
         jobs: &mut HashMap<Uuid, Job>,
         job_id: Uuid,
@@ -432,11 +423,7 @@ impl std::fmt::Debug for MemoryJobRepository {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("MemoryJobRepository")
-            .field(
-                "jobs",
-                &self.jobs.lock().map(|jobs| jobs.len()).unwrap_or(0),
-            )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -482,7 +469,7 @@ impl JobRepository for MemoryJobRepository {
     type Transaction<'a> = MemoryJobTransaction<'a>;
 
     async fn begin(&self) -> Result<Self::Transaction<'_>, JobRepositoryError> {
-        let guard = self.lock()?;
+        let guard = self.jobs.lock().await;
         let backup = guard.clone();
         Ok(MemoryJobTransaction {
             guard: Some(guard),
@@ -492,7 +479,7 @@ impl JobRepository for MemoryJobRepository {
     }
 
     async fn enqueue(&self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError> {
-        let mut jobs = self.lock()?;
+        let mut jobs = self.jobs.lock().await;
         enqueue_in_store(&mut jobs, spec)
     }
 
@@ -502,7 +489,7 @@ impl JobRepository for MemoryJobRepository {
         now: DateTime<Utc>,
         lease_for: Duration,
     ) -> Result<Option<JobLease>, JobRepositoryError> {
-        let mut jobs = self.lock()?;
+        let mut jobs = self.jobs.lock().await;
         claim_next_in_store(&mut jobs, owner, now, lease_for)
     }
 
@@ -514,7 +501,7 @@ impl JobRepository for MemoryJobRepository {
         now: DateTime<Utc>,
         lease_for: Duration,
     ) -> Result<Job, JobRepositoryError> {
-        let mut jobs = self.lock()?;
+        let mut jobs = self.jobs.lock().await;
         heartbeat_in_store(&mut jobs, job_id, owner, token, now, lease_for)
     }
 
@@ -525,7 +512,7 @@ impl JobRepository for MemoryJobRepository {
         token: LeaseToken,
         now: DateTime<Utc>,
     ) -> Result<Job, JobRepositoryError> {
-        let mut jobs = self.lock()?;
+        let mut jobs = self.jobs.lock().await;
         succeed_in_store(&mut jobs, job_id, owner, token, now)
     }
 
@@ -538,7 +525,7 @@ impl JobRepository for MemoryJobRepository {
         retry_at: DateTime<Utc>,
         error: &str,
     ) -> Result<Job, JobRepositoryError> {
-        let mut jobs = self.lock()?;
+        let mut jobs = self.jobs.lock().await;
         retry_in_store(&mut jobs, job_id, owner, token, now, retry_at, error)
     }
 
@@ -550,7 +537,7 @@ impl JobRepository for MemoryJobRepository {
         now: DateTime<Utc>,
         error: &str,
     ) -> Result<Job, JobRepositoryError> {
-        let mut jobs = self.lock()?;
+        let mut jobs = self.jobs.lock().await;
         fail_in_store(&mut jobs, job_id, owner, token, now, error)
     }
 
@@ -560,7 +547,7 @@ impl JobRepository for MemoryJobRepository {
         now: DateTime<Utc>,
         reason: &str,
     ) -> Result<Job, JobRepositoryError> {
-        let mut jobs = self.lock()?;
+        let mut jobs = self.jobs.lock().await;
         cancel_in_store(&mut jobs, job_id, now, reason)
     }
 
@@ -569,12 +556,12 @@ impl JobRepository for MemoryJobRepository {
         now: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<Job>, JobRepositoryError> {
-        let mut jobs = self.lock()?;
+        let mut jobs = self.jobs.lock().await;
         Ok(recover_expired_in_store(&mut jobs, now, limit))
     }
 
     async fn find(&self, job_id: Uuid) -> Result<Option<Job>, JobRepositoryError> {
-        Ok(self.lock()?.get(&job_id).cloned())
+        Ok(self.jobs.lock().await.get(&job_id).cloned())
     }
 }
 
