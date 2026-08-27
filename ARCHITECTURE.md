@@ -121,6 +121,77 @@ queued -> running -> retry_wait -> running
 queued/running -> failed
 ```
 
+## Local PostgreSQL development
+
+PostgreSQL can be run locally as a disposable or persistent Docker container.
+This is intended for repository integration tests and manual development; it
+is not a production database deployment. The application and future migration
+tests should connect through the same `DATABASE_URL` path used in Kubernetes.
+
+Create a named volume and start a development-only PostgreSQL instance:
+
+```sh
+docker volume create wechrss-postgres-dev-data
+docker run --detach \
+  --name wechrss-postgres-dev \
+  --env POSTGRES_USER=wechrss \
+  --env POSTGRES_PASSWORD=wechrss-dev-only \
+  --env POSTGRES_DB=wechrss \
+  --publish 5432:5432 \
+  --volume wechrss-postgres-dev-data:/var/lib/postgresql/data \
+  --health-cmd='pg_isready -U wechrss -d wechrss' \
+  --health-interval=2s \
+  --health-timeout=5s \
+  --health-retries=15 \
+  postgres:16-alpine
+```
+
+Wait until the container reports healthy before starting the application:
+
+```sh
+docker inspect --format '{{.State.Health.Status}}' wechrss-postgres-dev
+```
+
+For local development, configure the process with environment variables. The
+password below is intentionally a development-only example:
+
+```sh
+export DATABASE_URL='postgresql://wechrss:wechrss-dev-only@127.0.0.1:5432/wechrss'
+export DATABASE_POOL_MIN_CONNECTIONS=1
+export DATABASE_POOL_MAX_CONNECTIONS=5
+```
+
+All PostgreSQL SSL modes, CA certificates, client certificates, private keys,
+passwords, and related connection options must remain in `DATABASE_URL` and
+its query parameters. The Rust process passes this URL to SQLx unchanged; it
+does not add separate PostgreSQL SSL environment variables. A local container
+normally runs without TLS, so production credentials and certificate paths
+must not be copied from this example.
+
+The container can be stopped and restarted without losing data because the
+named volume is separate from the container:
+
+```sh
+docker stop wechrss-postgres-dev
+docker start wechrss-postgres-dev
+```
+
+When the local database is no longer needed, remove the container and, only if
+the development data is disposable, remove its volume too:
+
+```sh
+docker rm --force wechrss-postgres-dev
+docker volume rm wechrss-postgres-dev-data
+```
+
+The current implementation has no SQL migrations or repository queries, so
+the container currently provides readiness and connection infrastructure only.
+Once migrations and PostgreSQL repositories are implemented, integration tests
+should use an isolated database name/schema, apply migrations explicitly, and
+verify job claiming, lease fencing, recovery, active-job deduplication, and
+feed-cache updates against real PostgreSQL. CI should start an equivalent
+ephemeral service rather than depend on a developer's named volume.
+
 Transient browser/network errors use bounded exponential retry. Authentication
 expiry allows one refresh and one retry. Risk-control or verification states
 stop the job and mark the source for operator attention; they do not trigger a
@@ -325,5 +396,5 @@ timezones. They have no network, browser, database, scheduler, or sleeping
 side effects.
 
 The remaining tree intentionally contains no migrations, route handlers,
-browser calls, database calls, scheduler loops, or business implementation.
+browser calls, database queries, scheduler loops, or business implementation.
 Each remaining Rust file explains the contract it will eventually implement.
