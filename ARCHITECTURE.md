@@ -102,14 +102,16 @@ The planned `jobs` table represents individual executions and contains:
 
 ```text
 id, job_type, source_id, status, priority, run_after, attempts,
-max_attempts, lease_owner, lease_until, heartbeat_at, started_at,
+max_attempts, lease_owner, lease_token, lease_until, heartbeat_at, started_at,
 finished_at, last_error, payload_json, dedupe_key, created_at, updated_at
 ```
 
 Active-job deduplication uses a partial unique index over `dedupe_key` for
 `queued`, `running`, and `retry_wait` jobs. Workers claim jobs with
-`SELECT ... FOR UPDATE SKIP LOCKED`, set an instance-specific lease, and
-periodically extend it. Expired leases are returned to the queue.
+`SELECT ... FOR UPDATE SKIP LOCKED`, set an instance-specific lease and a new
+per-claim fencing token, and periodically extend it. Heartbeats and terminal
+updates must compare both the owner and token so an old worker cannot mutate a
+later claim by the same instance. Expired leases are returned to the queue.
 
 Expected state transitions:
 
