@@ -1,0 +1,30 @@
+[package]
+name = "wechrss"
+version = "0.1.0"
+edition = "2021"
+description = "Architecture skeleton for a browser-driven WeChat public-account RSS service"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+askama = "0.14"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+envy = "0.4"
+fantoccini = "0.22"
+quick-xml = "0.37"
+rand = "0.9"
+rand_distr = "0.5"
+scraper = "0.22"
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid", "json"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
