@@ -73,10 +73,12 @@ timezone, such as `Asia/Shanghai`.
 1. Any instance finds due sources and inserts a deduplicated job.
 2. A worker claims one queued job with a PostgreSQL row lock and lease.
 3. The quiet-hours policy is checked before any upstream work begins.
-4. The browser adapter loads the WeRead/account context and article list,
-   applying the pacing policy between upstream operations.
-5. Article pages are fetched, with bounded waits and controlled scrolls for
-   lazy-loaded content, then normalized into metadata, HTML, and assets.
+4. The authenticated WeRead adapter loads the account context and article
+   list, applying the pacing policy between upstream operations.
+5. Each article URL is fetched separately from the public WeChat article page.
+   This content fetch does not receive WeRead credentials and does not depend
+   on the account login; it uses bounded waits and controlled scrolls for
+   lazy-loaded content, then normalizes metadata, HTML, and assets.
 6. HTML is sanitized and asset URLs are rewritten to local archive URLs.
 7. Articles and archive records are upserted transactionally.
 8. The source feed is rendered and written to `feed_cache`.
@@ -288,11 +290,13 @@ transitions.
 ### Acquisition
 
 Browser and WeRead protocol adapters. Fantoccini/WebDriver details are confined
-here. Identity resolution, account authentication, article listing, and
-rendered article extraction expose typed results and typed acquisition errors
-to the application layer. The pacing module is the only owner of randomized
-wait generation and scroll policy; individual adapters must not invent their
-own delays.
+here. The existing Python fetching path does not include article-content
+fetching, so Rust keeps the two upstream paths explicit: WeRead credentials are
+used only for account/session and article-list operations, while the rendered
+article-page adapter fetches public article content without credentials. Neither
+adapter exposes raw protocol details to the application layer. The pacing module
+is the only owner of randomized wait generation and scroll policy; individual
+adapters must not invent their own delays.
 
 ### Persistence
 

@@ -2,7 +2,9 @@
 //!
 //! Encapsulates the upstream login/session context, QR exchange, refresh-token
 //! lifecycle, article-list responses, article-detail URL recovery, and current
-//! plus legacy response-shape parsing.
+//! plus legacy response-shape parsing. It does not fetch rendered article
+//! content; that is a separate public, unauthenticated operation in
+//! [`super::article_page`].
 //!
 //! The adapter is browser-driven by default in this design: protocol requests
 //! requiring browser cookies or session state execute through the browser
