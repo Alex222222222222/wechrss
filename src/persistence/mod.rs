@@ -8,6 +8,9 @@
 //! credentials, jobs, sync runs, and feed cache. Transactions must group
 //! article/archive changes, cache rebuilds, source status, and job completion
 //! where practical.
+//!
+//! The first implemented persistence slice is the PostgreSQL pool factory in
+//! [`postgres`]. Repository traits and SQL queries remain future work.
 
 pub mod postgres;
 pub mod repositories;
