@@ -1,5 +1,4 @@
 -- Durable job queue used by every application replica.
---
 -- The application passes job_type and status as their stable snake_case text
 -- representation. A later migration may add new values, but changing or
 -- removing values requires an explicit data migration.
@@ -16,11 +15,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     ),
     source_id UUID,
     status TEXT NOT NULL CHECK (
-        status IN ('queued', 'running', 'retry_wait', 'succeeded', 'failed')
+        status IN ('queued', 'running', 'retry_wait', 'deferred', 'succeeded', 'failed')
     ),
     priority INTEGER NOT NULL,
     run_after TIMESTAMPTZ NOT NULL,
-    attempts BIGINT NOT NULL CHECK (attempts >= 0),
+    claim_count BIGINT NOT NULL CHECK (claim_count >= 0),
+    failure_count BIGINT NOT NULL CHECK (failure_count >= 0),
     max_attempts BIGINT NOT NULL CHECK (max_attempts > 0),
     lease_owner TEXT,
     lease_token UUID,
@@ -36,8 +36,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     CHECK (
         (
             status = 'running'
-            AND attempts > 0
-            AND attempts <= max_attempts
+            AND claim_count > 0
+            AND failure_count < max_attempts
             AND lease_owner IS NOT NULL
             AND btrim(lease_owner) <> ''
             AND lease_token IS NOT NULL
@@ -47,8 +47,8 @@ CREATE TABLE IF NOT EXISTS jobs (
             AND finished_at IS NULL
         )
         OR (
-            status IN ('queued', 'retry_wait')
-            AND attempts < max_attempts
+            status IN ('queued', 'retry_wait', 'deferred')
+            AND failure_count < max_attempts
             AND lease_owner IS NULL
             AND lease_token IS NULL
             AND lease_until IS NULL
@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS jobs (
         )
         OR (
             status = 'succeeded'
-            AND attempts > 0
+            AND claim_count > 0
+            AND failure_count < max_attempts
             AND lease_owner IS NULL
             AND lease_token IS NULL
             AND lease_until IS NULL
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS jobs (
         )
         OR (
             status = 'failed'
+            AND failure_count <= max_attempts
             AND lease_owner IS NULL
             AND lease_token IS NULL
             AND lease_until IS NULL
@@ -75,11 +77,11 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedupe_key_idx
     ON jobs (dedupe_key)
-    WHERE status IN ('queued', 'running', 'retry_wait');
+    WHERE status IN ('queued', 'running', 'retry_wait', 'deferred');
 
 CREATE INDEX IF NOT EXISTS jobs_claim_idx
     ON jobs (priority DESC, run_after ASC, created_at ASC, id ASC)
-    WHERE status IN ('queued', 'retry_wait');
+    WHERE status IN ('queued', 'retry_wait', 'deferred');
 
 CREATE INDEX IF NOT EXISTS jobs_expired_lease_idx
     ON jobs (lease_until ASC, id ASC)

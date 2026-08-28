@@ -27,19 +27,17 @@
 //! queued -> running -> succeeded
 //! queued -> running -> retry_wait -> running
 //! queued -> running -> deferred -> running
-//! queued/retry_wait -> failed (cancelled)
+//! queued/retry_wait/deferred -> failed (cancelled)
 //! running -> failed
 //! running (expired lease) -> queued | failed
 //! ```
 //!
-//! The target model separates durable claim observability from the retry
-//! failure budget. `claim_count` increments whenever ownership is granted;
-//! `failure_count` increments only for a retryable execution failure and is
-//! compared with `max_attempts`. A quiet-hours transition enters `deferred`,
-//! sets `run_after`, and changes neither failure count nor terminal outcome.
-//! The currently implemented first slice still uses `attempts` as a claim count;
-//! `TODO(design)` markers identify the domain and migration work needed before
-//! quiet-hours deferral is implemented.
+//! The model separates durable claim observability from the retry failure
+//! budget. `claim_count` increments whenever ownership is granted;
+//! `failure_count` increments only for a retryable execution failure or an
+//! expired lease and is compared with `max_attempts`. A quiet-hours transition
+//! enters `deferred`, sets `run_after`, and changes neither counter nor the
+//! terminal outcome.
 //!
 //! High availability depends on two layers. PostgreSQL must atomically claim a
 //! due row using `FOR UPDATE SKIP LOCKED` and persist the lease owner, fencing
@@ -52,8 +50,9 @@
 //! Domain transitions accept an explicit timestamp to remain pure and
 //! deterministic. In production that timestamp is supplied by the PostgreSQL
 //! repository's statement-local server clock, not by the application replica.
-//! The in-memory repository uses an injectable test clock after the corrected
-//! repository contract is implemented.
+//! The interim in-memory repository accepts an explicit test timestamp; the
+//! production repository ignores that compatibility timestamp for distributed
+//! lease decisions and uses PostgreSQL time instead.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -85,18 +84,21 @@ pub enum JobStatus {
     Running,
     /// Work waiting until `run_after` for another attempt.
     RetryWait,
+    /// Work intentionally postponed without consuming failure budget.
+    Deferred,
     /// Work completed successfully.
     Succeeded,
-    /// Work stopped permanently or exhausted its attempts.
+    /// Work stopped permanently or exhausted its failure budget.
     Failed,
-    // TODO(design): add Deferred as an active, non-failure state in the domain,
-    // SQL mappings, claim query, active dedupe index, and a new migration.
 }
 
 impl JobStatus {
     /// Returns whether the status can be selected as active work.
     pub const fn is_active(self) -> bool {
-        matches!(self, Self::Queued | Self::Running | Self::RetryWait)
+        matches!(
+            self,
+            Self::Queued | Self::Running | Self::RetryWait | Self::Deferred
+        )
     }
 
     /// Returns whether no further worker transition is expected.
@@ -116,7 +118,7 @@ pub struct NewJob {
     pub priority: i32,
     /// Earliest time at which a worker may claim the job.
     pub run_after: DateTime<Utc>,
-    /// Maximum number of claims, including the first claim.
+    /// Maximum number of retryable failures before the job becomes terminal.
     pub max_attempts: u32,
     /// Typed job parameters. Secrets must not be placed in this payload.
     pub payload: Value,
@@ -129,7 +131,7 @@ pub struct NewJob {
 /// Complete job state read from durable storage.
 ///
 /// Persistence adapters use this value to rehydrate a [`Job`] without
-/// generating a new identifier or resetting attempts and lease fields. The
+/// generating a new identifier or resetting counters and lease fields. The
 /// conversion is validated so malformed rows cannot silently enter application
 /// orchestration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -146,9 +148,11 @@ pub struct PersistedJob {
     pub priority: i32,
     /// Earliest next claim time.
     pub run_after: DateTime<Utc>,
-    /// Number of claims already made.
-    pub attempts: u32,
-    /// Maximum number of permitted claims.
+    /// Number of claims already made, including claims after deferral.
+    pub claim_count: u32,
+    /// Number of retryable failures already recorded.
+    pub failure_count: u32,
+    /// Maximum number of permitted retryable failures.
     pub max_attempts: u32,
     /// Instance currently holding the lease.
     pub lease_owner: Option<String>,
@@ -215,7 +219,8 @@ pub struct Job {
     status: JobStatus,
     priority: i32,
     run_after: DateTime<Utc>,
-    attempts: u32,
+    claim_count: u32,
+    failure_count: u32,
     max_attempts: u32,
     lease_owner: Option<String>,
     lease_token: Option<LeaseToken>,
@@ -247,7 +252,8 @@ impl Job {
             status: JobStatus::Queued,
             priority: spec.priority,
             run_after: spec.run_after,
-            attempts: 0,
+            claim_count: 0,
+            failure_count: 0,
             max_attempts: spec.max_attempts,
             lease_owner: None,
             lease_token: None,
@@ -272,7 +278,8 @@ impl Job {
             status: record.status,
             priority: record.priority,
             run_after: record.run_after,
-            attempts: record.attempts,
+            claim_count: record.claim_count,
+            failure_count: record.failure_count,
             max_attempts: record.max_attempts,
             lease_owner: record.lease_owner,
             lease_token: record.lease_token,
@@ -321,11 +328,16 @@ impl Job {
     }
 
     /// Returns the number of worker claims made so far.
-    pub const fn attempts(&self) -> u32 {
-        self.attempts
+    pub const fn claim_count(&self) -> u32 {
+        self.claim_count
     }
 
-    /// Returns the maximum number of claims permitted.
+    /// Returns the number of retryable failures recorded so far.
+    pub const fn failure_count(&self) -> u32 {
+        self.failure_count
+    }
+
+    /// Returns the maximum number of retryable failures permitted.
     pub const fn max_attempts(&self) -> u32 {
         self.max_attempts
     }
@@ -385,7 +397,7 @@ impl Job {
         self.updated_at
     }
 
-    /// Claims a due queued or retry-wait job for one application instance.
+    /// Claims a due active job for one application instance.
     ///
     /// The repository must perform the due-row selection and update under a
     /// PostgreSQL lock. This method is the second line of defense and updates
@@ -398,7 +410,10 @@ impl Job {
     ) -> Result<LeaseToken, JobError> {
         validate_owner(owner)?;
         let lease_until = lease_expiry(now, lease_for)?;
-        if !matches!(self.status, JobStatus::Queued | JobStatus::RetryWait) {
+        if !matches!(
+            self.status,
+            JobStatus::Queued | JobStatus::RetryWait | JobStatus::Deferred
+        ) {
             return Err(JobError::InvalidTransition {
                 status: self.status,
                 operation: "claim",
@@ -407,14 +422,15 @@ impl Job {
         if self.run_after > now {
             return Err(JobError::NotDue);
         }
-        if self.attempts >= self.max_attempts {
+        if self.failure_count >= self.max_attempts {
             return Err(JobError::AttemptsExhausted);
         }
 
         let lease_token = LeaseToken::new();
-        // TODO(design): increment claim_count here instead. Retryable failures,
-        // not claims or quiet-hours deferrals, must consume max_attempts.
-        self.attempts += 1;
+        self.claim_count = self
+            .claim_count
+            .checked_add(1)
+            .ok_or(JobError::ClaimCountOverflow)?;
         self.status = JobStatus::Running;
         self.lease_owner = Some(owner.to_owned());
         self.lease_token = Some(lease_token);
@@ -424,6 +440,32 @@ impl Job {
         self.finished_at = None;
         self.updated_at = now;
         Ok(lease_token)
+    }
+
+    /// Defers a live job without consuming retry budget.
+    ///
+    /// This is used for quiet hours and other non-failure eligibility gates.
+    /// The caller supplies the next eligible instant after evaluating its
+    /// timezone policy; the lease itself is still fenced exactly like a retry.
+    pub fn defer(
+        &mut self,
+        owner: &str,
+        token: LeaseToken,
+        now: DateTime<Utc>,
+        resume_at: DateTime<Utc>,
+    ) -> Result<(), JobError> {
+        validate_owner(owner)?;
+        if resume_at <= now {
+            return Err(JobError::InvalidDeferralTime);
+        }
+        self.ensure_live_owner(owner, token, now, "defer")?;
+        self.status = JobStatus::Deferred;
+        self.run_after = resume_at;
+        self.clear_lease();
+        self.last_error = None;
+        self.finished_at = None;
+        self.updated_at = now;
+        Ok(())
     }
 
     /// Extends a live lease for its current owner.
@@ -460,7 +502,7 @@ impl Job {
         Ok(())
     }
 
-    /// Records a retry or turns the job terminal when attempts are exhausted.
+    /// Records a retry or turns the job terminal when failures are exhausted.
     ///
     /// The returned status tells the application service whether it should
     /// enqueue future work (`RetryWait`) or record a terminal failure
@@ -483,9 +525,11 @@ impl Job {
         self.clear_lease();
         self.updated_at = now;
 
-        // TODO(design): compare/increment failure_count in the corrected model;
-        // add a separate defer transition that never reaches this branch.
-        if self.attempts >= self.max_attempts {
+        self.failure_count = self
+            .failure_count
+            .checked_add(1)
+            .ok_or(JobError::FailureCountOverflow)?;
+        if self.failure_count >= self.max_attempts {
             self.status = JobStatus::Failed;
             self.finished_at = Some(now);
             Ok(JobStatus::Failed)
@@ -517,7 +561,7 @@ impl Job {
 
     /// Cancels an unclaimed job and records a terminal failure reason.
     ///
-    /// Queued and retry-wait jobs have no worker owner, so cancellation is an
+    /// Queued, retry-wait, and deferred jobs have no worker owner, so cancellation is an
     /// ownerless administrative transition. Running jobs must use [`Self::fail`]
     /// with their current lease token, preventing an operator action from
     /// racing an active worker without repository-level authorization.
@@ -527,7 +571,10 @@ impl Job {
         reason: impl Into<String>,
     ) -> Result<(), JobError> {
         let reason = nonempty_error(reason)?;
-        if !matches!(self.status, JobStatus::Queued | JobStatus::RetryWait) {
+        if !matches!(
+            self.status,
+            JobStatus::Queued | JobStatus::RetryWait | JobStatus::Deferred
+        ) {
             return Err(JobError::InvalidTransition {
                 status: self.status,
                 operation: "cancel",
@@ -545,8 +592,9 @@ impl Job {
     ///
     /// Returns `true` when this call changed the job. A live job and a job that
     /// has already been recovered both return `false`, which makes a locked
-    /// recovery pass naturally idempotent. Jobs with attempts remaining return
-    /// to `queued`; jobs at the attempt limit become terminal `failed`.
+    /// recovery pass naturally idempotent. Expired ownership consumes one
+    /// failure budget unit: jobs with failure budget remaining return to
+    /// `queued`, while exhausted jobs become terminal `failed`.
     pub fn recover_expired_lease(&mut self, now: DateTime<Utc>) -> bool {
         if self.status != JobStatus::Running
             || self
@@ -560,7 +608,8 @@ impl Job {
         self.run_after = now;
         self.last_error = Some("worker lease expired".to_owned());
         self.updated_at = now;
-        if self.attempts >= self.max_attempts {
+        self.failure_count = self.failure_count.saturating_add(1);
+        if self.failure_count >= self.max_attempts {
             self.status = JobStatus::Failed;
             self.finished_at = Some(now);
         } else {
@@ -603,9 +652,9 @@ impl Job {
     }
 
     fn validate_persisted_state(&self) -> Result<(), JobError> {
-        if self.max_attempts == 0 || self.attempts > self.max_attempts {
+        if self.max_attempts == 0 || self.failure_count > self.max_attempts {
             return Err(JobError::InvalidPersistedState {
-                reason: "attempts must be within a non-zero max_attempts limit",
+                reason: "failure_count must be within a non-zero max_attempts limit",
             });
         }
         if self.dedupe_key.trim().is_empty() {
@@ -621,8 +670,8 @@ impl Job {
         let lease_is_empty = !has_lease_owner && !has_lease_token && !has_lease_expiry;
 
         match self.status {
-            JobStatus::Running if self.attempts == 0 => Err(JobError::InvalidPersistedState {
-                reason: "running jobs require at least one attempt",
+            JobStatus::Running if self.claim_count == 0 => Err(JobError::InvalidPersistedState {
+                reason: "running jobs require at least one claim",
             }),
             JobStatus::Running if !lease_is_complete => Err(JobError::InvalidPersistedState {
                 reason: "running jobs require owner, token, and lease expiry",
@@ -642,19 +691,28 @@ impl Job {
                     reason: "running jobs cannot have finished_at",
                 })
             }
-            JobStatus::Queued | JobStatus::RetryWait if !lease_is_empty => {
+            JobStatus::Running if self.failure_count >= self.max_attempts => {
+                Err(JobError::InvalidPersistedState {
+                    reason: "running jobs must have failure budget remaining",
+                })
+            }
+            JobStatus::Queued | JobStatus::RetryWait | JobStatus::Deferred if !lease_is_empty => {
                 Err(JobError::InvalidPersistedState {
                     reason: "queued jobs cannot retain a lease",
                 })
             }
-            JobStatus::Queued | JobStatus::RetryWait if self.finished_at.is_some() => {
+            JobStatus::Queued | JobStatus::RetryWait | JobStatus::Deferred
+                if self.finished_at.is_some() =>
+            {
                 Err(JobError::InvalidPersistedState {
                     reason: "non-terminal jobs cannot have finished_at",
                 })
             }
-            JobStatus::Queued | JobStatus::RetryWait if self.attempts >= self.max_attempts => {
+            JobStatus::Queued | JobStatus::RetryWait | JobStatus::Deferred
+                if self.failure_count >= self.max_attempts =>
+            {
                 Err(JobError::InvalidPersistedState {
-                    reason: "active jobs must have an attempt remaining",
+                    reason: "active jobs must have failure budget remaining",
                 })
             }
             JobStatus::Succeeded | JobStatus::Failed if !lease_is_empty => {
@@ -691,8 +749,17 @@ pub enum JobError {
     #[error("job is not due")]
     NotDue,
     /// The job has no claims remaining.
-    #[error("job has exhausted its attempts")]
+    #[error("job has exhausted its failure budget")]
     AttemptsExhausted,
+    /// The claim counter cannot represent another lease acquisition.
+    #[error("job claim count overflowed")]
+    ClaimCountOverflow,
+    /// The failure counter cannot represent another retryable failure.
+    #[error("job failure count overflowed")]
+    FailureCountOverflow,
+    /// A deferral must resume after the current transition time.
+    #[error("job deferral time must be after the current time")]
+    InvalidDeferralTime,
     /// A worker attempted an operation from an incompatible state.
     #[error("cannot {operation} a job in {status:?} state")]
     InvalidTransition {
@@ -813,13 +880,15 @@ mod tests {
             Err(JobError::NotDue)
         );
         assert_eq!(job.status(), JobStatus::Queued);
-        assert_eq!(job.attempts(), 0);
+        assert_eq!(job.claim_count(), 0);
+        assert_eq!(job.failure_count(), 0);
 
         let token = job
             .claim(OWNER, at(100), Duration::seconds(30))
             .expect("due job should be claimable");
         assert_eq!(job.status(), JobStatus::Running);
-        assert_eq!(job.attempts(), 1);
+        assert_eq!(job.claim_count(), 1);
+        assert_eq!(job.failure_count(), 0);
         assert_eq!(job.lease_owner(), Some(OWNER));
         assert_eq!(job.lease_token(), Some(token));
         assert_eq!(job.lease_until(), Some(at(130)));
@@ -855,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_waits_then_fails_when_attempts_are_exhausted() {
+    fn retry_waits_then_fails_when_failure_budget_is_exhausted() {
         let mut job = new_job(2);
         let token = job.claim(OWNER, at(100), Duration::seconds(30)).unwrap();
 
@@ -864,7 +933,8 @@ mod tests {
             .expect("first attempt should be retryable");
         assert_eq!(status, JobStatus::RetryWait);
         assert_eq!(job.status(), JobStatus::RetryWait);
-        assert_eq!(job.attempts(), 1);
+        assert_eq!(job.claim_count(), 1);
+        assert_eq!(job.failure_count(), 1);
         assert_eq!(job.run_after(), at(200));
         assert_eq!(job.last_error(), Some("temporary browser failure"));
         assert_eq!(job.lease_owner(), None);
@@ -875,7 +945,8 @@ mod tests {
             .expect("exhaustion should become a terminal result");
         assert_eq!(status, JobStatus::Failed);
         assert_eq!(job.status(), JobStatus::Failed);
-        assert_eq!(job.attempts(), 2);
+        assert_eq!(job.claim_count(), 2);
+        assert_eq!(job.failure_count(), 2);
         assert_eq!(job.finished_at(), Some(at(210)));
         assert!(job.status().is_terminal());
     }
@@ -888,6 +959,8 @@ mod tests {
             .unwrap();
         assert!(retryable.recover_expired_lease(at(130)));
         assert_eq!(retryable.status(), JobStatus::Queued);
+        assert_eq!(retryable.claim_count(), 1);
+        assert_eq!(retryable.failure_count(), 1);
         assert_eq!(retryable.run_after(), at(130));
         assert_eq!(retryable.last_error(), Some("worker lease expired"));
         assert!(!retryable.recover_expired_lease(at(131)));
@@ -898,7 +971,48 @@ mod tests {
             .unwrap();
         assert!(exhausted.recover_expired_lease(at(130)));
         assert_eq!(exhausted.status(), JobStatus::Failed);
+        assert_eq!(exhausted.failure_count(), 1);
         assert_eq!(exhausted.finished_at(), Some(at(130)));
+    }
+
+    #[test]
+    fn deferral_allows_more_claims_without_consuming_failure_budget() {
+        let mut job = new_job(1);
+        let first_token = job.claim(OWNER, at(100), Duration::seconds(30)).unwrap();
+        job.defer(OWNER, first_token, at(110), at(200))
+            .expect("a live job should be deferrable");
+
+        assert_eq!(job.status(), JobStatus::Deferred);
+        assert_eq!(job.claim_count(), 1);
+        assert_eq!(job.failure_count(), 0);
+        assert_eq!(job.run_after(), at(200));
+        assert_eq!(job.last_error(), None);
+
+        let second_token = job.claim(OWNER, at(200), Duration::seconds(30)).unwrap();
+        assert_eq!(job.claim_count(), 2);
+        assert_eq!(job.failure_count(), 0);
+        assert_eq!(
+            job.retry(OWNER, second_token, at(210), at(300), "fetch failed")
+                .unwrap(),
+            JobStatus::Failed
+        );
+        assert_eq!(job.failure_count(), 1);
+    }
+
+    #[test]
+    fn deferral_requires_a_future_resume_time_and_current_lease() {
+        let mut job = new_job(2);
+        let token = job.claim(OWNER, at(100), Duration::seconds(30)).unwrap();
+
+        assert_eq!(
+            job.defer(OWNER, token, at(110), at(110)),
+            Err(JobError::InvalidDeferralTime)
+        );
+        assert_eq!(
+            job.defer(OTHER_OWNER, token, at(110), at(200)),
+            Err(JobError::LeaseOwnerMismatch)
+        );
+        assert_eq!(job.status(), JobStatus::Running);
     }
 
     #[test]
@@ -981,7 +1095,8 @@ mod tests {
             status: job.status(),
             priority: job.priority(),
             run_after: job.run_after(),
-            attempts: job.attempts(),
+            claim_count: job.claim_count(),
+            failure_count: job.failure_count(),
             max_attempts: job.max_attempts(),
             lease_owner: job.lease_owner().map(str::to_owned),
             lease_token: job.lease_token(),
@@ -1020,10 +1135,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_persisted_jobs_with_no_valid_attempt_remaining() {
+    fn rejects_persisted_jobs_with_no_valid_failure_budget() {
         let job = new_job(1);
         let mut queued = persisted_record(&job);
-        queued.attempts = queued.max_attempts;
+        queued.failure_count = queued.max_attempts;
         assert!(matches!(
             Job::from_persisted(queued),
             Err(JobError::InvalidPersistedState { .. })
@@ -1031,7 +1146,7 @@ mod tests {
 
         let mut running = persisted_record(&job);
         running.status = JobStatus::Running;
-        running.attempts = 0;
+        running.claim_count = 0;
         running.lease_owner = Some(OWNER.to_owned());
         running.lease_token = Some(LeaseToken(Uuid::new_v4()));
         running.lease_until = Some(at(130));

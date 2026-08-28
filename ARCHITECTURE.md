@@ -35,7 +35,7 @@ The current and target contracts must not be confused:
 | Area | Executable now | Target contract and implementation gate |
 | --- | --- | --- |
 | Runtime | No server, routes, scheduler, worker, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
-| Jobs | Five states; legacy `attempts` counts claims | A forward migration adds `deferred`, `claim_count`, `failure_count`, and PostgreSQL-authoritative time before scheduler work starts |
+| Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, and PostgreSQL-clocked SQLx job operations | Remove caller `now` parameters only in a later queue-port contract release |
 | Configuration | Original `AppConfig`, including legacy archive settings | Planned role, account-lease, cooldown, stale-cache, safe-admin, and optional-asset settings must be implemented and tested before deployment uses them |
 | Persistence | Job table/repository only | Sources, accounts, account leases, articles, sync runs, feed cache/build leases, and shared `UnitOfWork` remain design-only |
 | Acquisition/web/RSS | Documentation-only boundaries | Capability types and application/repository ports must exist before concrete adapters or handlers |
@@ -203,12 +203,15 @@ timestamps and rehydrates domain values from them. Database time offset is
 monitored operationally; replica clock skew cannot shorten another worker's
 lease.
 
-Accordingly, production persistence methods such as `claim_next`, `heartbeat`,
-`succeed`, and `recover_expired` do not accept a caller `now`. Retry policy
-supplies a duration, which SQL adds to `db_now`. A quiet-hours deferral supplies
-an absolute instant calculated from an authoritative database-time sample and
-the configured IANA timezone; SQL still uses its own current time to verify the
-live fence before storing it.
+The current job-repository compatibility interface still accepts a caller `now`
+so the existing in-memory tests and callers remain source-compatible. PostgreSQL
+does not bind that value into lease-sensitive SQL: `claim_next`, `heartbeat`,
+`succeed`, `defer`, `retry`, `fail`, `cancel`, and `recover_expired` use a
+statement-local `clock_timestamp()`. The eventual queue-port/`UnitOfWork` split
+will remove those compatibility parameters. Retry policy will then supply a
+duration, which SQL adds to `db_now`; quiet-hours deferral will supply an
+absolute instant calculated from an authoritative database-time sample and the
+configured IANA timezone.
 
 Expected state transitions:
 
@@ -348,11 +351,12 @@ export DATABASE_URL='postgresql://wechrss:wechrss-dev-only@127.0.0.1:5432/wechrs
 cargo test --locked --test postgres_job_repository -- --nocapture
 ```
 
-`0001_jobs.sql` is already part of the embedded migration history and remains
-immutable. It contains the first-slice `attempts`-counts-claims model. The
-corrected `deferred`, `claim_count`, and `failure_count` design will be added by
-a new forward migration; the pending schema work is recorded in
-`migrations/README.md`.
+`0001_jobs.sql` is part of the embedded migration history and remains immutable
+after publication. It contains the corrected `deferred`, `claim_count`, and
+`failure_count` model, with active indexes that include `deferred`. No release
+has been published yet, so there is no legacy `attempts` column or compatibility
+trigger to retain. After publication, all schema changes must use a new forward
+migration; the policy is recorded in `migrations/README.md`.
 
 Each successful test run cleans up its temporary database; a failed run may
 leave it in place for diagnosis. The configured PostgreSQL role must be allowed
@@ -672,9 +676,10 @@ than add more empty module shells. Work proceeds in this order:
    including safe admin defaults, disabled-by-default asset storage, runtime
    roles, lease/cooldown settings, and tests that reject misspelled
    application-owned variables.
-2. Add a forward migration and update the job domain/repository for `deferred`,
-   separate claim/failure counters, allowed-kind claiming, and
-   PostgreSQL-authoritative lease time. Use an expand/contract rollout so mixed
+2. Complete the job queue slice with allowed-kind claiming and the eventual
+   queue/outcome/recovery ports. The initial `0001_jobs.sql` migration already
+   adds `deferred`, separate claim/failure counters, and PostgreSQL-authoritative
+   lease time. Use an expand/contract rollout for later schema changes so mixed
    replica versions remain safe; upgrade and concurrency tests are a gate.
 3. Implement the shared `UnitOfWork`, transaction-scoped repository ports,
    account lease repository, and feed-build lease/CAS primitives. No source or
@@ -701,11 +706,12 @@ The implemented foundation includes the pure pacing and quiet-hours policy in
 `src/persistence/postgres.rs`, and the domain plus PostgreSQL/in-memory job
 repositories in `src/domain/job.rs` and
 `src/persistence/repositories/job_repository.rs`. The job repository supports
-durable claim leases, fencing, retries, cancellation, recovery, and active-job
-deduplication under its first-slice contract, but it still uses legacy claim
-attempts and caller-provided timestamps and therefore is not the final HA job
-contract. The pacing and configuration modules have no network, browser,
-database, scheduler, or sleeping side effects.
+durable claim leases, fencing, retries, non-failure deferral, cancellation,
+recovery, separate claim/failure counters, and active-job deduplication. Its
+`0001_jobs.sql` schema uses the final initial job contract, while PostgreSQL
+lease decisions use statement-local `clock_timestamp()`. The pacing and
+configuration modules have no network, browser, database, scheduler, or sleeping
+side effects.
 
 The remaining tree intentionally contains no route handlers, browser calls,
 article/source/feed-cache queries, scheduler loops, or business

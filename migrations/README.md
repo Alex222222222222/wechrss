@@ -1,37 +1,20 @@
 # Migration design notes
 
-Applied SQLx migrations are immutable because SQLx records their checksums.
-Do not edit `0001_jobs.sql` to implement later job-state changes.
+Applied SQLx migrations are immutable after publication because SQLx records
+their checksums. This project has not published a release yet, so `0001_jobs.sql`
+is kept as the complete initial job schema rather than introducing a temporary
+rolling-upgrade migration.
 
-TODO(design): the next forward migration updates the existing job contract. It:
+The initial schema provides:
 
-- adds the active non-failure `deferred` job state;
-- separates durable `claim_count` from retry-budget `failure_count`;
-- includes `deferred` in the active deduplication and claim indexes;
-- updates constraints so claims do not consume the failure budget; and
-- leaves all existing terminal rows terminal.
+- the active non-failure `deferred` job state;
+- separate durable `claim_count` and retry-budget `failure_count` values;
+- active deduplication and claim indexes that include `deferred`; and
+- constraints that prevent claims from consuming the failure budget.
 
-The legacy `attempts` value is copied to `claim_count`. For active rows,
-`failure_count` is backfilled from completed prior claims: `running` uses
-`greatest(attempts - 1, 0)`, while `queued` or `retry_wait` rows that have already
-been claimed use `attempts`. This preserves known crash/retry failures without
-counting the current running claim as failed. Upgrade tests must cover every
-legacy status before the old column is removed.
-
-This is an expand/contract rollout, not a one-step destructive migration:
-
-1. expand the table with compatible counter columns/defaults, extend status
-   constraints and indexes, and backfill while retaining `attempts`;
-2. deploy code that reads the new counters and dual-writes any field still
-   needed by an old replica;
-3. enable creation/claiming of `deferred` only after all worker replicas
-   understand it; and
-4. remove legacy `attempts` and dual-write compatibility in a later release
-   after verification.
-
-Migration tests must exercise both a clean database and an existing `0001`
-database. Rolling-upgrade tests must prove old and new replicas can coexist
-during the expand phase without losing active-job deduplication or leases.
+There is no legacy `attempts` column or compatibility trigger. When a release
+has been published, later changes must use a new forward migration and must not
+edit `0001_jobs.sql`.
 
 Later forward migrations are added only as their executable repository contract
 is implemented. They will:

@@ -70,9 +70,14 @@ async fn postgres_repository_enforces_claims_fencing_recovery_and_transactions(p
         "SKIP LOCKED must prevent a double claim"
     );
     assert_eq!(lease.job.id(), active_id);
+    let lease_owner = lease
+        .job
+        .lease_owner()
+        .expect("a claimed job should have a lease owner")
+        .to_owned();
 
     let wrong_token_result = repository_b
-        .succeed(active_id, OWNER_A, LeaseToken::new(), at(101))
+        .succeed(active_id, &lease_owner, LeaseToken::new(), at(101))
         .await;
     assert!(
         matches!(
@@ -86,19 +91,24 @@ async fn postgres_repository_enforces_claims_fencing_recovery_and_transactions(p
     let renewed = repository_a
         .heartbeat(
             active_id,
-            OWNER_A,
+            &lease_owner,
             lease.token,
             at(110),
             Duration::seconds(30),
         )
         .await
         .expect("current owner should renew its lease");
-    assert_eq!(renewed.lease_until(), Some(at(140)));
+    assert!(
+        renewed
+            .lease_until()
+            .is_some_and(|lease_until| lease_until > Utc::now() + Duration::seconds(20)),
+        "PostgreSQL should calculate the renewed lease from database time"
+    );
 
     let waiting = repository_a
         .retry(
             active_id,
-            OWNER_A,
+            &lease_owner,
             lease.token,
             at(120),
             at(200),
@@ -140,6 +150,13 @@ async fn postgres_repository_enforces_claims_fencing_recovery_and_transactions(p
         .expect("recovery job should claim")
         .expect("recovery job should be due");
     assert_eq!(recovery_lease.job.id(), recovery_id);
+    sqlx::query(
+        "UPDATE jobs SET lease_until = clock_timestamp() - interval '1 second' WHERE id = $1",
+    )
+    .bind(recovery_id)
+    .execute(&pool)
+    .await
+    .expect("test should be able to expire the recovery lease");
     let recovered = repository_b
         .recover_expired(at(430), 10)
         .await

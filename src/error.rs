@@ -16,6 +16,7 @@
 //! Future implementation notes: use `thiserror` for stable boundary errors and
 //! `anyhow` only when adding context at orchestration edges.
 
-// TODO(design): define errors for job/account lease loss, non-failure deferral,
-// UnitOfWork revision conflict, cache single-flight contention, and disabled
-// administration before implementing the corresponding services.
+// TODO(design): define errors for account lease loss, UnitOfWork revision
+// conflict, cache single-flight contention, and disabled administration before
+// implementing the corresponding services. Job deferral and job lease errors
+// are defined in the job domain/repository boundary.

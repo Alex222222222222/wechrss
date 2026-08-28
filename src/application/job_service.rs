@@ -22,6 +22,7 @@
 //! atomic cross-table persistence operation. Production lease decisions use
 //! PostgreSQL time rather than an application `now` argument.
 
-// TODO(design): add typed deferred outcomes, allowed-kind claim filters,
-// separate durable claim/failure counters, PostgreSQL-owned lease time, and the
-// queue/outcome/recovery port split before implementing a worker loop.
+// TODO(design): add allowed-kind claim filters and the queue/outcome/recovery
+// port split before implementing a worker loop. The durable deferred state,
+// separate counters, and PostgreSQL-owned lease time are implemented by the
+// current job domain/repository slice.

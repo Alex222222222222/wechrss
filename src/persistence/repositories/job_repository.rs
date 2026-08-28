@@ -13,7 +13,7 @@
 //!   return its lease token;
 //! - persist heartbeats and terminal transitions only for the current owner and
 //!   fencing token;
-//! - cancel unclaimed work; and
+//! - cancel unclaimed work;
 //! - defer jobs at non-failure eligibility boundaries; and
 //! - recover expired leases in bounded batches.
 //!
@@ -26,18 +26,16 @@
 //! PostgreSQL implementation behavior:
 //!
 //! - `enqueue` must rely on a partial unique index for active jobs in
-//!   `queued`, `running`, `retry_wait`, and the planned `deferred` state, mapping a duplicate to
+//!   `queued`, `running`, `retry_wait`, and `deferred`, mapping a duplicate to
 //!   [`EnqueueResult::AlreadyActive`];
-//! - the corrected `claim_next` contract must select due allowed rows with `FOR
-//!   UPDATE SKIP LOCKED`, assign a fresh `lease_token`, increment
-//!   `claim_count`, and commit the claim before returning it; the current first
-//!   slice still increments legacy `attempts` pending the documented migration;
-//! - heartbeat, success, retry, and failure updates must match `id`,
+//! - `claim_next` selects due allowed rows with `FOR UPDATE SKIP LOCKED`,
+//!   assigns a fresh `lease_token`, and increments `claim_count`;
+//! - heartbeat, success, retry, deferral, and failure updates must match `id`,
 //!   `lease_owner`, `lease_token`, and a live `lease_until` in their update
 //!   predicate, so stale workers cannot mutate a later claim; and
 //! - recovery must lock only expired running jobs, clear their lease, and
-//!   either return them to `queued` or mark them failed when attempts are
-//!   exhausted.
+//!   increment the failure budget before returning them to `queued` or marking
+//!   them failed.
 //!
 //! Cross-repository mutations use `persistence::unit_of_work`. This repository's
 //! current job-only transaction is an implemented interim boundary and must not
@@ -49,15 +47,13 @@
 //! cross-table persistence operation so terminal recovery can advance a source
 //! cooldown atomically.
 //!
-//! Clock contract: the implemented first slice still accepts caller-provided
-//! `now` values and binds them into production SQL. That is not the target HA
-//! contract. Production PostgreSQL operations must derive a single `db_now`
-//! from `clock_timestamp()` inside each statement for claim eligibility, lease
-//! creation/renewal, live-fence checks, completion, and recovery. The corrected
-//! repository owns its clock; the in-memory repository receives an injectable
-//! test clock. Application code supplies retry durations or an absolute deferral
-//! instant derived from an authoritative database-time sample, not a timestamp
-//! used to judge another worker's lease.
+//! Clock contract: PostgreSQL lease-sensitive statements derive a single
+//! statement-local `db_now` from `clock_timestamp()` for claim eligibility,
+//! lease creation/renewal, live-fence checks, completion, and recovery. The
+//! interim trait still accepts a caller timestamp so the deterministic memory
+//! implementation and existing callers remain source-compatible; PostgreSQL
+//! does not use that value to judge lease liveness. Removing that compatibility
+//! parameter is tracked with the eventual queue-port/UnitOfWork split.
 
 use std::{cmp::Ordering, collections::HashMap, fmt::Display, sync::Arc};
 
@@ -107,7 +103,7 @@ pub trait JobRepositoryTransaction {
 
     /// Claims the highest-priority due job within this transaction.
     // TODO(design): accept an allowed JobType set so quiet-hours workers cannot
-    // claim upstream work, and add a fenced non-failure defer operation.
+    // claim upstream work.
     async fn claim_next(
         &mut self,
         owner: &str,
@@ -125,6 +121,16 @@ pub trait JobRepositoryTransaction {
         lease_for: Duration,
     ) -> Result<Job, JobRepositoryError>;
 
+    /// Defers a live fenced job without consuming retry budget.
+    async fn defer(
+        &mut self,
+        job_id: Uuid,
+        owner: &str,
+        token: LeaseToken,
+        now: DateTime<Utc>,
+        resume_at: DateTime<Utc>,
+    ) -> Result<Job, JobRepositoryError>;
+
     /// Marks a live fenced job as successfully completed.
     // TODO(design): remove this from the general/interim transaction contract;
     // successful business-job completion belongs to UnitOfWork only.
@@ -136,7 +142,7 @@ pub trait JobRepositoryTransaction {
         now: DateTime<Utc>,
     ) -> Result<Job, JobRepositoryError>;
 
-    /// Records a retry or terminal failure when attempts are exhausted.
+    /// Records a retry or terminal failure when the failure budget is exhausted.
     async fn retry(
         &mut self,
         job_id: Uuid,
@@ -219,8 +225,8 @@ pub trait JobRepository: Send + Sync {
     async fn enqueue(&self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError>;
 
     /// Claims the highest-priority due job without waiting on another worker.
-    // TODO(design): accept an allowed JobType set and expose defer after the job
-    // domain/schema gain the corrected state and counters.
+    // TODO(design): accept an allowed JobType set so quiet-hours workers cannot
+    // claim upstream work.
     async fn claim_next(
         &self,
         owner: &str,
@@ -238,6 +244,16 @@ pub trait JobRepository: Send + Sync {
         lease_for: Duration,
     ) -> Result<Job, JobRepositoryError>;
 
+    /// Defers a live fenced job without consuming retry budget.
+    async fn defer(
+        &self,
+        job_id: Uuid,
+        owner: &str,
+        token: LeaseToken,
+        now: DateTime<Utc>,
+        resume_at: DateTime<Utc>,
+    ) -> Result<Job, JobRepositoryError>;
+
     /// Marks a live fenced job as successfully completed.
     // TODO(design): remove this convenience method from the target public queue
     // port so application code cannot commit success separately from data.
@@ -249,7 +265,7 @@ pub trait JobRepository: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<Job, JobRepositoryError>;
 
-    /// Records a retry or terminal failure when attempts are exhausted.
+    /// Records a retry or terminal failure when the failure budget is exhausted.
     async fn retry(
         &self,
         job_id: Uuid,
@@ -289,11 +305,9 @@ pub trait JobRepository: Send + Sync {
     async fn find(&self, job_id: Uuid) -> Result<Option<Job>, JobRepositoryError>;
 }
 
-const JOB_COLUMNS: &str = "id, job_type, source_id, status, priority, run_after, attempts, max_attempts, lease_owner, lease_token, lease_until, heartbeat_at, started_at, finished_at, last_error, payload_json, dedupe_key, created_at, updated_at";
-const JOB_COLUMNS_FROM_JOB: &str = "job.id, job.job_type, job.source_id, job.status, job.priority, job.run_after, job.attempts, job.max_attempts, job.lease_owner, job.lease_token, job.lease_until, job.heartbeat_at, job.started_at, job.finished_at, job.last_error, job.payload_json, job.dedupe_key, job.created_at, job.updated_at";
-// TODO(design): after the forward migration, include deferred in active/claim
-// SQL and replace legacy attempts columns with claim_count/failure_count.
-const ACTIVE_STATUSES: &str = "'queued', 'running', 'retry_wait'";
+const JOB_COLUMNS: &str = "id, job_type, source_id, status, priority, run_after, claim_count, failure_count, max_attempts, lease_owner, lease_token, lease_until, heartbeat_at, started_at, finished_at, last_error, payload_json, dedupe_key, created_at, updated_at";
+const JOB_COLUMNS_FROM_JOB: &str = "job.id, job.job_type, job.source_id, job.status, job.priority, job.run_after, job.claim_count, job.failure_count, job.max_attempts, job.lease_owner, job.lease_token, job.lease_until, job.heartbeat_at, job.started_at, job.finished_at, job.last_error, job.payload_json, job.dedupe_key, job.created_at, job.updated_at";
+const ACTIVE_STATUSES: &str = "'queued', 'running', 'retry_wait', 'deferred'";
 
 /// SQLx repository backed by the shared PostgreSQL job table.
 ///
@@ -383,6 +397,9 @@ impl<'a> PostgresJobTransaction<'a> {
             FencedOperation::Retry { retry_at, error } => current
                 .retry(owner, token, now, retry_at, error)
                 .map(|_| ()),
+            FencedOperation::Defer { resume_at } => {
+                current.defer(owner, token, now, resume_at).map(|_| ())
+            }
             FencedOperation::Fail { error } => current.fail(owner, token, now, error),
         };
 
@@ -428,20 +445,21 @@ enum FencedOperation<'a> {
         retry_at: DateTime<Utc>,
         error: &'a str,
     },
+    Defer {
+        resume_at: DateTime<Utc>,
+    },
     Fail {
         error: &'a str,
     },
 }
 
-// TODO(design): rewrite the production statements around one database-owned
-// timestamp CTE; caller-provided timestamps must not decide lease liveness.
 impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
     async fn enqueue(&mut self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError> {
         let job = Job::new(spec)?;
         let query = format!(
             r#"
             INSERT INTO jobs ({JOB_COLUMNS})
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
             ON CONFLICT (dedupe_key) WHERE status IN ({ACTIVE_STATUSES}) DO NOTHING
             RETURNING {JOB_COLUMNS}
             "#
@@ -454,7 +472,8 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
             .bind(status_name(job.status()))
             .bind(job.priority())
             .bind(job.run_after())
-            .bind(i64::from(job.attempts()))
+            .bind(i64::from(job.claim_count()))
+            .bind(i64::from(job.failure_count()))
             .bind(i64::from(job.max_attempts()))
             .bind(job.lease_owner().map(str::to_owned))
             .bind(job.lease_token().map(LeaseToken::as_uuid))
@@ -495,45 +514,48 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
     async fn claim_next(
         &mut self,
         owner: &str,
-        now: DateTime<Utc>,
+        _now: DateTime<Utc>,
         lease_for: Duration,
     ) -> Result<Option<JobLease>, JobRepositoryError> {
         validate_owner(owner)?;
-        let lease_until = lease_expiry(now, lease_for)?;
+        let lease_milliseconds = lease_milliseconds(lease_for)?;
         let token = LeaseToken::new();
         let query = format!(
             r#"
-            WITH candidate AS (
+            WITH db_clock AS MATERIALIZED (
+                SELECT clock_timestamp() AS now
+            ), candidate AS (
                 SELECT id
                 FROM jobs
-                WHERE status IN ('queued', 'retry_wait')
-                  AND run_after <= $1
-                  AND attempts < max_attempts
+                CROSS JOIN db_clock
+                WHERE status IN ('queued', 'retry_wait', 'deferred')
+                  AND run_after <= db_clock.now
+                  AND failure_count < max_attempts
                 ORDER BY priority DESC, run_after ASC, created_at ASC, id ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
             )
             UPDATE jobs AS job
             SET status = 'running',
-                attempts = job.attempts + 1,
-                lease_owner = $2,
-                lease_token = $3,
-                lease_until = $4,
-                heartbeat_at = $1,
-                started_at = COALESCE(job.started_at, $1),
+                claim_count = job.claim_count + 1,
+                lease_owner = $1,
+                lease_token = $2,
+                lease_until = db_clock.now + ($3::double precision * INTERVAL '1 millisecond'),
+                heartbeat_at = db_clock.now,
+                started_at = COALESCE(job.started_at, db_clock.now),
                 finished_at = NULL,
-                updated_at = $1
+                updated_at = db_clock.now
             FROM candidate
+            CROSS JOIN db_clock
             WHERE job.id = candidate.id
             RETURNING {JOB_COLUMNS_FROM_JOB}
             "#
         );
         let transaction = self.transaction_mut()?;
         let row = sqlx::query(&query)
-            .bind(now)
             .bind(owner)
             .bind(token.as_uuid())
-            .bind(lease_until)
+            .bind(lease_milliseconds)
             .fetch_optional(&mut **transaction)
             .await
             .map_err(storage_error)?;
@@ -556,16 +578,22 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
         lease_for: Duration,
     ) -> Result<Job, JobRepositoryError> {
         validate_owner(owner)?;
-        let lease_until = lease_expiry(now, lease_for)?;
+        let lease_milliseconds = lease_milliseconds(lease_for)?;
         let query = format!(
             r#"
+            WITH db_clock AS MATERIALIZED (
+                SELECT clock_timestamp() AS now
+            )
             UPDATE jobs
-            SET lease_until = $5, heartbeat_at = $4, updated_at = $4
+            SET lease_until = db_clock.now + ($4::double precision * INTERVAL '1 millisecond'),
+                heartbeat_at = db_clock.now,
+                updated_at = db_clock.now
+            FROM db_clock
             WHERE id = $1
               AND status = 'running'
               AND lease_owner = $2
               AND lease_token = $3
-              AND lease_until > $4
+              AND lease_until > db_clock.now
             RETURNING {JOB_COLUMNS}
             "#
         );
@@ -574,8 +602,7 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
             .bind(job_id)
             .bind(owner)
             .bind(token.as_uuid())
-            .bind(now)
-            .bind(lease_until)
+            .bind(lease_milliseconds)
             .fetch_optional(&mut **transaction)
             .await
             .map_err(storage_error)?;
@@ -593,6 +620,62 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
         }
     }
 
+    async fn defer(
+        &mut self,
+        job_id: Uuid,
+        owner: &str,
+        token: LeaseToken,
+        now: DateTime<Utc>,
+        resume_at: DateTime<Utc>,
+    ) -> Result<Job, JobRepositoryError> {
+        validate_owner(owner)?;
+        let query = format!(
+            r#"
+            WITH db_clock AS MATERIALIZED (
+                SELECT clock_timestamp() AS now
+            )
+            UPDATE jobs
+            SET status = 'deferred',
+                run_after = $4,
+                lease_owner = NULL,
+                lease_token = NULL,
+                lease_until = NULL,
+                last_error = NULL,
+                finished_at = NULL,
+                updated_at = db_clock.now
+            FROM db_clock
+            WHERE id = $1
+              AND status = 'running'
+              AND lease_owner = $2
+              AND lease_token = $3
+              AND lease_until > db_clock.now
+              AND $4 > db_clock.now
+            RETURNING {JOB_COLUMNS}
+            "#
+        );
+        let transaction = self.transaction_mut()?;
+        let row = sqlx::query(&query)
+            .bind(job_id)
+            .bind(owner)
+            .bind(token.as_uuid())
+            .bind(resume_at)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+        match row {
+            Some(row) => decode_job(row),
+            None => Err(self
+                .fenced_update_error(
+                    job_id,
+                    owner,
+                    token,
+                    now,
+                    FencedOperation::Defer { resume_at },
+                )
+                .await?),
+        }
+    }
+
     async fn succeed(
         &mut self,
         job_id: Uuid,
@@ -603,19 +686,23 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
         validate_owner(owner)?;
         let query = format!(
             r#"
+            WITH db_clock AS MATERIALIZED (
+                SELECT clock_timestamp() AS now
+            )
             UPDATE jobs
             SET status = 'succeeded',
                 lease_owner = NULL,
                 lease_token = NULL,
                 lease_until = NULL,
                 last_error = NULL,
-                finished_at = $4,
-                updated_at = $4
+                finished_at = db_clock.now,
+                updated_at = db_clock.now
+            FROM db_clock
             WHERE id = $1
               AND status = 'running'
               AND lease_owner = $2
               AND lease_token = $3
-              AND lease_until > $4
+              AND lease_until > db_clock.now
             RETURNING {JOB_COLUMNS}
             "#
         );
@@ -624,7 +711,6 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
             .bind(job_id)
             .bind(owner)
             .bind(token.as_uuid())
-            .bind(now)
             .fetch_optional(&mut **transaction)
             .await
             .map_err(storage_error)?;
@@ -649,26 +735,31 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
         validate_error(error)?;
         let query = format!(
             r#"
+            WITH db_clock AS MATERIALIZED (
+                SELECT clock_timestamp() AS now
+            )
             UPDATE jobs
             SET status = CASE
-                    WHEN attempts >= max_attempts THEN 'failed'
+                    WHEN failure_count + 1 >= max_attempts THEN 'failed'
                     ELSE 'retry_wait'
                 END,
+                failure_count = failure_count + 1,
                 lease_owner = NULL,
                 lease_token = NULL,
                 lease_until = NULL,
-                run_after = $5,
-                last_error = $6,
+                run_after = $4,
+                last_error = $5,
                 finished_at = CASE
-                    WHEN attempts >= max_attempts THEN $4
+                    WHEN failure_count + 1 >= max_attempts THEN db_clock.now
                     ELSE NULL
                 END,
-                updated_at = $4
+                updated_at = db_clock.now
+            FROM db_clock
             WHERE id = $1
               AND status = 'running'
               AND lease_owner = $2
               AND lease_token = $3
-              AND lease_until > $4
+              AND lease_until > db_clock.now
             RETURNING {JOB_COLUMNS}
             "#
         );
@@ -677,7 +768,6 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
             .bind(job_id)
             .bind(owner)
             .bind(token.as_uuid())
-            .bind(now)
             .bind(retry_at)
             .bind(error)
             .fetch_optional(&mut **transaction)
@@ -709,19 +799,23 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
         validate_error(error)?;
         let query = format!(
             r#"
+            WITH db_clock AS MATERIALIZED (
+                SELECT clock_timestamp() AS now
+            )
             UPDATE jobs
             SET status = 'failed',
                 lease_owner = NULL,
                 lease_token = NULL,
                 lease_until = NULL,
-                last_error = $5,
-                finished_at = $4,
-                updated_at = $4
+                last_error = $4,
+                finished_at = db_clock.now,
+                updated_at = db_clock.now
+            FROM db_clock
             WHERE id = $1
               AND status = 'running'
               AND lease_owner = $2
               AND lease_token = $3
-              AND lease_until > $4
+              AND lease_until > db_clock.now
             RETURNING {JOB_COLUMNS}
             "#
         );
@@ -730,7 +824,6 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
             .bind(job_id)
             .bind(owner)
             .bind(token.as_uuid())
-            .bind(now)
             .bind(error)
             .fetch_optional(&mut **transaction)
             .await
@@ -752,13 +845,17 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
         validate_error(reason)?;
         let query = format!(
             r#"
+            WITH db_clock AS MATERIALIZED (
+                SELECT clock_timestamp() AS now
+            )
             UPDATE jobs
             SET status = 'failed',
                 last_error = $2,
-                finished_at = $3,
-                updated_at = $3
+                finished_at = db_clock.now,
+                updated_at = db_clock.now
+            FROM db_clock
             WHERE id = $1
-              AND status IN ('queued', 'retry_wait')
+              AND status IN ({ACTIVE_STATUSES})
               AND lease_owner IS NULL
               AND lease_token IS NULL
               AND lease_until IS NULL
@@ -769,7 +866,6 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
         let row = sqlx::query(&query)
             .bind(job_id)
             .bind(reason)
-            .bind(now)
             .fetch_optional(&mut **transaction)
             .await
             .map_err(storage_error)?;
@@ -781,7 +877,7 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
 
     async fn recover_expired(
         &mut self,
-        now: DateTime<Utc>,
+        _now: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<Job>, JobRepositoryError> {
         let limit = i64::try_from(limit).map_err(|_| {
@@ -789,37 +885,41 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
         })?;
         let query = format!(
             r#"
-            WITH expired AS (
+            WITH db_clock AS MATERIALIZED (
+                SELECT clock_timestamp() AS now
+            ), expired AS (
                 SELECT id
                 FROM jobs
-                WHERE status = 'running' AND lease_until <= $1
+                CROSS JOIN db_clock
+                WHERE status = 'running' AND lease_until <= db_clock.now
                 ORDER BY lease_until ASC, id ASC
                 FOR UPDATE SKIP LOCKED
-                LIMIT $2
+                LIMIT $1
             )
             UPDATE jobs AS job
             SET status = CASE
-                    WHEN job.attempts >= job.max_attempts THEN 'failed'
+                    WHEN job.failure_count + 1 >= job.max_attempts THEN 'failed'
                     ELSE 'queued'
                 END,
-                run_after = $1,
+                failure_count = job.failure_count + 1,
+                run_after = db_clock.now,
                 lease_owner = NULL,
                 lease_token = NULL,
                 lease_until = NULL,
                 last_error = 'worker lease expired',
                 finished_at = CASE
-                    WHEN job.attempts >= job.max_attempts THEN $1
+                    WHEN job.failure_count + 1 >= job.max_attempts THEN db_clock.now
                     ELSE NULL
                 END,
-                updated_at = $1
+                updated_at = db_clock.now
             FROM expired
+            CROSS JOIN db_clock
             WHERE job.id = expired.id
             RETURNING {JOB_COLUMNS_FROM_JOB}
             "#
         );
         let transaction = self.transaction_mut()?;
         let rows = sqlx::query(&query)
-            .bind(now)
             .bind(limit)
             .fetch_all(&mut **transaction)
             .await
@@ -873,6 +973,22 @@ impl JobRepository for PostgresJobRepository {
         let mut transaction = self.begin().await?;
         let result = transaction
             .heartbeat(job_id, owner, token, now, lease_for)
+            .await?;
+        transaction.commit().await?;
+        Ok(result)
+    }
+
+    async fn defer(
+        &self,
+        job_id: Uuid,
+        owner: &str,
+        token: LeaseToken,
+        now: DateTime<Utc>,
+        resume_at: DateTime<Utc>,
+    ) -> Result<Job, JobRepositoryError> {
+        let mut transaction = self.begin().await?;
+        let result = transaction
+            .defer(job_id, owner, token, now, resume_at)
             .await?;
         transaction.commit().await?;
         Ok(result)
@@ -965,7 +1081,8 @@ fn decode_job(row: PgRow) -> Result<Job, JobRepositoryError> {
         status: parse_job_status(row.try_get("status").map_err(storage_error)?)?,
         priority: row.try_get("priority").map_err(storage_error)?,
         run_after: row.try_get("run_after").map_err(storage_error)?,
-        attempts: persisted_u32(&row, "attempts")?,
+        claim_count: persisted_u32(&row, "claim_count")?,
+        failure_count: persisted_u32(&row, "failure_count")?,
         max_attempts: persisted_u32(&row, "max_attempts")?,
         lease_owner: row.try_get("lease_owner").map_err(storage_error)?,
         lease_token: row
@@ -1011,6 +1128,7 @@ fn parse_job_status(value: String) -> Result<JobStatus, JobRepositoryError> {
         "queued" => Ok(JobStatus::Queued),
         "running" => Ok(JobStatus::Running),
         "retry_wait" => Ok(JobStatus::RetryWait),
+        "deferred" => Ok(JobStatus::Deferred),
         "succeeded" => Ok(JobStatus::Succeeded),
         "failed" => Ok(JobStatus::Failed),
         _ => Err(JobRepositoryError::Storage(format!(
@@ -1033,6 +1151,7 @@ fn status_name(status: JobStatus) -> &'static str {
         JobStatus::Queued => "queued",
         JobStatus::Running => "running",
         JobStatus::RetryWait => "retry_wait",
+        JobStatus::Deferred => "deferred",
         JobStatus::Succeeded => "succeeded",
         JobStatus::Failed => "failed",
     }
@@ -1054,15 +1173,15 @@ fn validate_error(error: &str) -> Result<(), JobRepositoryError> {
     }
 }
 
-fn lease_expiry(
-    now: DateTime<Utc>,
-    lease_for: Duration,
-) -> Result<DateTime<Utc>, JobRepositoryError> {
+fn lease_milliseconds(lease_for: Duration) -> Result<i64, JobRepositoryError> {
     if lease_for <= Duration::zero() {
         return Err(JobRepositoryError::Domain(JobError::InvalidLeaseDuration));
     }
-    now.checked_add_signed(lease_for)
-        .ok_or(JobRepositoryError::Domain(JobError::InvalidLeaseDuration))
+    let milliseconds = lease_for.num_milliseconds();
+    if milliseconds <= 0 {
+        return Err(JobRepositoryError::Domain(JobError::InvalidLeaseDuration));
+    }
+    Ok(milliseconds)
 }
 
 /// In-memory repository used for fast unit tests and local orchestration tests.
@@ -1118,9 +1237,11 @@ fn claim_next_in_store(
     let candidate_id = jobs
         .iter()
         .filter(|(_, job)| {
-            matches!(job.status(), JobStatus::Queued | JobStatus::RetryWait)
-                && job.run_after() <= now
-                && job.attempts() < job.max_attempts()
+            matches!(
+                job.status(),
+                JobStatus::Queued | JobStatus::RetryWait | JobStatus::Deferred
+            ) && job.run_after() <= now
+                && job.failure_count() < job.max_attempts()
         })
         .min_by(|(_, left), (_, right)| claim_order(left, right))
         .map(|(job_id, _)| *job_id);
@@ -1146,6 +1267,19 @@ fn heartbeat_in_store(
 ) -> Result<Job, JobRepositoryError> {
     let job = MemoryJobRepository::get_mut(jobs, job_id)?;
     job.heartbeat(owner, token, now, lease_for)?;
+    Ok(job.clone())
+}
+
+fn defer_in_store(
+    jobs: &mut HashMap<Uuid, Job>,
+    job_id: Uuid,
+    owner: &str,
+    token: LeaseToken,
+    now: DateTime<Utc>,
+    resume_at: DateTime<Utc>,
+) -> Result<Job, JobRepositoryError> {
+    let job = MemoryJobRepository::get_mut(jobs, job_id)?;
+    job.defer(owner, token, now, resume_at)?;
     Ok(job.clone())
 }
 
@@ -1314,6 +1448,18 @@ impl JobRepository for MemoryJobRepository {
         heartbeat_in_store(&mut jobs, job_id, owner, token, now, lease_for)
     }
 
+    async fn defer(
+        &self,
+        job_id: Uuid,
+        owner: &str,
+        token: LeaseToken,
+        now: DateTime<Utc>,
+        resume_at: DateTime<Utc>,
+    ) -> Result<Job, JobRepositoryError> {
+        let mut jobs = self.jobs.lock().await;
+        defer_in_store(&mut jobs, job_id, owner, token, now, resume_at)
+    }
+
     async fn succeed(
         &self,
         job_id: Uuid,
@@ -1397,6 +1543,17 @@ impl JobRepositoryTransaction for MemoryJobTransaction<'_> {
         lease_for: Duration,
     ) -> Result<Job, JobRepositoryError> {
         heartbeat_in_store(self.jobs_mut()?, job_id, owner, token, now, lease_for)
+    }
+
+    async fn defer(
+        &mut self,
+        job_id: Uuid,
+        owner: &str,
+        token: LeaseToken,
+        now: DateTime<Utc>,
+        resume_at: DateTime<Utc>,
+    ) -> Result<Job, JobRepositoryError> {
+        defer_in_store(self.jobs_mut()?, job_id, owner, token, now, resume_at)
     }
 
     async fn succeed(
@@ -1546,6 +1703,39 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn defers_a_claim_without_spending_failure_budget() {
+        let repository = MemoryJobRepository::new();
+        let job_id = inserted_id(&repository, spec("deferred", 1, 0)).await;
+        let first = repository
+            .claim_next(OWNER, at(0), Duration::seconds(30))
+            .await
+            .unwrap()
+            .expect("job should be claimed");
+
+        let deferred = repository
+            .defer(job_id, OWNER, first.token, at(1), at(100))
+            .await
+            .unwrap();
+        assert_eq!(deferred.status(), JobStatus::Deferred);
+        assert_eq!(deferred.claim_count(), 1);
+        assert_eq!(deferred.failure_count(), 0);
+        assert!(repository
+            .claim_next(OWNER, at(99), Duration::seconds(30))
+            .await
+            .unwrap()
+            .is_none());
+
+        let second = repository
+            .claim_next(OWNER, at(100), Duration::seconds(30))
+            .await
+            .unwrap()
+            .expect("deferred job should become claimable");
+        assert_eq!(second.job.id(), job_id);
+        assert_eq!(second.job.claim_count(), 2);
+        assert_eq!(second.job.failure_count(), 0);
     }
 
     #[tokio::test]
