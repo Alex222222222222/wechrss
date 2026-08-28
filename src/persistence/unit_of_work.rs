@@ -4,23 +4,23 @@
 //! changes, sync-run persistence, feed-cache replacement, and fenced job
 //! completion atomic without exposing SQLx transactions to application code.
 //!
-//! The future `UnitOfWorkFactory::begin` creates one short-lived SQLx
-//! transaction. Its returned handle exposes transaction-scoped source, article,
-//! sync-run, feed-cache, and job repository views. Only the unit of work can
-//! commit; dropping it or returning an error rolls all component writes back.
-//! Repository views borrow the unit of work and therefore cannot outlive or
-//! independently commit their transaction.
+//! `UnitOfWorkFactory::begin` creates one short-lived SQLx transaction. Its
+//! returned handle exposes a transaction-scoped job view today; source, article,
+//! sync-run, and feed-cache views will be added as their repository contracts
+//! become executable. Only the unit of work can commit; dropping it or
+//! returning an error rolls all component writes back. Repository views borrow
+//! the unit of work and therefore cannot outlive or independently commit their
+//! transaction.
 //!
 //! Minimum executable contract:
 //!
 //! - `UnitOfWorkFactory::begin()` creates the transaction;
-//! - `jobs().verify_fence(job_id, owner, token)` runs before business writes;
-//! - transaction-scoped article/source/sync/cache methods apply an idempotent
-//!   command and expected feed revision;
-//! - `jobs().succeed(...)` is available only through this unit of work, not the
-//!   general queue repository; and
-//! - `commit(self)` is the only successful exit. Every repository view has no
-//!   commit method and borrows the same transaction.
+//! - `jobs()` borrows the transaction-scoped job repository view;
+//! - `commit(self)` is the only successful exit for a completed unit of work;
+//! - `rollback(self)` is available for explicit cleanup in tests or callers
+//!   that need to await rollback; and
+//! - future `verify_fence`, article/source/sync/cache commands will be added to
+//!   views that borrow this same transaction.
 //!
 //! Retry, deferral, cancellation, and failure outcomes use the same boundary
 //! because they record sync results or alter source scheduling gates/cooldowns.
@@ -49,12 +49,95 @@
 //! mapping. A unit of work must use bounded lock/statement timeouts and should
 //! be short enough that a worker can safely heartbeat independently.
 //!
-//! High availability: the final job mutation remains fenced inside the same
-//! transaction as business writes. If ownership was lost, the unit of work
-//! rolls back instead of publishing writes from a stale worker. Cache
-//! compare-and-swap and feed-build fencing checks also happen inside this
-//! transaction.
+//! High availability: the job view already participates in the shared
+//! transaction, so future fenced job outcomes can commit together with business
+//! writes. If ownership is lost, the unit of work rolls back instead of
+//! publishing writes from a stale worker. Cache compare-and-swap and feed-build
+//! fencing checks will also happen inside this transaction once their views are
+//! implemented.
 
-// TODO(design): implement UnitOfWorkFactory and transaction-scoped repository
-// views, move success and business-coupled failure completion behind this
-// boundary, and prevent SyncService from receiving a job-only commit API.
+use std::fmt;
+
+use sqlx::PgPool;
+use thiserror::Error;
+
+use super::repositories::job_repository::PostgresJobTransaction;
+
+/// Errors raised while opening or completing a unit of work.
+#[derive(Debug, Error)]
+pub enum UnitOfWorkError {
+    /// SQLx could not start, commit, or roll back the transaction.
+    #[error("unit of work transaction error: {0}")]
+    Transaction(#[source] sqlx::Error),
+}
+
+/// Factory for short-lived, shared persistence transactions.
+#[derive(Clone)]
+pub struct UnitOfWorkFactory {
+    pool: PgPool,
+}
+
+impl fmt::Debug for UnitOfWorkFactory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnitOfWorkFactory")
+            .field("pool", &"<postgres pool>")
+            .finish()
+    }
+}
+
+impl UnitOfWorkFactory {
+    /// Creates a factory backed by the configured PostgreSQL pool.
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Begins a transaction whose repository views share one commit boundary.
+    pub async fn begin(&self) -> Result<UnitOfWork<'_>, UnitOfWorkError> {
+        let jobs = PostgresJobTransaction::begin(&self.pool)
+            .await
+            .map_err(UnitOfWorkError::Transaction)?;
+        Ok(UnitOfWork { jobs })
+    }
+}
+
+/// A short-lived transaction-scoped persistence unit.
+pub struct UnitOfWork<'a> {
+    jobs: PostgresJobTransaction<'a>,
+}
+
+impl<'a> UnitOfWork<'a> {
+    /// Borrows the job repository view without exposing an independent commit.
+    pub fn jobs(&mut self) -> &mut PostgresJobTransaction<'a> {
+        &mut self.jobs
+    }
+
+    /// Commits all mutations made through this unit of work.
+    pub async fn commit(self) -> Result<(), UnitOfWorkError> {
+        self.jobs
+            .commit_inner()
+            .await
+            .map_err(UnitOfWorkError::Transaction)
+    }
+
+    /// Explicitly rolls back all mutations made through this unit of work.
+    pub async fn rollback(self) -> Result<(), UnitOfWorkError> {
+        self.jobs
+            .rollback_inner()
+            .await
+            .map_err(UnitOfWorkError::Transaction)
+    }
+}
+
+impl fmt::Debug for UnitOfWork<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnitOfWork")
+            .field("jobs", &self.jobs)
+            .finish()
+    }
+}
+
+// TODO(design): add source, article, sync-run, and feed-cache views; move
+// verify-fence and business-coupled outcomes behind this boundary; and prevent
+// SyncService from receiving a job-only commit API.

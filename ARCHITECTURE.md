@@ -27,8 +27,8 @@ unimplemented.
 This document describes the target version-one architecture, not the behavior
 of a deployable server. The binary is currently a no-op. The only executable
 foundations are typed environment parsing for the original configuration set,
-pure pacing/quiet-hours policy, PostgreSQL pool/migration helpers, and the first
-job domain/repository slice.
+pure pacing/quiet-hours policy, PostgreSQL pool/migration helpers, the first job
+domain/repository slice, and its shared transaction boundary.
 
 The current and target contracts must not be confused:
 
@@ -37,7 +37,7 @@ The current and target contracts must not be confused:
 | Runtime | No server, routes, scheduler, worker, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, and PostgreSQL-clocked SQLx job operations | Remove caller `now` parameters only in a later queue-port contract release |
 | Configuration | Original `AppConfig`, including legacy archive settings | Planned role, account-lease, cooldown, stale-cache, safe-admin, and optional-asset settings must be implemented and tested before deployment uses them |
-| Persistence | Job table/repository only | Sources, accounts, account leases, articles, sync runs, feed cache/build leases, and shared `UnitOfWork` remain design-only |
+| Persistence | Job table/repository plus a shared job transaction boundary | Sources, accounts, account leases, articles, sync runs, feed cache/build leases, and their transaction-scoped `UnitOfWork` views remain design-only |
 | Acquisition/web/RSS | Documentation-only boundaries | Capability types and application/repository ports must exist before concrete adapters or handlers |
 
 Planned environment variables in this document are not parsed or effective
@@ -711,11 +711,14 @@ recovery, separate claim/failure counters, and active-job deduplication. Its
 `0001_jobs.sql` schema uses the final initial job contract, while PostgreSQL
 lease decisions use statement-local `clock_timestamp()`. The pacing and
 configuration modules have no network, browser, database, scheduler, or sleeping
-side effects.
+side effects. `UnitOfWorkFactory` and its transaction-scoped job view are
+implemented in `src/persistence/unit_of_work.rs`; the unit of work owns the
+shared commit/rollback boundary, while the other repository views remain future
+work.
 
 The remaining tree intentionally contains no route handlers, browser calls,
 article/source/feed-cache queries, scheduler loops, or business
-implementation. Documentation-only `FeedService`, `UnitOfWork`, and account
-lease modules define the corrected ownership boundaries. `TODO(design)` markers
-identify existing code and migrations that must change before those contracts
-are implemented.
+implementation. Documentation-only `FeedService`, source/article/feed-cache
+repositories, and account lease modules define the remaining ownership
+boundaries. `TODO(design)` markers identify existing code and migrations that
+must change before those contracts are implemented.

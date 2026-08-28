@@ -350,11 +350,27 @@ pub struct PostgresJobTransaction<'a> {
 }
 
 impl<'a> PostgresJobTransaction<'a> {
-    async fn begin(pool: &'a PgPool) -> Result<Self, JobRepositoryError> {
-        let transaction = pool.begin().await.map_err(storage_error)?;
+    pub(crate) async fn begin(pool: &'a PgPool) -> Result<Self, sqlx::Error> {
+        let transaction = pool.begin().await?;
         Ok(Self {
             transaction: Some(transaction),
         })
+    }
+
+    pub(crate) async fn commit_inner(mut self) -> Result<(), sqlx::Error> {
+        let transaction = self
+            .transaction
+            .take()
+            .ok_or_else(|| sqlx::Error::Protocol("transaction is closed".to_owned()))?;
+        transaction.commit().await
+    }
+
+    pub(crate) async fn rollback_inner(mut self) -> Result<(), sqlx::Error> {
+        let transaction = self
+            .transaction
+            .take()
+            .ok_or_else(|| sqlx::Error::Protocol("transaction is closed".to_owned()))?;
+        transaction.rollback().await
     }
 
     fn transaction_mut(&mut self) -> Result<&mut Transaction<'a, Postgres>, JobRepositoryError> {
@@ -927,12 +943,8 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
         rows.into_iter().map(decode_job).collect()
     }
 
-    async fn commit(mut self) -> Result<(), JobRepositoryError> {
-        let transaction = self
-            .transaction
-            .take()
-            .ok_or_else(|| JobRepositoryError::Storage("transaction is closed".to_owned()))?;
-        transaction.commit().await.map_err(storage_error)
+    async fn commit(self) -> Result<(), JobRepositoryError> {
+        self.commit_inner().await.map_err(storage_error)
     }
 }
 
@@ -940,7 +952,9 @@ impl JobRepository for PostgresJobRepository {
     type Transaction<'a> = PostgresJobTransaction<'a>;
 
     async fn begin(&self) -> Result<Self::Transaction<'_>, JobRepositoryError> {
-        PostgresJobTransaction::begin(&self.pool).await
+        PostgresJobTransaction::begin(&self.pool)
+            .await
+            .map_err(storage_error)
     }
 
     async fn enqueue(&self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError> {

@@ -8,6 +8,7 @@ use wechrss::{
         EnqueueResult, JobRepository, JobRepositoryError, JobRepositoryTransaction,
         PostgresJobRepository,
     },
+    persistence::unit_of_work::UnitOfWorkFactory,
 };
 
 const OWNER_A: &str = "integration-worker-a";
@@ -192,5 +193,61 @@ async fn postgres_repository_enforces_claims_fencing_recovery_and_transactions(p
         .find(rollback_id)
         .await
         .expect("rolled-back lookup should succeed")
+        .is_none());
+
+    let unit_of_work_factory = UnitOfWorkFactory::new(pool.clone());
+    let committed_id = {
+        let mut unit = unit_of_work_factory
+            .begin()
+            .await
+            .expect("unit of work should begin");
+        let result = unit
+            .jobs()
+            .enqueue(spec(format!("{prefix}unit-commit"), 1, 0))
+            .await
+            .expect("unit-of-work enqueue should succeed");
+        let id = match result {
+            EnqueueResult::Inserted(job) => job.id(),
+            EnqueueResult::AlreadyActive { .. } => panic!("unit-of-work job should insert"),
+        };
+        assert!(repository_a
+            .find(id)
+            .await
+            .expect("uncommitted job lookup should succeed")
+            .is_none());
+        unit.commit()
+            .await
+            .expect("unit-of-work commit should succeed");
+        id
+    };
+    assert!(repository_a
+        .find(committed_id)
+        .await
+        .expect("committed job lookup should succeed")
+        .is_some());
+
+    let rolled_back_id = {
+        let mut unit = unit_of_work_factory
+            .begin()
+            .await
+            .expect("second unit of work should begin");
+        let result = unit
+            .jobs()
+            .enqueue(spec(format!("{prefix}unit-rollback"), 1, 0))
+            .await
+            .expect("second unit-of-work enqueue should succeed");
+        let id = match result {
+            EnqueueResult::Inserted(job) => job.id(),
+            EnqueueResult::AlreadyActive { .. } => panic!("unit-of-work job should insert"),
+        };
+        unit.rollback()
+            .await
+            .expect("unit-of-work rollback should succeed");
+        id
+    };
+    assert!(repository_a
+        .find(rolled_back_id)
+        .await
+        .expect("rolled-back unit-of-work lookup should succeed")
         .is_none());
 }
