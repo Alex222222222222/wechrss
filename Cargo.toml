@@ -14,9 +14,9 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 envy = "0.4"
 fantoccini = "0.22"
-quick-xml = "0.37"
 rand = "0.9"
 rand_distr = "0.5"
+rss = "2.1"
 scraper = "0.22"
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }

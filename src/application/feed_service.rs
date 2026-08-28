@@ -17,8 +17,8 @@
 //!   semantics.
 //!
 //! Dependencies: source/feed-token lookup, source-scoped RSS input queries,
-//! `rss::renderer`, `feed_cache_repository`, `job_service`, and the persistence
-//! `UnitOfWorkFactory`. Freshness and lease metadata returned by production
+//! the implemented `rss::renderer`, `feed_cache_repository`, `job_service`,
+//! and the persistence `UnitOfWorkFactory`. Freshness and lease metadata returned by production
 //! persistence are based on PostgreSQL time. The service must not depend on
 //! acquisition adapters, WebDriver, WeRead credentials, or raw SQLx types.
 //!
@@ -43,5 +43,5 @@
 //! they must not reset the full 30-minute freshness period.
 
 // TODO(design): define FeedService ports and result DTOs over the implemented
-// feed-cache read/publication contracts before implementing the Axum feed
-// handler.
+// renderer and feed-cache read/publication contracts before implementing the
+// Axum feed handler.

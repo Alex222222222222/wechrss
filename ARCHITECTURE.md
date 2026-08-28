@@ -5,7 +5,8 @@ This document describes the planned Rust implementation of the existing
 incremental: it defines boundaries and ownership, with the domain/configuration
 policies and the first PostgreSQL job/cache-persistence slices implemented
 while network access, browser automation, and HTTP behavior remain
-unimplemented.
+unimplemented. The pure RSS renderer is now executable, but it is not yet
+wired to a feed service or HTTP route.
 
 ## Goals
 
@@ -40,7 +41,7 @@ The current and target contracts must not be confused:
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, and PostgreSQL-clocked SQLx job operations | Remove caller `now` parameters only in a later queue-port contract release |
 | Configuration | Original `AppConfig`, including legacy archive settings | Planned role, account-lease, cooldown, stale-cache, safe-admin, and optional-asset settings must be implemented and tested before deployment uses them |
 | Persistence | Job/source-scheduling/feed-cache tables, their PostgreSQL repositories, shared job/source/feed-cache transaction boundary, account leases, and feed-build leases | Source-service lifecycle orchestration, credential records, articles, sync runs, and their remaining transaction-scoped views are design-only |
-| Acquisition/web/RSS | A validated public WeChat article URL value object | Browser capabilities, application/repository ports, and concrete adapters or handlers remain future work |
+| Acquisition/web/RSS | A validated public WeChat article URL value object and pure RSS renderer | Browser capabilities, application/repository ports, and concrete adapters or handlers remain future work |
 
 Planned environment variables in this document are not parsed or effective
 runtime configuration merely because they are documented. Until the
@@ -432,7 +433,8 @@ The current persistence slice implements the cache read and the final
 revision/fence compare-and-swap publication. It does not yet implement source
 configuration or article persistence, so callers must currently provide the
 source revision and normalized rendered candidate through test/application
-ports. The feed route and renderer remain future work.
+ports. The pure renderer is implemented in `src/rss/renderer.rs`; the feed
+service and route remain future work.
 
 Cache replacement uses compare-and-swap semantics. A renderer records the
 source revision of its database snapshot, and the repository stores the result
@@ -571,7 +573,9 @@ reserved for the remaining modules.
 - SQLx with PostgreSQL for the pool, transactions, repositories, and embedded
   migrations (`postgres`, `runtime-tokio-rustls`, and `migrate` features).
 - Fantoccini for WebDriver browser sessions.
-- Serde, URL, Base64, and HTML/XML libraries for parsing and rendering.
+- Serde, URL, Base64, and HTML parsing libraries for normalized data.
+- The `rss` crate for RSS 2.0 serialization, stable GUIDs, namespaces, and
+  `content:encoded` output; the renderer hashes the resulting bytes for ETags.
 - Tracing for structured diagnostics.
 - Thiserror/Anyhow for typed boundary errors and application context.
 - Secrecy for in-memory secret handling.
@@ -702,8 +706,8 @@ than add more empty module shells. Work proceeds in this order:
    revision-aware feed-cache publication view, account lease, and feed-build
    lease repositories are also executable. No source or feed application
    service may bypass these boundaries with convenience transactions.
-4. Add the RSS renderer and make `FeedService` executable over the persisted
-   cache, then add the remaining source/article/archive queries.
+4. Make `FeedService` executable over the persisted cache, then add the
+   remaining source/article/archive queries.
 5. Build role-aware runtime composition, scheduler/worker loops, heartbeat
    cancellation, and degraded browser health behavior.
 6. Implement verified URL and browser capability types before Fantoccini
@@ -743,7 +747,9 @@ repository and its scheduling columns are implemented in
 with PostgreSQL row locking, inserts canonical source-sync jobs, and records
 short reservations in one transaction. Remaining source-service orchestration,
 article, sync-run, credential, archive, and other repository views remain
-future work.
+future work. The pure RSS renderer in `src/rss/renderer.rs` is executable and
+produces revision-tagged cache candidates, but it is not yet wired to database
+reads or `FeedService`.
 
 The remaining tree intentionally contains no route handlers, browser calls,
 article/source-configuration queries, scheduler loops, credential persistence,

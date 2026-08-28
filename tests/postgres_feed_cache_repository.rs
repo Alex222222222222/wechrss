@@ -14,6 +14,7 @@ use wechrss::{
         },
         unit_of_work::UnitOfWorkFactory,
     },
+    rss::renderer::{RenderArticle, RenderFeedInput, RssRenderer},
 };
 
 #[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
@@ -106,6 +107,48 @@ async fn postgres_feed_cache_publishes_and_reads_through_unit_of_work(pool: PgPo
         .expect("cache read should succeed")
         .expect("original cache should remain after rollback");
     assert_eq!(cache.cache().xml_bytes(), b"<rss><channel/></rss>");
+}
+
+#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+async fn rendered_feed_candidate_publishes_through_fenced_cache_path(pool: PgPool) {
+    let source_id = insert_source(&pool, 1).await;
+    let generated_at = Utc::now() - chrono::Duration::seconds(1);
+    let candidate = RssRenderer
+        .render(RenderFeedInput {
+            source_id,
+            title: "Test feed".to_owned(),
+            feed_url: "https://rss.example.test/feed".to_owned(),
+            description: "Integration test feed".to_owned(),
+            source_revision: FeedRevision::from_u64(1),
+            generated_at,
+            expires_at: generated_at + chrono::Duration::minutes(30),
+            articles: vec![RenderArticle {
+                review_id: "review-1".to_owned(),
+                title: "An article".to_owned(),
+                author: Some("Author".to_owned()),
+                summary: Some("A summary".to_owned()),
+                original_url: Some("https://mp.weixin.qq.com/s/article".to_owned()),
+                published_at: at(110),
+                content_html: "<p>Archived content</p>".to_owned(),
+            }],
+        })
+        .expect("normalized feed should render")
+        .into_candidate();
+
+    let lease_repository = PostgresFeedBuildLeaseRepository::new(pool.clone());
+    publish(&pool, &lease_repository, candidate.clone()).await;
+
+    let cache = PostgresFeedCacheRepository::new(pool)
+        .get(source_id)
+        .await
+        .expect("cache read should succeed")
+        .expect("rendered candidate should be readable");
+    assert!(cache.is_fresh());
+    assert_eq!(cache.cache().feed_revision(), FeedRevision::from_u64(1));
+    assert_eq!(cache.cache().etag(), candidate.etag());
+    assert_eq!(cache.cache().content_hash(), candidate.content_hash());
+    assert_eq!(cache.cache().xml_bytes(), candidate.xml_bytes());
+    assert_eq!(cache.cache().generated_at(), generated_at);
 }
 
 #[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
