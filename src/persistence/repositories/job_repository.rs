@@ -374,7 +374,9 @@ impl<'a> PostgresJobTransaction<'a> {
         transaction.rollback().await
     }
 
-    fn transaction_mut(&mut self) -> Result<&mut Transaction<'a, Postgres>, JobRepositoryError> {
+    pub(crate) fn transaction_mut(
+        &mut self,
+    ) -> Result<&mut Transaction<'a, Postgres>, JobRepositoryError> {
         self.transaction
             .as_mut()
             .ok_or_else(|| JobRepositoryError::Storage("transaction is closed".to_owned()))

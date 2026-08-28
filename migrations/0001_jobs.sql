@@ -87,6 +87,31 @@ CREATE INDEX IF NOT EXISTS jobs_expired_lease_idx
     ON jobs (lease_until ASC, id ASC)
     WHERE status = 'running';
 
+-- The source revision is the compare-and-swap fence for rendered RSS. The
+-- remaining source configuration columns can be added before the first
+-- published release without changing this initial migration's purpose.
+CREATE TABLE IF NOT EXISTS sources (
+    id UUID PRIMARY KEY,
+    feed_revision BIGINT NOT NULL DEFAULT 0 CHECK (feed_revision >= 0)
+);
+
+-- One current rendered document per source. XML is stored as bytes so the
+-- HTTP layer can return it without another serialization pass.
+CREATE TABLE IF NOT EXISTS feed_cache (
+    source_id UUID PRIMARY KEY REFERENCES sources (id) ON DELETE CASCADE,
+    xml_bytes BYTEA NOT NULL,
+    etag TEXT NOT NULL CHECK (btrim(etag) <> ''),
+    generated_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    feed_revision BIGINT NOT NULL CHECK (feed_revision >= 0),
+    content_hash TEXT NOT NULL CHECK (btrim(content_hash) <> ''),
+    updated_at TIMESTAMPTZ NOT NULL,
+    CHECK (expires_at > generated_at)
+);
+
+CREATE INDEX IF NOT EXISTS feed_cache_expiry_idx
+    ON feed_cache (expires_at ASC, source_id ASC);
+
 -- A lease row is the cross-replica mutex for one authenticated WeRead account.
 -- Credential material is intentionally stored by a separate future account
 -- table and never belongs in this coordination table.
@@ -102,10 +127,9 @@ CREATE INDEX IF NOT EXISTS account_leases_expiry_idx
     ON account_leases (lease_until ASC, account_id ASC);
 
 -- A build lease prevents concurrent RSS cache-miss requests from all rendering
--- the same source. The cache row and source revision are added in a later
--- revision-aware feed-cache slice.
+-- the same source.
 CREATE TABLE IF NOT EXISTS feed_build_leases (
-    source_id UUID PRIMARY KEY,
+    source_id UUID PRIMARY KEY REFERENCES sources (id) ON DELETE CASCADE,
     lease_owner TEXT NOT NULL CHECK (btrim(lease_owner) <> ''),
     lease_token UUID NOT NULL,
     lease_until TIMESTAMPTZ NOT NULL,

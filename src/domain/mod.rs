@@ -11,6 +11,7 @@
 
 pub mod article;
 pub mod credentials;
+pub mod feed;
 pub mod job;
 pub mod pacing;
 pub mod source;

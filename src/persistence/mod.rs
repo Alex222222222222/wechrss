@@ -15,8 +15,9 @@
 //! the job repository contract plus SQLx and memory implementations in
 //! [`repositories::job_repository`], and the PostgreSQL/memory account lease
 //! repository in [`repositories::account_lease_repository`] plus the durable
-//! feed-build lease repository in [`repositories::feed_cache_repository`].
-//! Revision-aware feed-cache rows and other repository SQL remain future work.
+//! feed-build lease and revision-aware feed-cache repository in
+//! [`repositories::feed_cache_repository`]. Source configuration, article,
+//! sync-run, credential, and archive repository SQL remain future work.
 
 pub mod postgres;
 pub mod repositories;

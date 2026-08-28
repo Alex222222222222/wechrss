@@ -3,7 +3,8 @@
 This document describes the planned Rust implementation of the existing
 `wechrss-main` Python service. The current Rust tree remains intentionally
 incremental: it defines boundaries and ownership, with the domain/configuration
-policies and the first PostgreSQL job-persistence slice implemented while
+policies and the first PostgreSQL job/cache-persistence slices implemented
+while
 network access, browser automation, scheduling, and HTTP behavior remain
 unimplemented.
 
@@ -27,10 +28,10 @@ unimplemented.
 This document describes the target version-one architecture, not the behavior
 of a deployable server. The binary is currently a no-op. The executable
 foundations are typed environment parsing for the original configuration set,
-pure pacing/quiet-hours policy, PostgreSQL pool/migration helpers, the job
-domain/repository slice, its shared transaction boundary, the stable account
-identity plus distributed account-lease slice, and the per-source feed-build
-lease slice.
+pure pacing/quiet-hours policy, PostgreSQL pool/migration helpers, the job and
+feed-cache domain/repository slices, their shared transaction boundary, the
+stable account identity plus distributed account-lease slice, and the
+per-source feed-build lease slice.
 
 The current and target contracts must not be confused:
 
@@ -39,7 +40,7 @@ The current and target contracts must not be confused:
 | Runtime | No server, routes, scheduler, worker, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, and PostgreSQL-clocked SQLx job operations | Remove caller `now` parameters only in a later queue-port contract release |
 | Configuration | Original `AppConfig`, including legacy archive settings | Planned role, account-lease, cooldown, stale-cache, safe-admin, and optional-asset settings must be implemented and tested before deployment uses them |
-| Persistence | Job table/repository, shared job transaction boundary, account-lease repository, and feed-build lease repository | Sources, credential records, articles, sync runs, feed-cache rows, and their transaction-scoped `UnitOfWork` views remain design-only |
+| Persistence | Job/source-revision/feed-cache tables, their PostgreSQL repositories, shared job/feed-cache transaction boundary, account leases, and feed-build leases | Source configuration, credential records, articles, sync runs, and their remaining transaction-scoped views are design-only |
 | Acquisition/web/RSS | Documentation-only boundaries | Capability types and application/repository ports must exist before concrete adapters or handlers |
 
 Planned environment variables in this document are not parsed or effective
@@ -340,8 +341,9 @@ docker rm --force wechrss-postgres-dev
 docker volume rm wechrss-postgres-dev-data
 ```
 
-The current implementation includes the `jobs`, `account_leases`, and
-`feed_build_leases` tables and their PostgreSQL repositories. The application
+The current implementation includes the minimal `sources` revision fence,
+`feed_cache`, `account_leases`, and `feed_build_leases` tables and their
+PostgreSQL repositories. The application
 uses SQLx's embedded `Migrator` to discover files
 under `migrations/`, record applied versions and checksums in
 `_sqlx_migrations`, and apply only pending migrations. The PostgreSQL
@@ -412,7 +414,7 @@ container timezone alone is not considered verified until that test passes.
 
 ## Feed cache
 
-The planned `feed_cache` table has one row per source:
+The `feed_cache` table has one row per source:
 
 ```text
 source_id, xml_bytes, etag, generated_at, expires_at,
@@ -425,6 +427,12 @@ content changes, and optional asset rewrites invalidate or rebuild the related
 row by incrementing `sources.feed_revision` in the mutation transaction. A row
 is fresh only when both `expires_at > now` and its revision equals the source
 revision.
+
+The current persistence slice implements the cache read and the final
+revision/fence compare-and-swap publication. It does not yet implement source
+configuration or article persistence, so callers must currently provide the
+source revision and normalized rendered candidate through test/application
+ports. The feed route and renderer remain future work.
 
 Cache replacement uses compare-and-swap semantics. A renderer records the
 source revision of its database snapshot, and the repository stores the result
@@ -686,13 +694,13 @@ than add more empty module shells. Work proceeds in this order:
    rollout for later schema changes so mixed replica versions remain safe;
    upgrade and concurrency tests are a gate.
 3. Extend the shared `UnitOfWork` with transaction-scoped repository ports and
-   implement revision-aware feed-cache reads/CAS publication. Account and
-   feed-build lease repositories are already executable, but credential records
-   must still be added before authenticated acquisition is enabled. No source
-   or feed application service may bypass these boundaries with convenience
-   transactions.
-4. Implement source, account/credential, article, sync-run, and feed-cache
-   repositories with PostgreSQL tests, then make `FeedService` executable.
+   implement source configuration, article, sync-run, and credential
+   repositories plus their transaction-scoped views. The revision-aware
+   feed-cache publication view, account lease, and feed-build lease repositories
+   are already executable. No source or feed application service may bypass
+   these boundaries with convenience transactions.
+4. Add the RSS renderer and make `FeedService` executable over the persisted
+   cache, then add the remaining source/article/archive queries.
 5. Build role-aware runtime composition, scheduler/worker loops, heartbeat
    cancellation, and degraded browser health behavior.
 6. Implement verified URL and browser capability types before Fantoccini
@@ -721,15 +729,15 @@ pacing and configuration modules have no network, browser, database, scheduler,
 or sleeping side effects. `UnitOfWorkFactory` and its transaction-scoped job
 view are implemented in `src/persistence/unit_of_work.rs`; the account-lease
 repository is implemented in
-`src/persistence/repositories/account_lease_repository.rs`, and the feed-build
-lease repository is implemented in
-`src/persistence/repositories/feed_cache_repository.rs`. The unit of work owns
-the shared commit/rollback boundary, while revision-aware feed-cache rows and
-the other repository views remain future work.
+`src/persistence/repositories/account_lease_repository.rs`. The source
+revision/feed-cache reader and transaction-scoped fenced publication are
+implemented in `src/persistence/repositories/feed_cache_repository.rs`, and
+`UnitOfWork` exposes that publication view. The remaining source configuration
+and other repository views remain future work.
 
 The remaining tree intentionally contains no route handlers, browser calls,
-article/source/feed-cache queries, scheduler loops, credential persistence, or
-business implementation. Documentation-only `FeedService`, source/article/feed-cache
+article/source-configuration queries, scheduler loops, credential persistence,
+or business implementation. Documentation-only `FeedService`, source/article
 repositories, and acquisition modules define the remaining ownership
 boundaries. `TODO(design)` markers identify existing code and migrations that
 must change before those contracts are implemented.

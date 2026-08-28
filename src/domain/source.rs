@@ -50,6 +50,42 @@ impl fmt::Display for SourceId {
     }
 }
 
+/// Monotonic revision of the feed-visible state for one source.
+///
+/// The value is persisted as a non-negative PostgreSQL `BIGINT`. A revision
+/// changes only when the normalized source/article data can change RSS output;
+/// idempotent retries must reuse the current value. It is intentionally kept
+/// separate from timestamps because timestamps cannot fence two concurrent
+/// rebuilds reliably.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FeedRevision(u64);
+
+impl FeedRevision {
+    /// Returns the initial revision for a newly created source.
+    pub const fn zero() -> Self {
+        Self(0)
+    }
+
+    /// Wraps a persisted or otherwise trusted revision value.
+    pub const fn from_u64(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the numeric value used by domain comparisons and persistence.
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    /// Advances the revision, returning `None` only at the numeric limit.
+    pub const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+}
+
 /// Fencing token for one feed-build lease incarnation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -138,4 +174,4 @@ impl FeedBuildLease {
 }
 
 // TODO(design): define the complete Source aggregate, SchedulingGate, failure
-// cooldown/reservation fields, and monotonic FeedRevision value types.
+// cooldown/reservation fields, account relationship, and feed-token metadata.

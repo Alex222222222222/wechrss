@@ -5,17 +5,18 @@
 //! completion atomic without exposing SQLx transactions to application code.
 //!
 //! `UnitOfWorkFactory::begin` creates one short-lived SQLx transaction. Its
-//! returned handle exposes a transaction-scoped job view today; source, article,
-//! sync-run, and feed-cache views will be added as their repository contracts
-//! become executable. Only the unit of work can commit; dropping it or
-//! returning an error rolls all component writes back. Repository views borrow
-//! the unit of work and therefore cannot outlive or independently commit their
-//! transaction.
+//! returned handle exposes transaction-scoped job and feed-cache views today;
+//! source, article, and sync-run views will be added as their repository
+//! contracts become executable. Only the unit of work can commit; dropping it
+//! or returning an error rolls all component writes back. Repository views
+//! borrow the unit of work and therefore cannot outlive or independently commit
+//! their transaction.
 //!
 //! Minimum executable contract:
 //!
 //! - `UnitOfWorkFactory::begin()` creates the transaction;
 //! - `jobs()` borrows the transaction-scoped job repository view;
+//! - `feed_cache()` borrows the transaction-scoped feed-cache publication view;
 //! - `commit(self)` is the only successful exit for a completed unit of work;
 //! - `rollback(self)` is available for explicit cleanup in tests or callers
 //!   that need to await rollback; and
@@ -40,7 +41,7 @@
 //!    changes, and advance to the candidate revision when feed-visible data
 //!    changed;
 //! 5. persist an already-rendered cache payload only for that exact revision,
-//!    verify/release any feed-build lease, update the sync run and source
+//!    verify/release the feed-build lease, update the sync run and source
 //!    schedule/gate, and mark the job successful;
 //! 6. commit once.
 //!
@@ -53,15 +54,16 @@
 //! transaction, so future fenced job outcomes can commit together with business
 //! writes. If ownership is lost, the unit of work rolls back instead of
 //! publishing writes from a stale worker. Cache compare-and-swap and feed-build
-//! fencing checks will also happen inside this transaction once their views are
-//! implemented.
+//! fencing checks happen inside this transaction through the feed-cache view.
 
 use std::fmt;
 
 use sqlx::PgPool;
 use thiserror::Error;
 
-use super::repositories::job_repository::PostgresJobTransaction;
+use super::repositories::{
+    feed_cache_repository::PostgresFeedCacheTransaction, job_repository::PostgresJobTransaction,
+};
 
 /// Errors raised while opening or completing a unit of work.
 #[derive(Debug, Error)]
@@ -112,6 +114,11 @@ impl<'a> UnitOfWork<'a> {
         &mut self.jobs
     }
 
+    /// Borrows the transaction-scoped feed-cache publication view.
+    pub fn feed_cache(&mut self) -> PostgresFeedCacheTransaction<'_, 'a> {
+        PostgresFeedCacheTransaction::new(&mut self.jobs)
+    }
+
     /// Commits all mutations made through this unit of work.
     pub async fn commit(self) -> Result<(), UnitOfWorkError> {
         self.jobs
@@ -138,6 +145,6 @@ impl fmt::Debug for UnitOfWork<'_> {
     }
 }
 
-// TODO(design): add source, article, sync-run, and feed-cache views; move
-// verify-fence and business-coupled outcomes behind this boundary; and prevent
-// SyncService from receiving a job-only commit API.
+// TODO(design): add source, article, and sync-run views; move verify-fence and
+// business-coupled job outcomes behind this boundary; and prevent SyncService
+// from receiving a job-only commit API.

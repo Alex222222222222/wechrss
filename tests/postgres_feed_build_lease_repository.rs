@@ -12,6 +12,11 @@ use wechrss::{
 async fn postgres_feed_build_lease_serializes_builders_and_supports_fenced_takeover(pool: PgPool) {
     let repository = PostgresFeedBuildLeaseRepository::new(pool.clone());
     let source_id = SourceId::from_uuid(Uuid::new_v4());
+    sqlx::query("INSERT INTO sources (id) VALUES ($1)")
+        .bind(source_id.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("test source should be insertable");
 
     let (builder_a, builder_b) = tokio::join!(
         repository.acquire_build(source_id, "builder-a", Duration::seconds(30)),
