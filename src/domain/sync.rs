@@ -1,7 +1,7 @@
 //! Synchronization result and status model.
 //!
 //! This module describes sync runs, received/new article counts, archive and
-//! asset outcomes, timestamps, and typed error classifications.
+//! optional asset outcomes, timestamps, and typed error classifications.
 //!
 //! Responsibilities: distinguish successful, running, authentication-expired,
 //! risk-control, blocked, retryable, and failed outcomes. Risk-control is an

@@ -2,7 +2,8 @@
 //!
 //! Documents administrative endpoints for authentication, sources, articles,
 //! manual sync, backfill, health/readiness, and job status. It also documents
-//! the public/tokenized feed and media routes.
+//! the public/tokenized feed and the optional media route used by archived
+//! binary assets.
 //!
 //! Request DTO validation happens here; use-case sequencing belongs to
 //! application services. Access and refresh tokens must never appear in

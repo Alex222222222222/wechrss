@@ -11,7 +11,8 @@ unimplemented.
 
 - Fetch WeChat public-account articles through a browser-driven acquisition
   layer.
-- Archive sanitized article HTML and its assets.
+- Archive sanitized article HTML; article-asset caching is optional in version
+  one.
 - Generate RSS feeds from archived data.
 - Support multiple application instances with PostgreSQL-coordinated jobs.
 - Keep RSS requests fast through a persisted 30-minute feed cache.
@@ -78,15 +79,19 @@ timezone, such as `Asia/Shanghai`.
 5. Each article URL is fetched separately from the public WeChat article page.
    This content fetch does not receive WeRead credentials and does not depend
    on the account login; it uses bounded waits and controlled scrolls for
-   lazy-loaded content, then normalizes metadata, HTML, and assets.
-6. HTML is sanitized and asset URLs are rewritten to local archive URLs.
-7. Articles and archive records are upserted transactionally.
+   lazy-loaded content, then normalizes metadata, HTML, and asset references.
+6. HTML is sanitized. Version one may retain approved external asset URLs and
+   skip binary asset downloads; an optional asset-archive mode stores assets and
+   rewrites those URLs to local media URLs.
+7. Articles and archive records are upserted transactionally. Asset metadata is
+   written only when optional asset archiving is enabled.
 8. The source feed is rendered and written to `feed_cache`.
 9. The job, sync run, source status, and next schedule are committed.
 
 All synchronization work must be idempotent. A worker can crash after an
-upsert and before job completion; retrying must not create duplicate articles,
-content versions, or assets.
+upsert and before job completion; retrying must not create duplicate articles or
+content versions. If optional asset archiving is enabled, asset writes must be
+deduplicated as well.
 
 ### Serve RSS
 
@@ -263,7 +268,8 @@ article_revision, content_hash, updated_at
 
 The default freshness period is 30 minutes. Successful article fetches
 proactively rebuild the cache. Source edits, article updates, URL backfills,
-content changes, and asset rewrites invalidate or rebuild the related row.
+content changes, and optional asset rewrites invalidate or rebuild the related
+row.
 
 The feed endpoint returns `ETag`, `Last-Modified`, and
 `Cache-Control: public, max-age=1800`. The database cache is an application
@@ -306,15 +312,19 @@ deduplication, and feed-cache reads/writes are persistence responsibilities.
 
 ### Archive
 
-Sanitization, asset persistence, checksum-based deduplication, and URL
-rewriting. The `AssetStore` abstraction supports a local persistent volume
-first and S3-compatible storage later.
+Sanitization is required. Asset persistence, checksum-based deduplication, and
+URL rewriting are optional in version one. When enabled, the `AssetStore`
+abstraction supports a local persistent volume first and S3-compatible storage
+later. Without it, the sanitizer retains only approved external asset URLs and
+the application does not need binary asset storage or media delivery.
 
 ### RSS
 
 Pure rendering from normalized records. It does not fetch upstream content,
 open browsers, or decide when synchronization occurs. It emits stable GUIDs,
-escaped XML, archived HTML, rewritten assets, and an ETag/content hash.
+escaped XML, archived HTML, approved external asset URLs by default, and an
+ETag/content hash. If optional asset archiving is enabled, it may instead emit
+rewritten local asset URLs.
 
 ### Web
 

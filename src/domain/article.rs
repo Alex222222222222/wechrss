@@ -6,7 +6,9 @@
 //! source relationship, content hash, and archived HTML.
 //!
 //! Responsibilities: describe stable identity, idempotent upsert expectations,
-//! content revisions, and asset references.
+//! content revisions, and optional asset references. Asset references may remain
+//! external in version one; binary asset caching is not required for an article
+//! to be archived or rendered.
 //!
 //! Non-responsibilities: HTML sanitization, asset downloads, SQL statements,
 //! RSS XML rendering, and browser extraction.

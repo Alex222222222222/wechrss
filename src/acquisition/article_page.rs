@@ -14,7 +14,8 @@
 //! timing or behavior simulation in selectors.
 //!
 //! The resulting content is passed to `ArchiveService`, which sanitizes it,
-//! stores assets, rewrites URLs, and causes the source feed cache to update.
+//! optionally stores assets and rewrites URLs, and causes the source feed cache
+//! to update.
 
 //! Article-list acquisition and account/session management belong to
 //! [`super::weread`]. This module only consumes an article URL and uses an
