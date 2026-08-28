@@ -5,8 +5,9 @@ This document describes the planned Rust implementation of the existing
 incremental: it defines boundaries and ownership, with the domain/configuration
 policies and the first PostgreSQL job/cache-persistence slices implemented
 while network access, browser automation, and HTTP behavior remain
-unimplemented. The pure RSS renderer is now executable, but it is not yet
-wired to a feed service or HTTP route.
+unimplemented. The pure RSS renderer and cache-first feed delivery decision
+service are executable, but they are not yet wired to a feed-token lookup or
+HTTP route.
 
 ## Goals
 
@@ -148,8 +149,10 @@ enabled, asset writes must be deduplicated as well.
 2. A fresh cache is returned immediately with its ETag.
 3. A stale cache is returned immediately while a deduplicated rebuild job is
    enqueued. A stale response is not advertised as fresh to downstream caches.
-4. If no cache exists, `FeedService` performs a database-only render through a
-   per-source single-flight/CAS path, stores it, and returns it. Concurrent
+4. In the current cache-first implementation, a cache miss enqueues a
+   deduplicated rebuild and returns a typed temporary-unavailable result with
+   `Retry-After`; it does not render in the request. A future database-only
+   single-flight/CAS path may populate and return the first document. Concurrent
    misses must not all render and overwrite the same source feed.
 
 RSS requests never start browser work or wait for a synchronization job.
@@ -242,6 +245,43 @@ expiry allows one refresh and one retry. Risk-control or verification states
 stop the job and move the source to an operator-blocked scheduling state; they
 do not trigger a retry loop. Quiet hours are a scheduling and politeness
 boundary, not a way to evade verification or anti-automation controls.
+
+### V1 queue transport decision
+
+Version one keeps the custom PostgreSQL `jobs` table as the authoritative
+application queue. It owns the durable job lifecycle, active-job
+deduplication, retry and failure counters, quiet-hours deferral, leases,
+fencing tokens, and the transaction-scoped completion contract. The
+cache-first `FeedService` currently enqueues `feed_rebuild` rows through this
+table using the canonical `feed_rebuild:{source_id}` key.
+
+PGMQ is a possible future transport optimization, not a version-one
+replacement for the `jobs` table. If it is evaluated later, the safe hybrid
+shape is:
+
+```text
+application jobs table = authoritative lifecycle, dedupe, retry, lease, fence
+PGMQ message           = optional durable wakeup/transport for a job id
+```
+
+A future PGMQ adapter must preserve the following rules:
+
+1. The `jobs` row remains the source of truth. A PGMQ visibility timeout must
+   not be treated as the application's lease or fencing token.
+2. A message should carry only a durable job identifier (and optionally a
+   version), never credentials or a second copy of mutable job state. Workers
+   must re-read and claim the `jobs` row before executing work.
+3. Enqueueing a job and publishing its wakeup must be made transactionally
+   consistent, or an outbox/reconciliation path must repair either side. A
+   message that arrives twice is harmless because job claiming and active
+   deduplication remain authoritative.
+4. PGMQ extension or SQL-only installation, version compatibility, migration
+   ownership, observability, and recovery behavior must be proven in a
+   separate deployment experiment before adding it as a required dependency.
+
+Until those conditions are satisfied, adding PGMQ would increase deployment
+and migration surface without removing the correctness responsibilities
+already handled by the custom table.
 
 ## Source scheduling and account leases
 
@@ -490,9 +530,10 @@ interfaces but do not contain SQL or browser selectors. `Scheduler` only
 enqueues work and applies quiet-hours eligibility. `SyncService` executes
 claimed work and re-checks quiet hours between upstream operations.
 `ArchiveService` owns the content pipeline. `JobService` owns leases and
-transitions. `FeedService` owns feed-token lookup, conditional reads,
-fresh/stale/missing decisions, single-flight cache population, and rebuild
-orchestration. Application services receive a `UnitOfWorkFactory` for atomic
+transitions. `FeedService` owns conditional reads, fresh/stale/missing
+decisions, and deduplicated rebuild enqueueing over the persisted cache.
+Feed-token lookup, single-flight cache population, and rebuild orchestration
+remain future extensions. Application services receive a `UnitOfWorkFactory` for atomic
 final writes; they do not compose independent repository transactions.
 
 ### Acquisition
@@ -706,7 +747,8 @@ than add more empty module shells. Work proceeds in this order:
    revision-aware feed-cache publication view, account lease, and feed-build
    lease repositories are also executable. No source or feed application
    service may bypass these boundaries with convenience transactions.
-4. Make `FeedService` executable over the persisted cache, then add the
+4. Make `FeedService` executable over the persisted cache (cache-first
+   delivery and deduplicated rebuild enqueueing are implemented), then add the
    remaining source/article/archive queries.
 5. Build role-aware runtime composition, scheduler/worker loops, heartbeat
    cancellation, and degraded browser health behavior.
@@ -748,12 +790,17 @@ with PostgreSQL row locking, inserts canonical source-sync jobs, and records
 short reservations in one transaction. Remaining source-service orchestration,
 article, sync-run, credential, archive, and other repository views remain
 future work. The pure RSS renderer in `src/rss/renderer.rs` is executable and
-produces revision-tagged cache candidates, but it is not yet wired to database
-reads or `FeedService`.
+produces revision-tagged cache candidates. The cache-first `FeedService` in
+`src/application/feed_service.rs` is also executable: it serves fresh or stale
+rows, honors conditional ETags, and enqueues deduplicated rebuild jobs through
+the custom `jobs` table adapter. It is not yet wired to feed-token lookup, the
+normalized article query, the database-only rebuild/publish workflow, or an
+HTTP route.
 
 The remaining tree intentionally contains no route handlers, browser calls,
 article/source-configuration queries, scheduler loops, credential persistence,
-or business implementation. Documentation-only `FeedService`, source/article
-repositories, and acquisition modules define the remaining ownership
-boundaries. `TODO(design)` markers identify existing code and migrations that
-must change before those contracts are implemented.
+or business implementation. Source/article repositories and acquisition
+modules remain documentation-only; `FeedService` now implements only the
+cache-delivery boundary described above. `TODO(design)` markers identify
+existing code and migrations that must change before the remaining contracts
+are implemented.

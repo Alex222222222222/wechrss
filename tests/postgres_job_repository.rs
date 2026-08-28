@@ -38,6 +38,43 @@ fn spec(key: String, max_attempts: u32, run_after: i64) -> NewJob {
 }
 
 #[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+async fn postgres_immediate_enqueue_uses_database_clock_for_due_and_audit_timestamps(pool: PgPool) {
+    let repository = PostgresJobRepository::new(pool.clone());
+    let future = Utc::now() + Duration::days(365);
+    let dedupe_key = format!("integration:immediate:{}", Uuid::new_v4());
+
+    let inserted = repository
+        .enqueue_immediately(NewJob {
+            job_type: JobType::FeedRebuild,
+            source_id: None,
+            priority: 1,
+            run_after: future,
+            max_attempts: 1,
+            payload: json!({"test": true}),
+            dedupe_key: dedupe_key.clone(),
+            now: future,
+        })
+        .await
+        .expect("immediate enqueue should succeed");
+    assert!(matches!(inserted, EnqueueResult::Inserted(_)));
+
+    let (run_after, created_at, updated_at): (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) =
+        sqlx::query_as("SELECT run_after, created_at, updated_at FROM jobs WHERE dedupe_key = $1")
+            .bind(dedupe_key)
+            .fetch_one(&pool)
+            .await
+            .expect("immediate job timestamps should be queryable");
+    let database_now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&pool)
+        .await
+        .expect("database time should be queryable");
+
+    assert!(run_after <= database_now);
+    assert!(created_at <= database_now);
+    assert_eq!(created_at, updated_at);
+}
+
+#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
 async fn postgres_repository_enforces_claims_fencing_recovery_and_transactions(pool: PgPool) {
     let repository_a = PostgresJobRepository::new(pool.clone());
     let repository_b = PostgresJobRepository::new(pool.clone());

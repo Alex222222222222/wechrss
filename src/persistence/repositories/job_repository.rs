@@ -31,6 +31,9 @@
 //! - `claim_next` selects due rows matching the supplied allowed type set with
 //!   `FOR UPDATE SKIP LOCKED`, assigns a fresh `lease_token`, and increments
 //!   `claim_count`; an empty set claims nothing;
+//! - `PostgresJobRepository::enqueue_immediately` uses one statement-local
+//!   `clock_timestamp()` for an immediately eligible job's due and audit
+//!   timestamps, which prevents a replica clock skew from delaying wakeups;
 //! - heartbeat, success, retry, deferral, and failure updates must match `id`,
 //!   `lease_owner`, `lease_token`, and a live `lease_until` in their update
 //!   predicate, so stale workers cannot mutate a later claim; and
@@ -341,6 +344,26 @@ impl PostgresJobRepository {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+
+    /// Enqueues an immediately eligible job using PostgreSQL server time.
+    ///
+    /// The `NewJob` timestamp fields are still required by the shared domain
+    /// input, but this PostgreSQL-specific path replaces `run_after`,
+    /// `created_at`, and `updated_at` with one statement-local
+    /// `clock_timestamp()` value before inserting. This is intended for
+    /// cross-replica wakeups such as feed rebuilds, where a skewed application
+    /// clock must not accidentally schedule work in the future.
+    pub async fn enqueue_immediately(
+        &self,
+        spec: NewJob,
+    ) -> Result<EnqueueResult, JobRepositoryError> {
+        let mut transaction = PostgresJobTransaction::begin(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        let result = transaction.enqueue_internal(spec, true).await?;
+        transaction.commit_inner().await.map_err(storage_error)?;
+        Ok(result)
+    }
 }
 
 /// Transaction-scoped SQLx job repository.
@@ -380,6 +403,78 @@ impl<'a> PostgresJobTransaction<'a> {
         self.transaction
             .as_mut()
             .ok_or_else(|| JobRepositoryError::Storage("transaction is closed".to_owned()))
+    }
+
+    // TODO(design): move this operation into the eventual queue port so
+    // immediate scheduling does not depend on the interim repository type.
+    async fn enqueue_internal(
+        &mut self,
+        spec: NewJob,
+        use_database_time: bool,
+    ) -> Result<EnqueueResult, JobRepositoryError> {
+        let job = Job::new(spec)?;
+        let query = format!(
+            r#"
+            WITH db_clock AS MATERIALIZED (
+                SELECT clock_timestamp() AS now
+            )
+            INSERT INTO jobs ({JOB_COLUMNS})
+            SELECT $1, $2, $3, $4, $5,
+                   CASE WHEN $21 THEN db_clock.now ELSE $6 END,
+                   $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                   CASE WHEN $21 THEN db_clock.now ELSE $19 END,
+                   CASE WHEN $21 THEN db_clock.now ELSE $20 END
+            FROM db_clock
+            ON CONFLICT (dedupe_key) WHERE status IN ({ACTIVE_STATUSES}) DO NOTHING
+            RETURNING {JOB_COLUMNS}
+            "#
+        );
+        let transaction = self.transaction_mut()?;
+        let row = sqlx::query(&query)
+            .bind(job.id())
+            .bind(job_type_name(job.job_type()))
+            .bind(job.source_id())
+            .bind(status_name(job.status()))
+            .bind(job.priority())
+            .bind(job.run_after())
+            .bind(i64::from(job.claim_count()))
+            .bind(i64::from(job.failure_count()))
+            .bind(i64::from(job.max_attempts()))
+            .bind(job.lease_owner().map(str::to_owned))
+            .bind(job.lease_token().map(LeaseToken::as_uuid))
+            .bind(job.lease_until())
+            .bind(job.heartbeat_at())
+            .bind(job.started_at())
+            .bind(job.finished_at())
+            .bind(job.last_error().map(str::to_owned))
+            .bind(job.payload())
+            .bind(job.dedupe_key())
+            .bind(job.created_at())
+            .bind(job.updated_at())
+            .bind(use_database_time)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+
+        if let Some(row) = row {
+            return Ok(EnqueueResult::Inserted(Box::new(decode_job(row)?)));
+        }
+
+        let row = sqlx::query(&format!(
+            "SELECT id FROM jobs WHERE dedupe_key = $1 AND status IN ({ACTIVE_STATUSES}) ORDER BY created_at ASC LIMIT 1"
+        ))
+        .bind(job.dedupe_key())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+        let Some(row) = row else {
+            return Err(JobRepositoryError::Storage(
+                "active job conflict was not found after insert conflict".to_owned(),
+            ));
+        };
+        Ok(EnqueueResult::AlreadyActive {
+            job_id: row.try_get("id").map_err(storage_error)?,
+        })
     }
 
     async fn find_in_transaction(
@@ -474,60 +569,7 @@ enum FencedOperation<'a> {
 
 impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
     async fn enqueue(&mut self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError> {
-        let job = Job::new(spec)?;
-        let query = format!(
-            r#"
-            INSERT INTO jobs ({JOB_COLUMNS})
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
-            ON CONFLICT (dedupe_key) WHERE status IN ({ACTIVE_STATUSES}) DO NOTHING
-            RETURNING {JOB_COLUMNS}
-            "#
-        );
-        let transaction = self.transaction_mut()?;
-        let row = sqlx::query(&query)
-            .bind(job.id())
-            .bind(job_type_name(job.job_type()))
-            .bind(job.source_id())
-            .bind(status_name(job.status()))
-            .bind(job.priority())
-            .bind(job.run_after())
-            .bind(i64::from(job.claim_count()))
-            .bind(i64::from(job.failure_count()))
-            .bind(i64::from(job.max_attempts()))
-            .bind(job.lease_owner().map(str::to_owned))
-            .bind(job.lease_token().map(LeaseToken::as_uuid))
-            .bind(job.lease_until())
-            .bind(job.heartbeat_at())
-            .bind(job.started_at())
-            .bind(job.finished_at())
-            .bind(job.last_error().map(str::to_owned))
-            .bind(job.payload())
-            .bind(job.dedupe_key())
-            .bind(job.created_at())
-            .bind(job.updated_at())
-            .fetch_optional(&mut **transaction)
-            .await
-            .map_err(storage_error)?;
-
-        if let Some(row) = row {
-            return Ok(EnqueueResult::Inserted(Box::new(decode_job(row)?)));
-        }
-
-        let row = sqlx::query(&format!(
-            "SELECT id FROM jobs WHERE dedupe_key = $1 AND status IN ({ACTIVE_STATUSES}) ORDER BY created_at ASC LIMIT 1"
-        ))
-        .bind(job.dedupe_key())
-        .fetch_optional(&mut **transaction)
-        .await
-        .map_err(storage_error)?;
-        let Some(row) = row else {
-            return Err(JobRepositoryError::Storage(
-                "active job conflict was not found after insert conflict".to_owned(),
-            ));
-        };
-        Ok(EnqueueResult::AlreadyActive {
-            job_id: row.try_get("id").map_err(storage_error)?,
-        })
+        self.enqueue_internal(spec, false).await
     }
 
     async fn claim_next(

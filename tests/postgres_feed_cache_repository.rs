@@ -2,6 +2,10 @@ use chrono::{DateTime, TimeZone, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 use wechrss::{
+    application::feed_service::{
+        FeedDelivery, FeedRebuildJobConfig, FeedRebuildStatus, FeedRequest, FeedService,
+        FeedServiceConfig, PostgresFeedRebuildQueue,
+    },
     domain::{
         feed::FeedCacheCandidate,
         source::{FeedRevision, SourceId},
@@ -12,6 +16,7 @@ use wechrss::{
             FeedCacheTransactionRepository, PostgresFeedBuildLeaseRepository,
             PostgresFeedCacheRepository,
         },
+        repositories::job_repository::PostgresJobRepository,
         unit_of_work::UnitOfWorkFactory,
     },
     rss::renderer::{RenderArticle, RenderFeedInput, RssRenderer},
@@ -149,6 +154,75 @@ async fn rendered_feed_candidate_publishes_through_fenced_cache_path(pool: PgPoo
     assert_eq!(cache.cache().content_hash(), candidate.content_hash());
     assert_eq!(cache.cache().xml_bytes(), candidate.xml_bytes());
     assert_eq!(cache.cache().generated_at(), generated_at);
+}
+
+#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+async fn feed_service_serves_stale_cache_and_deduplicates_rebuild_jobs(pool: PgPool) {
+    let source_id = insert_source(&pool, 1).await;
+    let lease_repository = PostgresFeedBuildLeaseRepository::new(pool.clone());
+    publish(
+        &pool,
+        &lease_repository,
+        candidate(source_id, 1, 10, 20, b"stale-feed", "etag-stale"),
+    )
+    .await;
+
+    let queue = PostgresFeedRebuildQueue::new(
+        PostgresJobRepository::new(pool.clone()),
+        FeedRebuildJobConfig::default(),
+    );
+    let service = FeedService::new(
+        PostgresFeedCacheRepository::new(pool.clone()),
+        queue,
+        FeedServiceConfig::default(),
+    );
+
+    let first = service
+        .get_feed(FeedRequest::new(source_id, None))
+        .await
+        .expect("stale cache should be returned");
+    assert!(matches!(
+        first,
+        FeedDelivery::Cached {
+            status: wechrss::application::feed_service::FeedCacheStatus::Stale,
+            rebuild: FeedRebuildStatus::Enqueued,
+            cache,
+        } if cache.xml_bytes() == b"stale-feed"
+    ));
+
+    let second = service
+        .get_feed(FeedRequest::new(source_id, None))
+        .await
+        .expect("duplicate stale request should still be served");
+    assert!(matches!(
+        second,
+        FeedDelivery::Cached {
+            rebuild: FeedRebuildStatus::AlreadyActive,
+            ..
+        }
+    ));
+
+    let job_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE dedupe_key = $1 AND status = 'queued'")
+            .bind(format!("feed_rebuild:{source_id}"))
+            .fetch_one(&pool)
+            .await
+            .expect("rebuild job should be queryable");
+    assert_eq!(job_count, 1);
+
+    let (run_after, created_at, updated_at): (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) =
+        sqlx::query_as("SELECT run_after, created_at, updated_at FROM jobs WHERE dedupe_key = $1")
+            .bind(format!("feed_rebuild:{source_id}"))
+            .fetch_one(&pool)
+            .await
+            .expect("rebuild timestamps should be queryable");
+    let database_now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&pool)
+        .await
+        .expect("database time should be queryable");
+    assert!(run_after <= database_now);
+    assert!(created_at <= database_now);
+    assert_eq!(created_at, updated_at);
 }
 
 #[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
