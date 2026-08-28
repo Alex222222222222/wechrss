@@ -5,9 +5,9 @@ This document describes the planned Rust implementation of the existing
 incremental: it defines boundaries and ownership, with the domain/configuration
 policies and the first PostgreSQL job/cache-persistence slices implemented
 while network access, browser automation, and HTTP behavior remain
-unimplemented. The pure RSS renderer and cache-first feed delivery decision
-service are executable, but they are not yet wired to a feed-token lookup or
-HTTP route.
+unimplemented. The pure RSS renderer, normalized article persistence, and
+cache-first feed delivery decision service are executable, but they are not yet
+wired to a feed-token lookup or HTTP route.
 
 ## Goals
 
@@ -41,7 +41,7 @@ The current and target contracts must not be confused:
 | Runtime | No server, routes, scheduler, worker, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, and PostgreSQL-clocked SQLx job operations | Remove caller `now` parameters only in a later queue-port contract release |
 | Configuration | Original `AppConfig`, including legacy archive settings | Planned role, account-lease, cooldown, stale-cache, safe-admin, and optional-asset settings must be implemented and tested before deployment uses them |
-| Persistence | Job/source-scheduling/feed-cache tables, their PostgreSQL repositories, shared job/source/feed-cache transaction boundary, account leases, and feed-build leases | Source-service lifecycle orchestration, credential records, articles, sync runs, and their remaining transaction-scoped views are design-only |
+| Persistence | Job/source-scheduling/article/feed-cache tables, their PostgreSQL repositories, shared job/source/article/feed-cache transaction boundary, account leases, and feed-build leases | Source-service lifecycle orchestration, credential records, sync runs, and their remaining transaction-scoped views are design-only |
 | Acquisition/web/RSS | A validated public WeChat article URL value object and pure RSS renderer | Browser capabilities, application/repository ports, and concrete adapters or handlers remain future work |
 
 Planned environment variables in this document are not parsed or effective
@@ -469,12 +469,13 @@ row by incrementing `sources.feed_revision` in the mutation transaction. A row
 is fresh only when both `expires_at > now` and its revision equals the source
 revision.
 
-The current persistence slice implements the cache read and the final
-revision/fence compare-and-swap publication. It does not yet implement source
-configuration or article persistence, so callers must currently provide the
-source revision and normalized rendered candidate through test/application
-ports. The pure renderer is implemented in `src/rss/renderer.rs`; the feed
-service and route remain future work.
+The current persistence slice implements source configuration, normalized
+article persistence, the cache read, and the final revision/fence
+compare-and-swap publication. Callers must still provide the source revision
+and normalized rendered candidate through application ports. The pure renderer
+is implemented in `src/rss/renderer.rs`; the cache-first feed service is
+implemented in `src/application/feed_service.rs`, while feed-token lookup and
+the HTTP route remain future work.
 
 Cache replacement uses compare-and-swap semantics. A renderer records the
 source revision of its database snapshot, and the repository stores the result
@@ -519,9 +520,16 @@ requests.
 ### Domain
 
 Pure business concepts and invariants. Domain modules do not depend on Axum,
-Fantoccini, SQLx, or concrete storage. Article identity is `review_id`; URLs
-may be absent or later replaced. Jobs and sync statuses are explicit types so
-retry and risk-control behavior cannot be represented as arbitrary strings.
+Fantoccini, SQLx, or concrete storage. Article storage identity is the pair
+`(source_id, review_id)`; `review_id` is the stable upstream identity within a
+source. URLs and content may be absent in a partial list observation and are
+merged with previously known detail data rather than treated as deletions.
+Article observations carry a monotonic version allocated before upstream work
+starts; persistence ignores an older version so out-of-order workers cannot
+regress newer RSS content. `fetched_at` records completion time and is never
+used as the ordering fence.
+Jobs and sync statuses are explicit types so retry and risk-control behavior
+cannot be represented as arbitrary strings.
 
 ### Application
 
@@ -741,15 +749,16 @@ than add more empty module shells. Work proceeds in this order:
    rollout for later schema changes so mixed replica versions remain safe;
    upgrade and concurrency tests are a gate.
 3. Extend the shared `UnitOfWork` with transaction-scoped repository ports and
-   complete the source service, article, sync-run, and credential repositories
-   plus their transaction-scoped views. Source identity/create/read,
+   complete the source service, sync-run, and credential repositories plus their
+   transaction-scoped views. Source identity/create/read,
+   normalized article persistence,
    scheduling state, and feed-revision mutations are already executable. The
    revision-aware feed-cache publication view, account lease, and feed-build
    lease repositories are also executable. No source or feed application
    service may bypass these boundaries with convenience transactions.
 4. Make `FeedService` executable over the persisted cache (cache-first
    delivery and deduplicated rebuild enqueueing are implemented), then add the
-   remaining source/article/archive queries.
+   remaining source/archive queries and database-only rebuild orchestration.
 5. Build role-aware runtime composition, scheduler/worker loops, heartbeat
    cancellation, and degraded browser health behavior.
 6. Implement verified URL and browser capability types before Fantoccini
@@ -787,20 +796,23 @@ transaction-scoped scheduling/gate/revision mutations are implemented in
 repository and its scheduling columns are implemented in
 `src/persistence/repositories/scheduler_repository.rs`; it selects due sources
 with PostgreSQL row locking, inserts canonical source-sync jobs, and records
-short reservations in one transaction. Remaining source-service orchestration,
-article, sync-run, credential, archive, and other repository views remain
-future work. The pure RSS renderer in `src/rss/renderer.rs` is executable and
+short reservations in one transaction. Normalized article domain values and
+the PostgreSQL article repository/transaction view are implemented in
+`src/domain/article.rs` and `src/persistence/repositories/article_repository.rs`;
+they provide idempotent upserts, feed-visible change detection, and
+source-scoped RSS ordering. Remaining source-service orchestration, sync-run,
+credential, archive, and other repository views remain future work. The pure
+RSS renderer in `src/rss/renderer.rs` is executable and
 produces revision-tagged cache candidates. The cache-first `FeedService` in
 `src/application/feed_service.rs` is also executable: it serves fresh or stale
 rows, honors conditional ETags, and enqueues deduplicated rebuild jobs through
 the custom `jobs` table adapter. It is not yet wired to feed-token lookup, the
-normalized article query, the database-only rebuild/publish workflow, or an
-HTTP route.
+database-only rebuild/publish workflow, or an HTTP route.
 
 The remaining tree intentionally contains no route handlers, browser calls,
-article/source-configuration queries, scheduler loops, credential persistence,
-or business implementation. Source/article repositories and acquisition
-modules remain documentation-only; `FeedService` now implements only the
-cache-delivery boundary described above. `TODO(design)` markers identify
-existing code and migrations that must change before the remaining contracts
-are implemented.
+source-configuration orchestration, scheduler loops, credential persistence,
+or business implementation. Source-service, sync-run, credential, archive, and
+acquisition modules remain documentation-only; article persistence and
+`FeedService` implement only the database/cache boundaries described above.
+`TODO(design)` markers identify existing code and migrations that must change
+before the remaining contracts are implemented.

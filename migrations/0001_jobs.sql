@@ -3,6 +3,14 @@
 -- representation. A later migration may add new values, but changing or
 -- removing values requires an explicit data migration.
 
+-- Allocated before upstream article acquisition starts. Gaps are expected when
+-- a worker reserves a version but fails before persisting its observation.
+CREATE SEQUENCE IF NOT EXISTS article_observation_version_seq
+    AS BIGINT
+    START WITH 1
+    INCREMENT BY 1
+    MINVALUE 1;
+
 CREATE TABLE IF NOT EXISTS jobs (
     id UUID PRIMARY KEY,
     job_type TEXT NOT NULL CHECK (
@@ -119,6 +127,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS sources_book_id_idx
 CREATE INDEX IF NOT EXISTS sources_due_idx
     ON sources (next_fetch_at ASC, priority DESC, id ASC)
     WHERE enabled AND scheduling_gate = 'ready';
+
+-- Normalized article state is keyed by source and the stable upstream
+-- review_id. Content is already sanitized before insertion. Version one keeps
+-- asset bytes outside this table; optional asset archiving can add separate
+-- metadata and relationships later.
+CREATE TABLE IF NOT EXISTS articles (
+    source_id UUID NOT NULL REFERENCES sources (id) ON DELETE CASCADE,
+    review_id TEXT NOT NULL CHECK (btrim(review_id) <> ''),
+    title TEXT NOT NULL CHECK (btrim(title) <> ''),
+    author TEXT,
+    summary TEXT,
+    cover_url TEXT,
+    original_url TEXT,
+    published_at TIMESTAMPTZ NOT NULL,
+    content_html TEXT NOT NULL DEFAULT '',
+    content_hash TEXT CHECK (content_hash IS NULL OR btrim(content_hash) <> ''),
+    observation_version BIGINT NOT NULL DEFAULT nextval('article_observation_version_seq')
+        CHECK (observation_version > 0),
+    fetched_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (source_id, review_id),
+    CHECK (cover_url IS NULL OR btrim(cover_url) <> ''),
+    CHECK (original_url IS NULL OR btrim(original_url) <> '')
+);
+
+CREATE INDEX IF NOT EXISTS articles_feed_order_idx
+    ON articles (source_id, published_at DESC, review_id ASC);
 
 -- One current rendered document per source. XML is stored as bytes so the
 -- HTTP layer can return it without another serialization pass.

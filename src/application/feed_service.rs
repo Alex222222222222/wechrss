@@ -53,8 +53,8 @@
 //! future transport optimization while the `jobs` row remains authoritative.
 //!
 //! TODO(design): add feed-token/source lookup and a database-only rebuild
-//! orchestration path after the normalized article query and transaction-scoped
-//! repositories are implemented.
+//! orchestration path over the normalized article query and fenced cache
+//! publication view.
 
 use std::fmt;
 
