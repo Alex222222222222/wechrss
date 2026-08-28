@@ -12,8 +12,10 @@
 //!
 //! The first implemented persistence slices are the PostgreSQL pool/migration
 //! helpers in [`postgres`], the shared transaction owner in [`unit_of_work`],
-//! and the job repository contract plus SQLx and memory implementations in
-//! [`repositories::job_repository`]. Other repository SQL remains future work.
+//! the job repository contract plus SQLx and memory implementations in
+//! [`repositories::job_repository`], and the PostgreSQL/memory account lease
+//! repository in [`repositories::account_lease_repository`]. Other repository
+//! SQL remains future work.
 
 pub mod postgres;
 pub mod repositories;

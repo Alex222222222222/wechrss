@@ -86,3 +86,17 @@ CREATE INDEX IF NOT EXISTS jobs_claim_idx
 CREATE INDEX IF NOT EXISTS jobs_expired_lease_idx
     ON jobs (lease_until ASC, id ASC)
     WHERE status = 'running';
+
+-- A lease row is the cross-replica mutex for one authenticated WeRead account.
+-- Credential material is intentionally stored by a separate future account
+-- table and never belongs in this coordination table.
+CREATE TABLE IF NOT EXISTS account_leases (
+    account_id UUID PRIMARY KEY,
+    lease_owner TEXT NOT NULL CHECK (btrim(lease_owner) <> ''),
+    lease_token UUID NOT NULL,
+    lease_until TIMESTAMPTZ NOT NULL,
+    heartbeat_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS account_leases_expiry_idx
+    ON account_leases (lease_until ASC, account_id ASC);
