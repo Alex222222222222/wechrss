@@ -676,11 +676,12 @@ than add more empty module shells. Work proceeds in this order:
    including safe admin defaults, disabled-by-default asset storage, runtime
    roles, lease/cooldown settings, and tests that reject misspelled
    application-owned variables.
-2. Complete the job queue slice with allowed-kind claiming and the eventual
-   queue/outcome/recovery ports. The initial `0001_jobs.sql` migration already
-   adds `deferred`, separate claim/failure counters, and PostgreSQL-authoritative
-   lease time. Use an expand/contract rollout for later schema changes so mixed
-   replica versions remain safe; upgrade and concurrency tests are a gate.
+2. Complete the job queue slice with the eventual queue/outcome/recovery
+   ports. The repository now supports allowed-kind claiming, while the initial
+   `0001_jobs.sql` migration already adds `deferred`, separate claim/failure
+   counters, and PostgreSQL-authoritative lease time. Use an expand/contract
+   rollout for later schema changes so mixed replica versions remain safe;
+   upgrade and concurrency tests are a gate.
 3. Implement the shared `UnitOfWork`, transaction-scoped repository ports,
    account lease repository, and feed-build lease/CAS primitives. No source or
    feed application service may bypass these boundaries with convenience
@@ -707,7 +708,8 @@ The implemented foundation includes the pure pacing and quiet-hours policy in
 repositories in `src/domain/job.rs` and
 `src/persistence/repositories/job_repository.rs`. The job repository supports
 durable claim leases, fencing, retries, non-failure deferral, cancellation,
-recovery, separate claim/failure counters, and active-job deduplication. Its
+recovery, separate claim/failure counters, active-job deduplication, and
+allowed-kind claiming. Its
 `0001_jobs.sql` schema uses the final initial job contract, while PostgreSQL
 lease decisions use statement-local `clock_timestamp()`. The pacing and
 configuration modules have no network, browser, database, scheduler, or sleeping

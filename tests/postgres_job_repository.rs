@@ -20,9 +20,9 @@ fn at(seconds: i64) -> DateTime<Utc> {
         .expect("test timestamp should be valid")
 }
 
-fn spec(key: String, max_attempts: u32, run_after: i64) -> NewJob {
+fn spec_with_type(job_type: JobType, key: String, max_attempts: u32, run_after: i64) -> NewJob {
     NewJob {
-        job_type: JobType::SourceSync,
+        job_type,
         source_id: Some(Uuid::nil()),
         priority: 10,
         run_after: at(run_after),
@@ -31,6 +31,10 @@ fn spec(key: String, max_attempts: u32, run_after: i64) -> NewJob {
         dedupe_key: key,
         now: at(0),
     }
+}
+
+fn spec(key: String, max_attempts: u32, run_after: i64) -> NewJob {
+    spec_with_type(JobType::SourceSync, key, max_attempts, run_after)
 }
 
 #[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
@@ -54,8 +58,8 @@ async fn postgres_repository_enforces_claims_fencing_recovery_and_transactions(p
     ));
 
     let (claimed_a, claimed_b) = tokio::join!(
-        repository_a.claim_next(OWNER_A, at(100), Duration::seconds(30)),
-        repository_b.claim_next(OWNER_B, at(100), Duration::seconds(30)),
+        repository_a.claim_next(OWNER_A, at(100), Duration::seconds(30), JobType::ALL),
+        repository_b.claim_next(OWNER_B, at(100), Duration::seconds(30), JobType::ALL),
     );
     let mut claims = [
         claimed_a.expect("worker A claim should succeed"),
@@ -119,7 +123,7 @@ async fn postgres_repository_enforces_claims_fencing_recovery_and_transactions(p
         .expect("current owner should schedule a retry");
     assert_eq!(waiting.status(), JobStatus::RetryWait);
     let retry_lease = repository_b
-        .claim_next(OWNER_B, at(200), Duration::seconds(30))
+        .claim_next(OWNER_B, at(200), Duration::seconds(30), JobType::ALL)
         .await
         .expect("retry claim should succeed")
         .expect("retry-wait job should become claimable");
@@ -146,7 +150,7 @@ async fn postgres_repository_enforces_claims_fencing_recovery_and_transactions(p
         EnqueueResult::AlreadyActive { .. } => panic!("recovery job should insert"),
     };
     let recovery_lease = repository_a
-        .claim_next(OWNER_A, at(400), Duration::seconds(30))
+        .claim_next(OWNER_A, at(400), Duration::seconds(30), JobType::ALL)
         .await
         .expect("recovery job should claim")
         .expect("recovery job should be due");
@@ -250,4 +254,69 @@ async fn postgres_repository_enforces_claims_fencing_recovery_and_transactions(p
         .await
         .expect("rolled-back unit-of-work lookup should succeed")
         .is_none());
+
+    repository_a
+        .cancel(recovery_id, at(500), "isolate claim-filter fixture")
+        .await
+        .expect("recovery fixture should be cancellable");
+    repository_a
+        .cancel(committed_id, at(500), "isolate claim-filter fixture")
+        .await
+        .expect("unit-of-work fixture should be cancellable");
+
+    let filtered_source_id = match repository_a
+        .enqueue(spec_with_type(
+            JobType::SourceSync,
+            format!("{prefix}filtered-source"),
+            1,
+            0,
+        ))
+        .await
+        .expect("filtered source job should enqueue")
+    {
+        EnqueueResult::Inserted(job) => job.id(),
+        EnqueueResult::AlreadyActive { .. } => panic!("filtered source job should insert"),
+    };
+    let filtered_feed_id = match repository_a
+        .enqueue(spec_with_type(
+            JobType::FeedRebuild,
+            format!("{prefix}filtered-feed"),
+            1,
+            0,
+        ))
+        .await
+        .expect("filtered feed job should enqueue")
+    {
+        EnqueueResult::Inserted(job) => job.id(),
+        EnqueueResult::AlreadyActive { .. } => panic!("filtered feed job should insert"),
+    };
+    assert!(repository_a
+        .claim_next(OWNER_A, at(0), Duration::seconds(30), &[])
+        .await
+        .expect("empty job type filter should be accepted")
+        .is_none());
+    let feed_lease = repository_a
+        .claim_next(
+            OWNER_A,
+            at(0),
+            Duration::seconds(30),
+            &[JobType::FeedRebuild],
+        )
+        .await
+        .expect("feed-only claim should succeed")
+        .expect("feed job should be claimable");
+    assert_eq!(feed_lease.job.id(), filtered_feed_id);
+    assert_eq!(feed_lease.job.job_type(), JobType::FeedRebuild);
+    let source_lease = repository_a
+        .claim_next(
+            OWNER_A,
+            at(0),
+            Duration::seconds(30),
+            &[JobType::SourceSync],
+        )
+        .await
+        .expect("source-only claim should succeed")
+        .expect("source job should be claimable");
+    assert_eq!(source_lease.job.id(), filtered_source_id);
+    assert_eq!(source_lease.job.job_type(), JobType::SourceSync);
 }

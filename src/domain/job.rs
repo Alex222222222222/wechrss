@@ -74,6 +74,16 @@ pub enum JobType {
     CredentialRefresh,
 }
 
+impl JobType {
+    /// Every job kind known by this application.
+    pub const ALL: &'static [Self] = &[
+        Self::SourceSync,
+        Self::FeedRebuild,
+        Self::ArticleBackfill,
+        Self::CredentialRefresh,
+    ];
+}
+
 /// Persisted lifecycle state for a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

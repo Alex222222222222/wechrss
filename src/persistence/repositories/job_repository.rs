@@ -9,7 +9,7 @@
 //! Responsibilities:
 //!
 //! - enqueue jobs with active `dedupe_key` uniqueness;
-//! - claim one due and currently allowed job atomically for an instance and
+//! - claim one due job from an allowed type set atomically for an instance and
 //!   return its lease token;
 //! - persist heartbeats and terminal transitions only for the current owner and
 //!   fencing token;
@@ -28,8 +28,9 @@
 //! - `enqueue` must rely on a partial unique index for active jobs in
 //!   `queued`, `running`, `retry_wait`, and `deferred`, mapping a duplicate to
 //!   [`EnqueueResult::AlreadyActive`];
-//! - `claim_next` selects due allowed rows with `FOR UPDATE SKIP LOCKED`,
-//!   assigns a fresh `lease_token`, and increments `claim_count`;
+//! - `claim_next` selects due rows matching the supplied allowed type set with
+//!   `FOR UPDATE SKIP LOCKED`, assigns a fresh `lease_token`, and increments
+//!   `claim_count`; an empty set claims nothing;
 //! - heartbeat, success, retry, deferral, and failure updates must match `id`,
 //!   `lease_owner`, `lease_token`, and a live `lease_until` in their update
 //!   predicate, so stale workers cannot mutate a later claim; and
@@ -101,14 +102,14 @@ pub trait JobRepositoryTransaction {
     /// Inserts a job unless an active job already owns its deduplication key.
     async fn enqueue(&mut self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError>;
 
-    /// Claims the highest-priority due job within this transaction.
-    // TODO(design): accept an allowed JobType set so quiet-hours workers cannot
-    // claim upstream work.
+    /// Claims the highest-priority due job of an allowed type within this
+    /// transaction. An empty set claims nothing.
     async fn claim_next(
         &mut self,
         owner: &str,
         now: DateTime<Utc>,
         lease_for: Duration,
+        allowed_job_types: &[JobType],
     ) -> Result<Option<JobLease>, JobRepositoryError>;
 
     /// Extends a live lease for the owner and claim token.
@@ -224,14 +225,14 @@ pub trait JobRepository: Send + Sync {
     /// Inserts a job unless an active job already owns its deduplication key.
     async fn enqueue(&self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError>;
 
-    /// Claims the highest-priority due job without waiting on another worker.
-    // TODO(design): accept an allowed JobType set so quiet-hours workers cannot
-    // claim upstream work.
+    /// Claims the highest-priority due job of an allowed type without waiting
+    /// on another worker. An empty set claims nothing.
     async fn claim_next(
         &self,
         owner: &str,
         now: DateTime<Utc>,
         lease_for: Duration,
+        allowed_job_types: &[JobType],
     ) -> Result<Option<JobLease>, JobRepositoryError>;
 
     /// Extends a live lease for the owner and claim token.
@@ -532,6 +533,7 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
         owner: &str,
         _now: DateTime<Utc>,
         lease_for: Duration,
+        allowed_job_types: &[JobType],
     ) -> Result<Option<JobLease>, JobRepositoryError> {
         validate_owner(owner)?;
         let lease_milliseconds = lease_milliseconds(lease_for)?;
@@ -545,6 +547,7 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
                 FROM jobs
                 CROSS JOIN db_clock
                 WHERE status IN ('queued', 'retry_wait', 'deferred')
+                  AND job_type = ANY($4::text[])
                   AND run_after <= db_clock.now
                   AND failure_count < max_attempts
                 ORDER BY priority DESC, run_after ASC, created_at ASC, id ASC
@@ -572,6 +575,7 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
             .bind(owner)
             .bind(token.as_uuid())
             .bind(lease_milliseconds)
+            .bind(job_type_names(allowed_job_types))
             .fetch_optional(&mut **transaction)
             .await
             .map_err(storage_error)?;
@@ -969,9 +973,12 @@ impl JobRepository for PostgresJobRepository {
         owner: &str,
         now: DateTime<Utc>,
         lease_for: Duration,
+        allowed_job_types: &[JobType],
     ) -> Result<Option<JobLease>, JobRepositoryError> {
         let mut transaction = self.begin().await?;
-        let result = transaction.claim_next(owner, now, lease_for).await?;
+        let result = transaction
+            .claim_next(owner, now, lease_for, allowed_job_types)
+            .await?;
         transaction.commit().await?;
         Ok(result)
     }
@@ -1160,6 +1167,13 @@ fn job_type_name(job_type: JobType) -> &'static str {
     }
 }
 
+fn job_type_names(job_types: &[JobType]) -> Vec<String> {
+    job_types
+        .iter()
+        .map(|job_type| job_type_name(*job_type).to_owned())
+        .collect()
+}
+
 fn status_name(status: JobStatus) -> &'static str {
     match status {
         JobStatus::Queued => "queued",
@@ -1247,6 +1261,7 @@ fn claim_next_in_store(
     owner: &str,
     now: DateTime<Utc>,
     lease_for: Duration,
+    allowed_job_types: &[JobType],
 ) -> Result<Option<JobLease>, JobRepositoryError> {
     let candidate_id = jobs
         .iter()
@@ -1255,6 +1270,7 @@ fn claim_next_in_store(
                 job.status(),
                 JobStatus::Queued | JobStatus::RetryWait | JobStatus::Deferred
             ) && job.run_after() <= now
+                && allowed_job_types.contains(&job.job_type())
                 && job.failure_count() < job.max_attempts()
         })
         .min_by(|(_, left), (_, right)| claim_order(left, right))
@@ -1445,9 +1461,10 @@ impl JobRepository for MemoryJobRepository {
         owner: &str,
         now: DateTime<Utc>,
         lease_for: Duration,
+        allowed_job_types: &[JobType],
     ) -> Result<Option<JobLease>, JobRepositoryError> {
         let mut jobs = self.jobs.lock().await;
-        claim_next_in_store(&mut jobs, owner, now, lease_for)
+        claim_next_in_store(&mut jobs, owner, now, lease_for, allowed_job_types)
     }
 
     async fn heartbeat(
@@ -1544,8 +1561,9 @@ impl JobRepositoryTransaction for MemoryJobTransaction<'_> {
         owner: &str,
         now: DateTime<Utc>,
         lease_for: Duration,
+        allowed_job_types: &[JobType],
     ) -> Result<Option<JobLease>, JobRepositoryError> {
-        claim_next_in_store(self.jobs_mut()?, owner, now, lease_for)
+        claim_next_in_store(self.jobs_mut()?, owner, now, lease_for, allowed_job_types)
     }
 
     async fn heartbeat(
@@ -1651,9 +1669,9 @@ mod tests {
             .expect("test timestamp should be valid")
     }
 
-    fn spec(key: &str, priority: i32, run_after: i64) -> NewJob {
+    fn spec_with_type(job_type: JobType, key: &str, priority: i32, run_after: i64) -> NewJob {
         NewJob {
-            job_type: JobType::SourceSync,
+            job_type,
             source_id: Some(Uuid::nil()),
             priority,
             run_after: at(run_after),
@@ -1662,6 +1680,10 @@ mod tests {
             dedupe_key: key.to_owned(),
             now: at(0),
         }
+    }
+
+    fn spec(key: &str, priority: i32, run_after: i64) -> NewJob {
+        spec_with_type(JobType::SourceSync, key, priority, run_after)
     }
 
     async fn inserted_id(repository: &MemoryJobRepository, job: NewJob) -> Uuid {
@@ -1699,24 +1721,60 @@ mod tests {
         inserted_id(&repository, spec("future", 100, 500)).await;
 
         let first = repository
-            .claim_next(OWNER, at(100), Duration::seconds(30))
+            .claim_next(OWNER, at(100), Duration::seconds(30), JobType::ALL)
             .await
             .unwrap()
             .expect("a due job should be claimed");
         assert_eq!(first.job.dedupe_key(), "high");
 
         let second = repository
-            .claim_next(OWNER, at(100), Duration::seconds(30))
+            .claim_next(OWNER, at(100), Duration::seconds(30), JobType::ALL)
             .await
             .unwrap()
             .expect("the second due job should be claimed");
         assert_eq!(second.job.dedupe_key(), "low");
 
         assert!(repository
-            .claim_next(OWNER, at(100), Duration::seconds(30))
+            .claim_next(OWNER, at(100), Duration::seconds(30), JobType::ALL)
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn claims_only_allowed_job_types_and_empty_filter_claims_nothing() {
+        let repository = MemoryJobRepository::new();
+        inserted_id(
+            &repository,
+            spec_with_type(JobType::SourceSync, "source", 10, 0),
+        )
+        .await;
+        let feed_id = inserted_id(
+            &repository,
+            spec_with_type(JobType::FeedRebuild, "feed", 1, 0),
+        )
+        .await;
+
+        assert!(repository
+            .claim_next(OWNER, at(0), Duration::seconds(30), &[])
+            .await
+            .unwrap()
+            .is_none());
+
+        let feed_lease = repository
+            .claim_next(OWNER, at(0), Duration::seconds(30), &[JobType::FeedRebuild])
+            .await
+            .unwrap()
+            .expect("the allowed feed job should be claimable");
+        assert_eq!(feed_lease.job.id(), feed_id);
+        assert_eq!(feed_lease.job.job_type(), JobType::FeedRebuild);
+
+        let source_lease = repository
+            .claim_next(OWNER, at(0), Duration::seconds(30), &[JobType::SourceSync])
+            .await
+            .unwrap()
+            .expect("the allowed source job should be claimable");
+        assert_eq!(source_lease.job.job_type(), JobType::SourceSync);
     }
 
     #[tokio::test]
@@ -1724,7 +1782,7 @@ mod tests {
         let repository = MemoryJobRepository::new();
         let job_id = inserted_id(&repository, spec("deferred", 1, 0)).await;
         let first = repository
-            .claim_next(OWNER, at(0), Duration::seconds(30))
+            .claim_next(OWNER, at(0), Duration::seconds(30), JobType::ALL)
             .await
             .unwrap()
             .expect("job should be claimed");
@@ -1737,13 +1795,13 @@ mod tests {
         assert_eq!(deferred.claim_count(), 1);
         assert_eq!(deferred.failure_count(), 0);
         assert!(repository
-            .claim_next(OWNER, at(99), Duration::seconds(30))
+            .claim_next(OWNER, at(99), Duration::seconds(30), JobType::ALL)
             .await
             .unwrap()
             .is_none());
 
         let second = repository
-            .claim_next(OWNER, at(100), Duration::seconds(30))
+            .claim_next(OWNER, at(100), Duration::seconds(30), JobType::ALL)
             .await
             .unwrap()
             .expect("deferred job should become claimable");
@@ -1757,13 +1815,13 @@ mod tests {
         let repository = MemoryJobRepository::new();
         let job_id = inserted_id(&repository, spec("source:one", 1, 0)).await;
         let first = repository
-            .claim_next(OWNER, at(100), Duration::seconds(30))
+            .claim_next(OWNER, at(100), Duration::seconds(30), JobType::ALL)
             .await
             .unwrap()
             .unwrap();
         repository.recover_expired(at(130), 10).await.unwrap();
         let second = repository
-            .claim_next(OWNER, at(130), Duration::seconds(30))
+            .claim_next(OWNER, at(130), Duration::seconds(30), JobType::ALL)
             .await
             .unwrap()
             .unwrap();
@@ -1788,12 +1846,12 @@ mod tests {
         inserted_id(&repository, spec("one", 1, 0)).await;
         inserted_id(&repository, spec("two", 1, 0)).await;
         let _first = repository
-            .claim_next(OWNER, at(100), Duration::seconds(30))
+            .claim_next(OWNER, at(100), Duration::seconds(30), JobType::ALL)
             .await
             .unwrap()
             .unwrap();
         let _second = repository
-            .claim_next(OWNER, at(100), Duration::seconds(30))
+            .claim_next(OWNER, at(100), Duration::seconds(30), JobType::ALL)
             .await
             .unwrap()
             .unwrap();
@@ -1818,7 +1876,7 @@ mod tests {
         let missing = Uuid::new_v4();
         inserted_id(&repository, spec("token-source", 1, 0)).await;
         let token = repository
-            .claim_next(OWNER, at(0), Duration::seconds(30))
+            .claim_next(OWNER, at(0), Duration::seconds(30), JobType::ALL)
             .await
             .unwrap()
             .unwrap()
@@ -1832,7 +1890,7 @@ mod tests {
 
         let job_id = inserted_id(&repository, spec("source:one", 1, 0)).await;
         let lease = repository
-            .claim_next(OWNER, at(1), Duration::seconds(30))
+            .claim_next(OWNER, at(1), Duration::seconds(30), JobType::ALL)
             .await
             .unwrap()
             .unwrap();
