@@ -10,3 +10,13 @@
 
 //! Public feed access must be intentionally separate from administrative
 //! access so RSS readers do not need dashboard credentials.
+//!
+//! Safe configuration rule: administration is disabled unless explicitly
+//! enabled. Enabling it requires both an administrator password and independent
+//! session-signing key; incomplete settings fail startup. Disabled management,
+//! QR-login, and credential mutation routes are not registered, rather than
+//! becoming anonymous. Session cookies and CSRF behavior follow the policies in
+//! `ARCHITECTURE.md`.
+
+// TODO(design): add admin-enabled route construction, required session signing,
+// secure cookie/CSRF middleware, and login rate limiting.

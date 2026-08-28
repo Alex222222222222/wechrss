@@ -7,7 +7,8 @@
 //! PostgreSQL is the source of truth for sources, articles, archive metadata,
 //! credentials, jobs, sync runs, and feed cache. Transactions must group
 //! article/archive changes, cache rebuilds, source status, and job completion
-//! where practical.
+//! through [`unit_of_work`]. Browser/network work never runs inside that
+//! transaction.
 //!
 //! The first implemented persistence slices are the PostgreSQL pool/migration
 //! helpers in [`postgres`] and the job repository contract plus SQLx and memory
@@ -16,3 +17,4 @@
 
 pub mod postgres;
 pub mod repositories;
+pub mod unit_of_work;

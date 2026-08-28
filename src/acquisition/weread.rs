@@ -10,6 +10,9 @@
 //! requiring browser cookies or session state execute through the browser
 //! abstraction. It must expose normalized results and typed errors rather than
 //! raw JSON to application services.
+//! Callers must hold the fenced PostgreSQL account lease for the stable account
+//! ID before constructing an authenticated adapter. Lease loss cancels the
+//! adapter before another protocol request is issued.
 //!
 //! Authentication expiry allows one refresh/retry at the application layer.
 //! Risk-control responses terminate work and are never used to rotate tokens.
@@ -17,3 +20,7 @@
 //! Every upstream protocol request passes through the shared pacing and quiet-
 //! hours gate. This keeps rate policy centralized and makes it impossible for
 //! a protocol-specific method to silently use a tighter interval.
+
+// TODO(design): define WeReadAdapter over &mut AuthenticatedBrowserSession; its
+// constructor verifies the live AccountLeaseGuard and account ID. Keep public
+// article extraction out of this interface.

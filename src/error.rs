@@ -4,7 +4,8 @@
 //! authentication, persistence, archive, RSS, job, and web failures.
 //!
 //! Responsibilities include preserving whether an error is retryable,
-//! authentication-expiring, risk-control, permanent, or operator-actionable.
+//! authentication-expiring, risk-control, deferred, fencing/revision-conflicted,
+//! permanent, or operator-actionable.
 //! This classification drives job transitions and must not be inferred from
 //! arbitrary error strings in application code.
 //!
@@ -14,3 +15,7 @@
 //!
 //! Future implementation notes: use `thiserror` for stable boundary errors and
 //! `anyhow` only when adding context at orchestration edges.
+
+// TODO(design): define errors for job/account lease loss, non-failure deferral,
+// UnitOfWork revision conflict, cache single-flight contention, and disabled
+// administration before implementing the corresponding services.

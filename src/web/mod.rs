@@ -8,7 +8,12 @@
 //!
 //! Feed requests read persisted XML cache bytes and return them immediately.
 //! Stale-cache requests may enqueue a deduplicated rebuild but never wait for
-//! browser work.
+//! browser work. Feed freshness and rebuild orchestration belong to
+//! `application::feed_service`, not Axum handlers.
+//!
+//! API readiness remains available for cached RSS when browser workers are
+//! degraded. Administrative routes are registered only when complete
+//! authentication/session configuration is explicitly enabled.
 
 pub mod api;
 pub mod auth;

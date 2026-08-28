@@ -4,7 +4,10 @@
 //! transaction-friendly operations so application services can atomically
 //! persist idempotent article changes, cache updates, and job state.
 
+pub mod account_lease_repository;
 pub mod article_repository;
 pub mod feed_cache_repository;
 pub mod job_repository;
+pub mod scheduler_repository;
 pub mod source_repository;
+pub mod sync_run_repository;

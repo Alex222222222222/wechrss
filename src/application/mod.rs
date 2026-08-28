@@ -7,9 +7,13 @@
 //! The scheduler only creates durable jobs. Workers execute claimed jobs.
 //! Successful synchronization updates articles and the source feed cache;
 //! administrative mutations invalidate or enqueue cache rebuilds.
+//! `FeedService` owns cached-feed delivery decisions. Final cross-repository
+//! writes use the persistence `UnitOfWork`; acquisition and waits occur before
+//! that short transaction begins.
 
 pub mod archive_service;
 pub mod auth_service;
+pub mod feed_service;
 pub mod job_service;
 pub mod scheduler;
 pub mod source_service;

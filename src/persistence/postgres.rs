@@ -15,6 +15,13 @@
 //!
 //! Readiness should verify PostgreSQL connectivity independently from liveness.
 //! Credentials must be encrypted before they reach this layer.
+//! Cross-repository transactions are constructed by `persistence::unit_of_work`;
+//! repository modules must not each open unrelated transactions for one final
+//! synchronization commit.
+//!
+//! PostgreSQL server time is authoritative for distributed lease, due-time, and
+//! expiry decisions. Production statements derive and reuse one `db_now` value;
+//! application replica clocks are never used to expire another owner's lease.
 
 use secrecy::ExposeSecret;
 use sqlx::{

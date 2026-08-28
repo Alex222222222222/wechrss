@@ -1,8 +1,9 @@
 //! Public module map for the WechRss Rust implementation.
 //!
-//! This crate is currently a documentation-first skeleton. The module
-//! declarations establish dependency direction for the future implementation;
-//! they intentionally contain no runtime behavior.
+//! This crate is being implemented incrementally. The module declarations
+//! establish dependency direction; configuration, pacing, and the first durable
+//! job-persistence slice are implemented while the remaining modules document
+//! their future contracts.
 
 pub mod acquisition;
 pub mod application;

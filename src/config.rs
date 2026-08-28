@@ -14,15 +14,20 @@
 //! ```text
 //! DATABASE_URL
 //! DATABASE_POOL_MIN_CONNECTIONS / DATABASE_POOL_MAX_CONNECTIONS
-//! WEBDRIVER_URL / BROWSER_ENGINE
-//! APP_INSTANCE_ID / HTTP_BIND / HTTP_PORT
+//! WEBDRIVER_URL / BROWSER_ENGINE / WORKER_CONCURRENCY
+//! APP_INSTANCE_ID / HTTP_BIND / HTTP_PORT / APP_ROLES
 //! APP_TIMEZONE / QUIET_HOURS_START / QUIET_HOURS_END
 //! JOB_POLL_SECONDS / JOB_LEASE_SECONDS / JOB_HEARTBEAT_SECONDS /
 //! JOB_MAX_ATTEMPTS
-//! RSS_CACHE_TTL_SECONDS
+//! ACCOUNT_LEASE_SECONDS / ACCOUNT_HEARTBEAT_SECONDS
+//! SOURCE_FAILURE_COOLDOWN_SECONDS
+//! RSS_CACHE_TTL_SECONDS / RSS_STALE_WHILE_REVALIDATE_SECONDS /
+//! RSS_CACHE_MISS_WAIT_MS
+//! FEED_BUILD_LEASE_SECONDS / FEED_BUILD_HEARTBEAT_SECONDS
 //! PACING_* / SCROLL_*
-//! ARCHIVE_BACKEND / ARCHIVE_LOCAL_PATH
-//! ADMIN_PASSWORD / CREDENTIAL_ENCRYPTION_KEY
+//! ASSET_ARCHIVE_BACKEND / ASSET_ARCHIVE_LOCAL_PATH
+//! ADMIN_ENABLED / ADMIN_PASSWORD / SESSION_SIGNING_KEY /
+//! CREDENTIAL_ENCRYPTION_KEY
 //! ```
 //!
 //! `APP_INSTANCE_ID` is optional for local use; when omitted, a random UUID is
@@ -39,6 +44,18 @@
 //! Kubernetes ConfigMaps and Secrets may inject these values, but the
 //! application still consumes them through its environment. Diagnostics must
 //! expose variable names and validation failures, never secret contents.
+//!
+//! Implementation status: the current `RawConfig` still parses the original
+//! field set, including `ARCHIVE_BACKEND` and `ARCHIVE_LOCAL_PATH`. The role,
+//! worker-concurrency, account-lease, failure-cooldown, stale-cache,
+//! `ADMIN_ENABLED`, session-signing, and `ASSET_ARCHIVE_*` names above are the
+//! target contract and are not parsed or effective yet. Deployment must not
+//! rely on them until the configuration TODOs are implemented. The future
+//! loader must detect misspelled application-owned names without rejecting
+//! unrelated process variables supplied by the container runtime. It does this
+//! by filtering and validating the owned prefixes documented in
+//! `ARCHITECTURE.md`, not by applying Serde `deny_unknown_fields` to every
+//! process variable.
 
 use std::{env, str::FromStr, time::Duration};
 
@@ -105,6 +122,12 @@ pub enum ConfigError {
 /// Validated configuration used by future runtime components.
 #[derive(Debug)]
 pub struct AppConfig {
+    // TODO(design): add validated process roles so API, scheduler, and worker
+    // capacity can be deployed independently; also add worker concurrency,
+    // account/feed-build lease and heartbeat settings, source failure cooldown,
+    // and stale/miss response windows required by the corrected architecture.
+    // TODO(design): pre-validate application-owned environment prefixes so a
+    // documented setting cannot be misspelled and silently ignored.
     /// PostgreSQL URL, retained as a secret because it may contain a password.
     pub database_url: SecretString,
     /// Minimum number of PostgreSQL connections kept in the pool.
@@ -137,12 +160,18 @@ pub struct AppConfig {
     pub rss_cache_ttl: Duration,
     /// Shared request/page/scroll pacing policy.
     pub pacing: PacingPolicy,
-    /// Archive backend name, currently intended to be `local` or `s3`.
+    /// Legacy archive backend field pending replacement by an optional asset
+    /// archive enum whose default is `Disabled`.
     pub archive_backend: String,
-    /// Local archive root used by the local backend.
+    /// Legacy local archive root, used only when the future asset backend is
+    /// explicitly enabled as local.
     pub archive_local_path: String,
-    /// Optional administrator password.
+    /// Optional administrator password. Until route construction implements the
+    /// documented admin-enabled policy, absence must never imply anonymous
+    /// administrative access.
     pub admin_password: Option<SecretString>,
+    // TODO(design): add ADMIN_ENABLED and SESSION_SIGNING_KEY. Disabled admin
+    // routes are not registered; enabled admin must require both secrets.
     /// Credential-encryption key.
     pub credential_encryption_key: SecretString,
 }
@@ -330,6 +359,9 @@ impl AppConfig {
             });
         }
 
+        // TODO(design): replace these legacy settings with
+        // AssetArchiveConfig::{Disabled, Local, S3}, defaulting to Disabled,
+        // and validate backend-specific values only when enabled.
         let archive_backend = raw.archive_backend.unwrap_or_else(|| "local".to_owned());
         if !matches!(archive_backend.as_str(), "local" | "s3") {
             return Err(ConfigError::InvalidValue {
@@ -371,6 +403,8 @@ impl AppConfig {
             pacing,
             archive_backend,
             archive_local_path,
+            // TODO(design): validate this together with ADMIN_ENABLED and a
+            // distinct SESSION_SIGNING_KEY before admin routes are implemented.
             admin_password: raw
                 .admin_password
                 .filter(|value| !value.is_empty())

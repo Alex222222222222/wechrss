@@ -1,8 +1,15 @@
 # Browser Sidecar Deployment Notes
 
-The Rust application and its browser sidecar must use the same IANA timezone
-for quiet-hours decisions and browser-visible local time. `TZ` is configuration,
-not a substitute for installing timezone data.
+> **Implementation status:** the Rust binary is currently a no-op. These are
+> target deployment constraints plus development-database instructions, not a
+> runnable application manifest. Environment variables described as planned are
+> not parsed until the corresponding `TODO(design)` in `src/config.rs` is
+> implemented and tested.
+
+A Rust process with the `worker` role and its browser sidecar must use the same
+IANA timezone for quiet-hours decisions and browser-visible local time. `TZ` is
+configuration, not a substitute for installing timezone data. API-only and
+scheduler-only processes do not require a browser sidecar.
 
 ## Docker image requirements
 
@@ -32,6 +39,13 @@ override layer. In production, inject the timezone from one ConfigMap or
 environment source instead of maintaining separate values for the application
 and sidecar. Secrets such as database URLs and encryption keys belong in a
 Kubernetes Secret.
+
+The target configuration will use `APP_ROLES=all` for a small combined
+deployment or a validated subset of `api,scheduler,worker` when scaling
+components independently. `APP_ROLES` is not parsed by the current `AppConfig`.
+Once implemented, browser-session capacity and worker replica count must be
+intentional; increasing API replicas for RSS traffic must not automatically
+increase upstream fetch concurrency.
 
 ## Kubernetes
 
@@ -109,6 +123,15 @@ session should verify the browser-visible timezone during session setup.
 The WebDriver port remains Pod-internal. NetworkPolicy should prevent external
 clients from reaching it. Browser profile and asset storage require persistent
 volumes only when session persistence or local asset storage is selected.
+Public article extraction uses a clean ephemeral profile and never reuses the
+authenticated account profile.
+
+API readiness requires PostgreSQL but does not fail solely because WebDriver is
+unavailable, allowing persisted RSS feeds to remain serviceable. Browser and
+browser-timezone health are exposed as degraded component status and stop
+workers from claiming browser jobs. A worker-only process may make browser
+availability part of its own readiness condition. Liveness remains a local
+process check.
 
 ## Timezone verification
 
@@ -117,10 +140,18 @@ compare it with the configured IANA timezone. A mismatch is a configuration
 error, not a reason to silently continue. This catches images that have `TZ`
 set but lack usable timezone data or browser-specific timezone configuration.
 
+PostgreSQL server time is authoritative for distributed leases, due-job checks,
+and lease recovery. Production monitoring should alert on database clock offset,
+but an application Pod's wall-clock skew must not cause it to expire another
+worker's lease. Application/browser timezone configuration remains necessary for
+quiet-hours presentation and browser behavior; it does not replace the
+PostgreSQL clock used by lease SQL.
+
 ## Quiet-hours behavior
 
 Quiet hours block new upstream requests, page navigations, and scroll/fetch
 operations. They do not block RSS reads, cached feed responses, or local
 PostgreSQL maintenance. A job that crosses into quiet hours may finish its
-current bounded operation and then return a resumable result before the next
-upstream operation.
+current bounded operation and then enter the durable non-failure `deferred`
+state until the next eligible instant. Deferral does not consume its retry
+failure budget.

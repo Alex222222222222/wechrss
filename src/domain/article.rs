@@ -14,4 +14,9 @@
 //! RSS XML rendering, and browser extraction.
 //!
 //! RSS interactions: the renderer consumes normalized article/content values;
-//! an article mutation causes the owning source's feed cache to be rebuilt.
+//! a feed-visible article mutation increments the owning source's monotonic feed
+//! revision and causes that exact revision to be rebuilt. Idempotent no-op
+//! upserts do not increment the revision.
+
+// TODO(design): define normalized article/archive input and feed-visible change
+// result types before implementing transaction-scoped persistence.

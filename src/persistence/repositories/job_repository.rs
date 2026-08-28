@@ -9,10 +9,12 @@
 //! Responsibilities:
 //!
 //! - enqueue jobs with active `dedupe_key` uniqueness;
-//! - claim one due job atomically for an instance and return its lease token;
+//! - claim one due and currently allowed job atomically for an instance and
+//!   return its lease token;
 //! - persist heartbeats and terminal transitions only for the current owner and
 //!   fencing token;
 //! - cancel unclaimed work; and
+//! - defer jobs at non-failure eligibility boundaries; and
 //! - recover expired leases in bounded batches.
 //!
 //! Non-responsibilities: executing job payloads, calculating browser pacing,
@@ -24,11 +26,12 @@
 //! PostgreSQL implementation behavior:
 //!
 //! - `enqueue` must rely on a partial unique index for active jobs in
-//!   `queued`, `running`, and `retry_wait`, mapping a duplicate to
+//!   `queued`, `running`, `retry_wait`, and the planned `deferred` state, mapping a duplicate to
 //!   [`EnqueueResult::AlreadyActive`];
-//! - `claim_next` must select due rows with `FOR UPDATE SKIP LOCKED`, assign a
-//!   fresh `lease_token`, increment `attempts`, and commit the claim before
-//!   returning it;
+//! - the corrected `claim_next` contract must select due allowed rows with `FOR
+//!   UPDATE SKIP LOCKED`, assign a fresh `lease_token`, increment
+//!   `claim_count`, and commit the claim before returning it; the current first
+//!   slice still increments legacy `attempts` pending the documented migration;
 //! - heartbeat, success, retry, and failure updates must match `id`,
 //!   `lease_owner`, `lease_token`, and a live `lease_until` in their update
 //!   predicate, so stale workers cannot mutate a later claim; and
@@ -36,10 +39,25 @@
 //!   either return them to `queued` or mark them failed when attempts are
 //!   exhausted.
 //!
-//! All mutations should be transaction-friendly. In particular, a future sync
-//! service can update articles, archive metadata, feed cache, source status,
-//! and job completion within the transaction boundaries defined by the
-//! application layer.
+//! Cross-repository mutations use `persistence::unit_of_work`. This repository's
+//! current job-only transaction is an implemented interim boundary and must not
+//! become the application API for final synchronization commits.
+//! In the target interface, the general queue port exposes enqueue, claim,
+//! heartbeat, and reads, but no independent worker outcome transition.
+//! Success, retry, deferral, cancellation, and failure are available through the
+//! transaction-scoped UnitOfWork outcome view. Expired recovery is a dedicated
+//! cross-table persistence operation so terminal recovery can advance a source
+//! cooldown atomically.
+//!
+//! Clock contract: the implemented first slice still accepts caller-provided
+//! `now` values and binds them into production SQL. That is not the target HA
+//! contract. Production PostgreSQL operations must derive a single `db_now`
+//! from `clock_timestamp()` inside each statement for claim eligibility, lease
+//! creation/renewal, live-fence checks, completion, and recovery. The corrected
+//! repository owns its clock; the in-memory repository receives an injectable
+//! test clock. Application code supplies retry durations or an absolute deferral
+//! instant derived from an authoritative database-time sample, not a timestamp
+//! used to judge another worker's lease.
 
 use std::{cmp::Ordering, collections::HashMap, fmt::Display, sync::Arc};
 
@@ -75,17 +93,21 @@ pub struct JobLease {
 
 /// Operations available while a repository transaction is held.
 ///
-/// A PostgreSQL implementation should back this handle with one SQLx
-/// transaction. The application can use the same transaction scope to build
-/// transaction-scoped source, article, archive, and feed-cache repositories,
-/// then call [`Self::commit`] only after all related changes succeed. Dropping
-/// an uncommitted handle must roll the transaction back.
+/// The current PostgreSQL implementation backs this interim job-only handle
+/// with one SQLx transaction. Cross-repository application commits must instead
+/// use `persistence::unit_of_work`, whose transaction-scoped job view will
+/// eventually delegate to these operations. Dropping an uncommitted handle must
+/// roll the transaction back.
 #[allow(async_fn_in_trait)]
 pub trait JobRepositoryTransaction {
+    // TODO(design): remove caller-provided `now` from lease-sensitive repository
+    // APIs when introducing the repository-owned production/test clock.
     /// Inserts a job unless an active job already owns its deduplication key.
     async fn enqueue(&mut self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError>;
 
     /// Claims the highest-priority due job within this transaction.
+    // TODO(design): accept an allowed JobType set so quiet-hours workers cannot
+    // claim upstream work, and add a fenced non-failure defer operation.
     async fn claim_next(
         &mut self,
         owner: &str,
@@ -104,6 +126,8 @@ pub trait JobRepositoryTransaction {
     ) -> Result<Job, JobRepositoryError>;
 
     /// Marks a live fenced job as successfully completed.
+    // TODO(design): remove this from the general/interim transaction contract;
+    // successful business-job completion belongs to UnitOfWork only.
     async fn succeed(
         &mut self,
         job_id: Uuid,
@@ -180,7 +204,10 @@ pub enum JobRepositoryError {
 /// that needs dynamic dispatch can add an object-safe adapter.
 #[allow(async_fn_in_trait)]
 pub trait JobRepository: Send + Sync {
-    /// Transaction-scoped repository type used for atomic multi-repository work.
+    // TODO(design): split this interim all-in-one trait into a queue port,
+    // UnitOfWork outcome view, and atomic expired-recovery operation before any
+    // application worker is implemented.
+    /// Interim job-only transaction type; multi-repository work uses UnitOfWork.
     type Transaction<'a>: JobRepositoryTransaction + 'a
     where
         Self: 'a;
@@ -192,6 +219,8 @@ pub trait JobRepository: Send + Sync {
     async fn enqueue(&self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError>;
 
     /// Claims the highest-priority due job without waiting on another worker.
+    // TODO(design): accept an allowed JobType set and expose defer after the job
+    // domain/schema gain the corrected state and counters.
     async fn claim_next(
         &self,
         owner: &str,
@@ -210,6 +239,8 @@ pub trait JobRepository: Send + Sync {
     ) -> Result<Job, JobRepositoryError>;
 
     /// Marks a live fenced job as successfully completed.
+    // TODO(design): remove this convenience method from the target public queue
+    // port so application code cannot commit success separately from data.
     async fn succeed(
         &self,
         job_id: Uuid,
@@ -260,15 +291,17 @@ pub trait JobRepository: Send + Sync {
 
 const JOB_COLUMNS: &str = "id, job_type, source_id, status, priority, run_after, attempts, max_attempts, lease_owner, lease_token, lease_until, heartbeat_at, started_at, finished_at, last_error, payload_json, dedupe_key, created_at, updated_at";
 const JOB_COLUMNS_FROM_JOB: &str = "job.id, job.job_type, job.source_id, job.status, job.priority, job.run_after, job.attempts, job.max_attempts, job.lease_owner, job.lease_token, job.lease_until, job.heartbeat_at, job.started_at, job.finished_at, job.last_error, job.payload_json, job.dedupe_key, job.created_at, job.updated_at";
+// TODO(design): after the forward migration, include deferred in active/claim
+// SQL and replace legacy attempts columns with claim_count/failure_count.
 const ACTIVE_STATUSES: &str = "'queued', 'running', 'retry_wait'";
 
 /// SQLx repository backed by the shared PostgreSQL job table.
 ///
 /// Each convenience mutation opens a transaction, performs the operation, and
-/// commits before returning. Callers that need to combine job completion with
-/// article, source, archive, or feed-cache writes should use [`JobRepository::begin`]
-/// and keep the returned transaction open until all transaction-scoped work is
-/// complete.
+/// commits before returning. These convenience operations remain suitable for
+/// independent enqueue, claim, heartbeat, and recovery work. Final job
+/// completion combined with article, source, sync-run, or feed-cache writes must
+/// use the shared UnitOfWork instead of [`JobRepository::begin`].
 #[derive(Clone)]
 pub struct PostgresJobRepository {
     pool: PgPool,
@@ -297,6 +330,8 @@ impl PostgresJobRepository {
 
 /// Transaction-scoped SQLx job repository.
 pub struct PostgresJobTransaction<'a> {
+    // TODO(design): move ownership of this SQLx transaction to UnitOfWork and
+    // expose this implementation only as its transaction-scoped job view.
     transaction: Option<Transaction<'a, Postgres>>,
 }
 
@@ -398,6 +433,8 @@ enum FencedOperation<'a> {
     },
 }
 
+// TODO(design): rewrite the production statements around one database-owned
+// timestamp CTE; caller-provided timestamps must not decide lease liveness.
 impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
     async fn enqueue(&mut self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError> {
         let job = Job::new(spec)?;

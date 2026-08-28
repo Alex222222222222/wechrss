@@ -21,21 +21,25 @@
 //! decides which due sources should be enqueued; this module only checks a
 //! candidate job's local invariants.
 //!
-//! The lifecycle is:
+//! The target lifecycle is:
 //!
 //! ```text
 //! queued -> running -> succeeded
 //! queued -> running -> retry_wait -> running
+//! queued -> running -> deferred -> running
 //! queued/retry_wait -> failed (cancelled)
 //! running -> failed
 //! running (expired lease) -> queued | failed
 //! ```
 //!
-//! `attempts` counts claims, so the first successful claim changes it from
-//! zero to one. A retry returns to `retry_wait` while attempts remain; once
-//! the configured maximum is reached, the retry request becomes terminal
-//! `failed`. This makes crash recovery bounded even when a worker disappears
-//! immediately after claiming a job.
+//! The target model separates durable claim observability from the retry
+//! failure budget. `claim_count` increments whenever ownership is granted;
+//! `failure_count` increments only for a retryable execution failure and is
+//! compared with `max_attempts`. A quiet-hours transition enters `deferred`,
+//! sets `run_after`, and changes neither failure count nor terminal outcome.
+//! The currently implemented first slice still uses `attempts` as a claim count;
+//! `TODO(design)` markers identify the domain and migration work needed before
+//! quiet-hours deferral is implemented.
 //!
 //! High availability depends on two layers. PostgreSQL must atomically claim a
 //! due row using `FOR UPDATE SKIP LOCKED` and persist the lease owner, fencing
@@ -44,6 +48,12 @@
 //! safely. Job handlers still need idempotent article and cache writes because
 //! a process can crash after performing side effects but before completing its
 //! job.
+//!
+//! Domain transitions accept an explicit timestamp to remain pure and
+//! deterministic. In production that timestamp is supplied by the PostgreSQL
+//! repository's statement-local server clock, not by the application replica.
+//! The in-memory repository uses an injectable test clock after the corrected
+//! repository contract is implemented.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -79,6 +89,8 @@ pub enum JobStatus {
     Succeeded,
     /// Work stopped permanently or exhausted its attempts.
     Failed,
+    // TODO(design): add Deferred as an active, non-failure state in the domain,
+    // SQL mappings, claim query, active dedupe index, and a new migration.
 }
 
 impl JobStatus {
@@ -400,6 +412,8 @@ impl Job {
         }
 
         let lease_token = LeaseToken::new();
+        // TODO(design): increment claim_count here instead. Retryable failures,
+        // not claims or quiet-hours deferrals, must consume max_attempts.
         self.attempts += 1;
         self.status = JobStatus::Running;
         self.lease_owner = Some(owner.to_owned());
@@ -469,6 +483,8 @@ impl Job {
         self.clear_lease();
         self.updated_at = now;
 
+        // TODO(design): compare/increment failure_count in the corrected model;
+        // add a separate defer transition that never reaches this branch.
         if self.attempts >= self.max_attempts {
             self.status = JobStatus::Failed;
             self.finished_at = Some(now);

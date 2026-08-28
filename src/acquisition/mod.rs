@@ -13,6 +13,8 @@
 //! operations. Public article content is fetched by [`article_page`] without
 //! credentials, so a content-page fetch must not trigger login or depend on a
 //! persisted account session.
+//! Authenticated and public browser sessions are separate capabilities. Public
+//! sessions use clean ephemeral profiles and accept only verified WeChat URLs.
 
 pub mod article_page;
 pub mod browser_pool;

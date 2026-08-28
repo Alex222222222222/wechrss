@@ -7,6 +7,11 @@
 //! Resolution uses the browser abstraction and returns a domain-level result;
 //! it does not insert sources or create jobs. Invalid hosts, malformed Base64,
 //! missing identity, and verification pages are distinct failures.
+//! The same host/scheme validation primitive is reused for article URLs returned
+//! by upstream listing/detail responses, not only for operator-pasted URLs.
 
 //! A successful identity result is later used by `SourceService` to enforce
 //! unique source identity and invalidate/rebuild the correct feed cache.
+
+// TODO(design): extract the verified WeChat URL newtype shared with
+// article_page and validate post-navigation redirect destinations.
