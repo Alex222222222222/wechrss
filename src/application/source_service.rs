@@ -16,7 +16,11 @@
 //!
 //! Non-responsibilities: direct SQL, browser selectors, article fetching, or
 //! rendering RSS bytes. PostgreSQL concurrency and duplicate-source handling
-//! belong to repositories and transactions.
+//! belong to repositories and transactions. The source repository now provides
+//! the transaction-scoped primitive; this service still must compose it with
+//! identity, cache, and initial-job policies.
 
-// TODO(design): add account identity, scheduling gate, feed revision, and
-// UnitOfWork-backed mutation contracts before implementing source CRUD.
+// TODO(design): define the source-service ports that compose identity
+// resolution, source persistence, feed-cache invalidation, and initial job
+// enqueueing. Source identity/create/read and transaction-scoped scheduling
+// mutations are now available from the domain and persistence layers.

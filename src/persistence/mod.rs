@@ -18,8 +18,10 @@
 //! feed-build lease and revision-aware feed-cache repository in
 //! [`repositories::feed_cache_repository`]. The PostgreSQL scheduler repository
 //! in [`repositories::scheduler_repository`] now atomically enqueues due source
-//! jobs and records source reservations. Source CRUD, article, sync-run,
-//! credential, and archive repository SQL remain future work.
+//! jobs and records source reservations. Source identity/create/read and
+//! transaction-scoped scheduling/revision mutations are implemented in
+//! [`repositories::source_repository`]. Source-service lifecycle orchestration,
+//! article, sync-run, credential, and archive repository SQL remain future work.
 
 pub mod postgres;
 pub mod repositories;

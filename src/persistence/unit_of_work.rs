@@ -5,8 +5,8 @@
 //! completion atomic without exposing SQLx transactions to application code.
 //!
 //! `UnitOfWorkFactory::begin` creates one short-lived SQLx transaction. Its
-//! returned handle exposes transaction-scoped job and feed-cache views today;
-//! source, article, and sync-run views will be added as their repository
+//! returned handle exposes transaction-scoped job, source, and feed-cache views
+//! today; article and sync-run views will be added as their repository
 //! contracts become executable. Only the unit of work can commit; dropping it
 //! or returning an error rolls all component writes back. Repository views
 //! borrow the unit of work and therefore cannot outlive or independently commit
@@ -16,12 +16,13 @@
 //!
 //! - `UnitOfWorkFactory::begin()` creates the transaction;
 //! - `jobs()` borrows the transaction-scoped job repository view;
+//! - `source()` borrows the transaction-scoped source mutation view;
 //! - `feed_cache()` borrows the transaction-scoped feed-cache publication view;
 //! - `commit(self)` is the only successful exit for a completed unit of work;
 //! - `rollback(self)` is available for explicit cleanup in tests or callers
 //!   that need to await rollback; and
-//! - future `verify_fence`, article/source/sync/cache commands will be added to
-//!   views that borrow this same transaction.
+//! - future `verify_fence`, article, sync-run, and archive commands will be
+//!   added to views that borrow this same transaction.
 //!
 //! Retry, deferral, cancellation, and failure outcomes use the same boundary
 //! because they record sync results or alter source scheduling gates/cooldowns.
@@ -63,6 +64,7 @@ use thiserror::Error;
 
 use super::repositories::{
     feed_cache_repository::PostgresFeedCacheTransaction, job_repository::PostgresJobTransaction,
+    source_repository::PostgresSourceTransaction,
 };
 
 /// Errors raised while opening or completing a unit of work.
@@ -119,6 +121,11 @@ impl<'a> UnitOfWork<'a> {
         PostgresFeedCacheTransaction::new(&mut self.jobs)
     }
 
+    /// Borrows the transaction-scoped source mutation view.
+    pub fn source(&mut self) -> PostgresSourceTransaction<'_, 'a> {
+        PostgresSourceTransaction::new(&mut self.jobs)
+    }
+
     /// Commits all mutations made through this unit of work.
     pub async fn commit(self) -> Result<(), UnitOfWorkError> {
         self.jobs
@@ -145,6 +152,6 @@ impl fmt::Debug for UnitOfWork<'_> {
     }
 }
 
-// TODO(design): add source, article, and sync-run views; move verify-fence and
+// TODO(design): add article and sync-run views; move verify-fence and
 // business-coupled job outcomes behind this boundary; and prevent SyncService
 // from receiving a job-only commit API.

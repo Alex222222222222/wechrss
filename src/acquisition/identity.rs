@@ -13,5 +13,8 @@
 //! A successful identity result is later used by `SourceService` to enforce
 //! unique source identity and invalidate/rebuild the correct feed cache.
 
-// TODO(design): extract the verified WeChat URL newtype shared with
-// article_page and validate post-navigation redirect destinations.
+// The shared `VerifiedWechatArticleUrl` value object currently lives in
+// `domain::source` so persistence and acquisition use the same validated
+// representation without making the domain depend on browser code. The
+// remaining implementation work is URL identity resolution and redirect
+// revalidation after every navigation.

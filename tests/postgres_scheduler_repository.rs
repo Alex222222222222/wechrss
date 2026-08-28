@@ -201,9 +201,12 @@ async fn insert_source(
 ) -> SourceId {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     sqlx::query(
-        "INSERT INTO sources (id, enabled, scheduling_gate, next_fetch_at, priority) VALUES ($1, $2, $3, clock_timestamp() - interval '1 second', $4)",
+        "INSERT INTO sources (id, book_id, display_name, article_url, enabled, scheduling_gate, next_fetch_at, priority) VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp() - interval '1 second', $7)",
     )
     .bind(source_id.as_uuid())
+    .bind(format!("book-{source_id}"))
+    .bind("Test source")
+    .bind("https://mp.weixin.qq.com/s/test")
     .bind(enabled)
     .bind(scheduling_gate.as_str())
     .bind(priority)

@@ -39,8 +39,8 @@ The current and target contracts must not be confused:
 | Runtime | No server, routes, scheduler, worker, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, and PostgreSQL-clocked SQLx job operations | Remove caller `now` parameters only in a later queue-port contract release |
 | Configuration | Original `AppConfig`, including legacy archive settings | Planned role, account-lease, cooldown, stale-cache, safe-admin, and optional-asset settings must be implemented and tested before deployment uses them |
-| Persistence | Job/source-scheduling/feed-cache tables, their PostgreSQL repositories, shared job/feed-cache transaction boundary, account leases, and feed-build leases | Source CRUD/configuration, credential records, articles, sync runs, and their remaining transaction-scoped views are design-only |
-| Acquisition/web/RSS | Documentation-only boundaries | Capability types and application/repository ports must exist before concrete adapters or handlers |
+| Persistence | Job/source-scheduling/feed-cache tables, their PostgreSQL repositories, shared job/source/feed-cache transaction boundary, account leases, and feed-build leases | Source-service lifecycle orchestration, credential records, articles, sync runs, and their remaining transaction-scoped views are design-only |
+| Acquisition/web/RSS | A validated public WeChat article URL value object | Browser capabilities, application/repository ports, and concrete adapters or handlers remain future work |
 
 Planned environment variables in this document are not parsed or effective
 runtime configuration merely because they are documented. Until the
@@ -515,7 +515,9 @@ The concrete capability contract is:
 - `VerifiedWechatArticleUrl` is constructed only from `https` URLs whose
   normalized host is exactly `mp.weixin.qq.com`; user information, fragments,
   non-default ports, and ambiguous encoded hosts are rejected. The final URL is
-  revalidated after every navigation or redirect before extraction.
+  revalidated after every navigation or redirect before extraction. The
+  domain-side value object is implemented in `src/domain/source.rs`; the
+  acquisition constructor and post-navigation revalidation remain TODOs.
 - `PublicBrowserSession` is a non-cloneable fresh WebDriver session with no
   imported profile, cookies, local storage, credential handle, or account-lease
   guard. It is destroyed after the public operation.
@@ -694,11 +696,12 @@ than add more empty module shells. Work proceeds in this order:
    rollout for later schema changes so mixed replica versions remain safe;
    upgrade and concurrency tests are a gate.
 3. Extend the shared `UnitOfWork` with transaction-scoped repository ports and
-   implement source configuration, article, sync-run, and credential
-   repositories plus their transaction-scoped views. The revision-aware
-   feed-cache publication view, account lease, and feed-build lease repositories
-   are already executable. No source or feed application service may bypass
-   these boundaries with convenience transactions.
+   complete the source service, article, sync-run, and credential repositories
+   plus their transaction-scoped views. Source identity/create/read,
+   scheduling state, and feed-revision mutations are already executable. The
+   revision-aware feed-cache publication view, account lease, and feed-build
+   lease repositories are also executable. No source or feed application
+   service may bypass these boundaries with convenience transactions.
 4. Add the RSS renderer and make `FeedService` executable over the persisted
    cache, then add the remaining source/article/archive queries.
 5. Build role-aware runtime composition, scheduler/worker loops, heartbeat
@@ -732,12 +735,15 @@ repository is implemented in
 `src/persistence/repositories/account_lease_repository.rs`. The source
 revision/feed-cache reader and transaction-scoped fenced publication are
 implemented in `src/persistence/repositories/feed_cache_repository.rs`, and
-`UnitOfWork` exposes that publication view. The atomic source scheduler
+`UnitOfWork` exposes that publication view. Source identity/create/read and
+transaction-scoped scheduling/gate/revision mutations are implemented in
+`src/persistence/repositories/source_repository.rs`. The atomic source scheduler
 repository and its scheduling columns are implemented in
 `src/persistence/repositories/scheduler_repository.rs`; it selects due sources
 with PostgreSQL row locking, inserts canonical source-sync jobs, and records
-short reservations in one transaction. The remaining source CRUD/configuration
-and other repository views remain future work.
+short reservations in one transaction. Remaining source-service orchestration,
+article, sync-run, credential, archive, and other repository views remain
+future work.
 
 The remaining tree intentionally contains no route handlers, browser calls,
 article/source-configuration queries, scheduler loops, credential persistence,

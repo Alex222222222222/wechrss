@@ -320,9 +320,14 @@ fn at(seconds: i64) -> DateTime<Utc> {
 
 async fn insert_source(pool: &PgPool, revision: i64) -> SourceId {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
-    sqlx::query("INSERT INTO sources (id, feed_revision) VALUES ($1, $2)")
-        .bind(source_id.as_uuid())
-        .bind(revision)
+    sqlx::query(
+        "INSERT INTO sources (id, book_id, display_name, article_url, feed_revision) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(source_id.as_uuid())
+    .bind(format!("book-{source_id}"))
+    .bind("Test source")
+    .bind("https://mp.weixin.qq.com/s/test")
+    .bind(revision)
         .execute(pool)
         .await
         .expect("test source should be insertable");

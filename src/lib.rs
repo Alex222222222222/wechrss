@@ -2,8 +2,9 @@
 //!
 //! This crate is being implemented incrementally. The module declarations
 //! establish dependency direction; configuration, pacing, durable job and
-//! feed-cache persistence slices, and the shared transaction boundary are
-//! implemented while the remaining modules document their future contracts.
+//! feed-cache/source persistence slices, and the shared transaction boundary
+//! are implemented while the remaining modules document their future
+//! contracts.
 
 pub mod acquisition;
 pub mod application;

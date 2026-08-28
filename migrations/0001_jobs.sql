@@ -89,10 +89,14 @@ CREATE INDEX IF NOT EXISTS jobs_expired_lease_idx
 
 -- Source scheduling state is durable so every application replica observes
 -- the same due time, gate, cooldown, and short enqueue reservation. The
--- remaining source identity/configuration columns can be added before the
--- first published release without changing this initial migration's purpose.
+-- source identity and configuration live in this same initial aggregate so
+-- source creation and scheduling can share one transaction boundary.
 CREATE TABLE IF NOT EXISTS sources (
     id UUID PRIMARY KEY,
+    book_id TEXT NOT NULL CHECK (btrim(book_id) <> ''),
+    display_name TEXT NOT NULL CHECK (btrim(display_name) <> ''),
+    article_url TEXT NOT NULL CHECK (btrim(article_url) <> ''),
+    account_id UUID,
     feed_revision BIGINT NOT NULL DEFAULT 0 CHECK (feed_revision >= 0),
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     scheduling_gate TEXT NOT NULL DEFAULT 'ready' CHECK (
@@ -108,6 +112,9 @@ CREATE TABLE IF NOT EXISTS sources (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS sources_book_id_idx
+    ON sources (book_id);
 
 CREATE INDEX IF NOT EXISTS sources_due_idx
     ON sources (next_fetch_at ASC, priority DESC, id ASC)

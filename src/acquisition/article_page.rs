@@ -27,6 +27,7 @@
 //! [`super::weread`]. This module only consumes an article URL and uses an
 //! unauthenticated browser context for the public content page.
 
-// TODO(design): add VerifiedWechatArticleUrl and an ArticlePageFetcher port that
-// accepts &mut PublicBrowserSession only, so URL validation and credential
-// isolation are enforced by types rather than caller convention.
+// TODO(design): add an ArticlePageFetcher port that accepts
+// `VerifiedWechatArticleUrl` and `&mut PublicBrowserSession` only, and
+// revalidates the final URL after every navigation so credential isolation and
+// redirect safety remain enforced by types and the adapter.
