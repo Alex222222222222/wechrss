@@ -100,3 +100,19 @@ CREATE TABLE IF NOT EXISTS account_leases (
 
 CREATE INDEX IF NOT EXISTS account_leases_expiry_idx
     ON account_leases (lease_until ASC, account_id ASC);
+
+-- A build lease prevents concurrent RSS cache-miss requests from all rendering
+-- the same source. The cache row and source revision are added in a later
+-- revision-aware feed-cache slice.
+CREATE TABLE IF NOT EXISTS feed_build_leases (
+    source_id UUID PRIMARY KEY,
+    lease_owner TEXT NOT NULL CHECK (btrim(lease_owner) <> ''),
+    lease_token UUID NOT NULL,
+    lease_until TIMESTAMPTZ NOT NULL,
+    heartbeat_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS feed_build_leases_expiry_idx
+    ON feed_build_leases (lease_until ASC, source_id ASC);

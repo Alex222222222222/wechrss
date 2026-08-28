@@ -28,8 +28,9 @@ This document describes the target version-one architecture, not the behavior
 of a deployable server. The binary is currently a no-op. The executable
 foundations are typed environment parsing for the original configuration set,
 pure pacing/quiet-hours policy, PostgreSQL pool/migration helpers, the job
-domain/repository slice, its shared transaction boundary, and the stable
-account identity plus distributed account-lease slice.
+domain/repository slice, its shared transaction boundary, the stable account
+identity plus distributed account-lease slice, and the per-source feed-build
+lease slice.
 
 The current and target contracts must not be confused:
 
@@ -38,7 +39,7 @@ The current and target contracts must not be confused:
 | Runtime | No server, routes, scheduler, worker, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, and PostgreSQL-clocked SQLx job operations | Remove caller `now` parameters only in a later queue-port contract release |
 | Configuration | Original `AppConfig`, including legacy archive settings | Planned role, account-lease, cooldown, stale-cache, safe-admin, and optional-asset settings must be implemented and tested before deployment uses them |
-| Persistence | Job table/repository, shared job transaction boundary, and account-lease repository | Sources, credential records, articles, sync runs, feed cache/build leases, and their transaction-scoped `UnitOfWork` views remain design-only |
+| Persistence | Job table/repository, shared job transaction boundary, account-lease repository, and feed-build lease repository | Sources, credential records, articles, sync runs, feed-cache rows, and their transaction-scoped `UnitOfWork` views remain design-only |
 | Acquisition/web/RSS | Documentation-only boundaries | Capability types and application/repository ports must exist before concrete adapters or handlers |
 
 Planned environment variables in this document are not parsed or effective
@@ -339,8 +340,9 @@ docker rm --force wechrss-postgres-dev
 docker volume rm wechrss-postgres-dev-data
 ```
 
-The current implementation includes the `jobs` migration and PostgreSQL job
-repository. The application uses SQLx's embedded `Migrator` to discover files
+The current implementation includes the `jobs`, `account_leases`, and
+`feed_build_leases` tables and their PostgreSQL repositories. The application
+uses SQLx's embedded `Migrator` to discover files
 under `migrations/`, record applied versions and checksums in
 `_sqlx_migrations`, and apply only pending migrations. The PostgreSQL
 integration test uses `#[sqlx::test]`, which creates an isolated temporary
@@ -684,10 +686,11 @@ than add more empty module shells. Work proceeds in this order:
    rollout for later schema changes so mixed replica versions remain safe;
    upgrade and concurrency tests are a gate.
 3. Extend the shared `UnitOfWork` with transaction-scoped repository ports and
-   implement feed-build lease/CAS primitives. The account-lease repository is
-   already executable, but credential records must still be added before
-   authenticated acquisition is enabled. No source or feed application service
-   may bypass these boundaries with convenience transactions.
+   implement revision-aware feed-cache reads/CAS publication. Account and
+   feed-build lease repositories are already executable, but credential records
+   must still be added before authenticated acquisition is enabled. No source
+   or feed application service may bypass these boundaries with convenience
+   transactions.
 4. Implement source, account/credential, article, sync-run, and feed-cache
    repositories with PostgreSQL tests, then make `FeedService` executable.
 5. Build role-aware runtime composition, scheduler/worker loops, heartbeat
@@ -718,9 +721,11 @@ pacing and configuration modules have no network, browser, database, scheduler,
 or sleeping side effects. `UnitOfWorkFactory` and its transaction-scoped job
 view are implemented in `src/persistence/unit_of_work.rs`; the account-lease
 repository is implemented in
-`src/persistence/repositories/account_lease_repository.rs`. The unit of work
-owns the shared commit/rollback boundary, while the other repository views
-remain future work.
+`src/persistence/repositories/account_lease_repository.rs`, and the feed-build
+lease repository is implemented in
+`src/persistence/repositories/feed_cache_repository.rs`. The unit of work owns
+the shared commit/rollback boundary, while revision-aware feed-cache rows and
+the other repository views remain future work.
 
 The remaining tree intentionally contains no route handlers, browser calls,
 article/source/feed-cache queries, scheduler loops, credential persistence, or

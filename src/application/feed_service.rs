@@ -42,5 +42,5 @@
 //! responses use `max-age=0` plus a bounded `stale-while-revalidate` directive;
 //! they must not reset the full 30-minute freshness period.
 
-// TODO(design): define FeedService ports and result DTOs before implementing the
-// Axum feed handler or feed-cache repository.
+// TODO(design): define FeedService ports and result DTOs plus the revision-aware
+// feed-cache repository before implementing the Axum feed handler.
