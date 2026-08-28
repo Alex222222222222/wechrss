@@ -1,9 +1,9 @@
 //! Source persistence repository.
 //!
-//! Stores source identity and feed revision today. The eventual repository will
-//! also store display configuration, enabled state, scheduling timestamps,
-//! scheduling gate, failure cooldown, stable WeRead account relationship, and
-//! opaque feed-token metadata. It will enforce unique `book_id` values.
+//! Stores source scheduling state and feed revision today. The eventual
+//! repository will also store display configuration, stable WeRead account
+//! relationship, and opaque feed-token metadata. It will enforce unique
+//! `book_id` values.
 //!
 //! The cross-table due-source reservation and job insertion operation belongs
 //! to `scheduler_repository`; this repository supplies its transaction-scoped
@@ -14,6 +14,6 @@
 //! transactions. This repository does not resolve article URLs or execute
 //! synchronization.
 
-// TODO(design): add the remaining source configuration fields, scheduling
-// gates/account relationships, and transaction-scoped schedule/reservation
-// updates around the implemented feed-revision row.
+// TODO(design): add source CRUD, remaining configuration fields, stable account
+// relationships, feed-token metadata, and transaction-scoped source schedule
+// updates around the implemented scheduling/revision rows.

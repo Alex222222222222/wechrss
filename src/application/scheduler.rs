@@ -22,6 +22,7 @@
 //! exhausted failures receive a durable cooldown so release of an active job
 //! deduplication key cannot create an immediate infinite retry loop.
 
-// TODO(design): replace future due-source list/enqueue composition with one
-// PostgreSQL-clocked atomic scheduler-repository operation and explicit source
-// scheduling gates.
+// TODO(design): define the application scheduler loop over the implemented
+// repository operation, including quiet-hour policy, bounded polling, and
+// metrics. The loop must not reimplement source selection or enqueue work
+// through separate repository calls.

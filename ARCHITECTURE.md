@@ -4,8 +4,7 @@ This document describes the planned Rust implementation of the existing
 `wechrss-main` Python service. The current Rust tree remains intentionally
 incremental: it defines boundaries and ownership, with the domain/configuration
 policies and the first PostgreSQL job/cache-persistence slices implemented
-while
-network access, browser automation, scheduling, and HTTP behavior remain
+while network access, browser automation, and HTTP behavior remain
 unimplemented.
 
 ## Goals
@@ -30,8 +29,8 @@ of a deployable server. The binary is currently a no-op. The executable
 foundations are typed environment parsing for the original configuration set,
 pure pacing/quiet-hours policy, PostgreSQL pool/migration helpers, the job and
 feed-cache domain/repository slices, their shared transaction boundary, the
-stable account identity plus distributed account-lease slice, and the
-per-source feed-build lease slice.
+stable account identity plus distributed account-lease slice, the per-source
+feed-build lease slice, and atomic due-source scheduling persistence.
 
 The current and target contracts must not be confused:
 
@@ -40,7 +39,7 @@ The current and target contracts must not be confused:
 | Runtime | No server, routes, scheduler, worker, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, and PostgreSQL-clocked SQLx job operations | Remove caller `now` parameters only in a later queue-port contract release |
 | Configuration | Original `AppConfig`, including legacy archive settings | Planned role, account-lease, cooldown, stale-cache, safe-admin, and optional-asset settings must be implemented and tested before deployment uses them |
-| Persistence | Job/source-revision/feed-cache tables, their PostgreSQL repositories, shared job/feed-cache transaction boundary, account leases, and feed-build leases | Source configuration, credential records, articles, sync runs, and their remaining transaction-scoped views are design-only |
+| Persistence | Job/source-scheduling/feed-cache tables, their PostgreSQL repositories, shared job/feed-cache transaction boundary, account leases, and feed-build leases | Source CRUD/configuration, credential records, articles, sync runs, and their remaining transaction-scoped views are design-only |
 | Acquisition/web/RSS | Documentation-only boundaries | Capability types and application/repository ports must exist before concrete adapters or handlers |
 
 Planned environment variables in this document are not parsed or effective
@@ -341,9 +340,10 @@ docker rm --force wechrss-postgres-dev
 docker volume rm wechrss-postgres-dev-data
 ```
 
-The current implementation includes the minimal `sources` revision fence,
+The current implementation includes the source scheduling/revision fence,
 `feed_cache`, `account_leases`, and `feed_build_leases` tables and their
-PostgreSQL repositories. The application
+PostgreSQL repositories. The scheduler repository atomically reserves due
+sources and inserts canonical source-sync jobs across replicas. The application
 uses SQLx's embedded `Migrator` to discover files
 under `migrations/`, record applied versions and checksums in
 `_sqlx_migrations`, and apply only pending migrations. The PostgreSQL
@@ -732,7 +732,11 @@ repository is implemented in
 `src/persistence/repositories/account_lease_repository.rs`. The source
 revision/feed-cache reader and transaction-scoped fenced publication are
 implemented in `src/persistence/repositories/feed_cache_repository.rs`, and
-`UnitOfWork` exposes that publication view. The remaining source configuration
+`UnitOfWork` exposes that publication view. The atomic source scheduler
+repository and its scheduling columns are implemented in
+`src/persistence/repositories/scheduler_repository.rs`; it selects due sources
+with PostgreSQL row locking, inserts canonical source-sync jobs, and records
+short reservations in one transaction. The remaining source CRUD/configuration
 and other repository views remain future work.
 
 The remaining tree intentionally contains no route handlers, browser calls,

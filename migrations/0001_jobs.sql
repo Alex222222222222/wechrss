@@ -87,13 +87,31 @@ CREATE INDEX IF NOT EXISTS jobs_expired_lease_idx
     ON jobs (lease_until ASC, id ASC)
     WHERE status = 'running';
 
--- The source revision is the compare-and-swap fence for rendered RSS. The
--- remaining source configuration columns can be added before the first
--- published release without changing this initial migration's purpose.
+-- Source scheduling state is durable so every application replica observes
+-- the same due time, gate, cooldown, and short enqueue reservation. The
+-- remaining source identity/configuration columns can be added before the
+-- first published release without changing this initial migration's purpose.
 CREATE TABLE IF NOT EXISTS sources (
     id UUID PRIMARY KEY,
-    feed_revision BIGINT NOT NULL DEFAULT 0 CHECK (feed_revision >= 0)
+    feed_revision BIGINT NOT NULL DEFAULT 0 CHECK (feed_revision >= 0),
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    scheduling_gate TEXT NOT NULL DEFAULT 'ready' CHECK (
+        scheduling_gate IN ('ready', 'authentication_required', 'risk_controlled')
+    ),
+    sync_interval_seconds BIGINT NOT NULL DEFAULT 3600 CHECK (sync_interval_seconds > 0),
+    rss_item_limit BIGINT NOT NULL DEFAULT 50 CHECK (rss_item_limit > 0),
+    next_fetch_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    failure_cooldown_until TIMESTAMPTZ,
+    schedule_reserved_until TIMESTAMPTZ,
+    priority INTEGER NOT NULL DEFAULT 0,
+    max_attempts BIGINT NOT NULL DEFAULT 3 CHECK (max_attempts > 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS sources_due_idx
+    ON sources (next_fetch_at ASC, priority DESC, id ASC)
+    WHERE enabled AND scheduling_gate = 'ready';
 
 -- One current rendered document per source. XML is stored as bytes so the
 -- HTTP layer can return it without another serialization pass.

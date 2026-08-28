@@ -16,8 +16,10 @@
 //! [`repositories::job_repository`], and the PostgreSQL/memory account lease
 //! repository in [`repositories::account_lease_repository`] plus the durable
 //! feed-build lease and revision-aware feed-cache repository in
-//! [`repositories::feed_cache_repository`]. Source configuration, article,
-//! sync-run, credential, and archive repository SQL remain future work.
+//! [`repositories::feed_cache_repository`]. The PostgreSQL scheduler repository
+//! in [`repositories::scheduler_repository`] now atomically enqueues due source
+//! jobs and records source reservations. Source CRUD, article, sync-run,
+//! credential, and archive repository SQL remain future work.
 
 pub mod postgres;
 pub mod repositories;
