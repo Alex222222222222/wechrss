@@ -3,7 +3,8 @@
 //! Purpose: provide the one cross-table operation needed by every scheduler
 //! replica without exposing a race-prone due-source list to application code.
 //! [`SchedulerRepository::enqueue_due_sources`] opens a short transaction,
-//! derives eligibility time from PostgreSQL, locks a bounded batch of enabled,
+//! samples the PostgreSQL clock, evaluates the application-supplied quiet-hours
+//! predicate against that sample, then locks a bounded batch of enabled,
 //! `ready`, due sources with `FOR UPDATE SKIP LOCKED`, excludes sources with an
 //! active source-sync job, inserts canonical `source_sync:{source_id}` jobs,
 //! and records their scheduling reservations.
@@ -16,8 +17,10 @@
 //!
 //! Failure behavior: the source reservation and job insertion commit together
 //! or not at all. Duplicate conflicts caused by concurrent manual sync requests
-//! are normal idempotent outcomes. This repository never calculates quiet
-//! hours, runs browser work, or decides a source's terminal scheduling gate.
+//! are normal idempotent outcomes. The application owns quiet-hours
+//! configuration; this repository only evaluates the supplied pure policy
+//! against its authoritative database timestamp. It never runs browser work or
+//! decides a source's terminal scheduling gate.
 //!
 //! High availability: source rows are locked in PostgreSQL, so independent
 //! application replicas claim disjoint batches. `SKIP LOCKED` prevents one slow
@@ -33,7 +36,7 @@ use sqlx::{PgPool, Row};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::domain::source::SourceId;
+use crate::{domain::pacing::QuietHours, domain::source::SourceId};
 
 /// A source-sync job inserted together with its scheduler reservation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +44,16 @@ pub struct EnqueuedSource {
     source_id: SourceId,
     job_id: Uuid,
     reserved_until: chrono::DateTime<chrono::Utc>,
+}
+
+/// Outcome of one atomic source-scheduling pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchedulerPass {
+    /// No source jobs were considered because the database-clocked quiet-hours
+    /// policy was active.
+    SkippedQuietHours,
+    /// Source jobs inserted by this pass.
+    Enqueued(Vec<EnqueuedSource>),
 }
 
 impl EnqueuedSource {
@@ -89,12 +102,15 @@ pub enum SchedulerRepositoryError {
 #[allow(async_fn_in_trait)]
 pub trait SchedulerRepository: Send + Sync {
     /// Enqueues up to `limit` eligible sources and reserves each source for a
-    /// short period. A zero limit is a successful no-op.
+    /// short period. The optional policy is evaluated using a PostgreSQL
+    /// timestamp inside the same transaction. A zero limit is a successful
+    /// no-op.
     async fn enqueue_due_sources(
         &self,
         limit: usize,
         reservation_for: Duration,
-    ) -> Result<Vec<EnqueuedSource>, SchedulerRepositoryError>;
+        quiet_hours: Option<QuietHours>,
+    ) -> Result<SchedulerPass, SchedulerRepositoryError>;
 }
 
 /// PostgreSQL implementation of the atomic due-source operation.
@@ -124,9 +140,10 @@ impl SchedulerRepository for PostgresSchedulerRepository {
         &self,
         limit: usize,
         reservation_for: Duration,
-    ) -> Result<Vec<EnqueuedSource>, SchedulerRepositoryError> {
+        quiet_hours: Option<QuietHours>,
+    ) -> Result<SchedulerPass, SchedulerRepositoryError> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(SchedulerPass::Enqueued(Vec::new()));
         }
         let limit = i64::try_from(limit)
             .map_err(|_| SchedulerRepositoryError::InvalidLimit { value: limit })?;
@@ -137,24 +154,33 @@ impl SchedulerRepository for PostgresSchedulerRepository {
             .begin()
             .await
             .map_err(SchedulerRepositoryError::Storage)?;
+        let db_now: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(SchedulerRepositoryError::Storage)?;
+
+        if quiet_hours.is_some_and(|quiet_hours| quiet_hours.is_quiet_at(db_now)) {
+            transaction
+                .commit()
+                .await
+                .map_err(SchedulerRepositoryError::Storage)?;
+            return Ok(SchedulerPass::SkippedQuietHours);
+        }
+
         let source_rows = sqlx::query(
             r#"
-            WITH db_clock AS MATERIALIZED (
-                SELECT clock_timestamp() AS now
-            )
-            SELECT source.id, source.priority, source.max_attempts, db_clock.now
+            SELECT source.id, source.priority, source.max_attempts, $2::timestamptz AS now
             FROM sources AS source
-            CROSS JOIN db_clock
             WHERE source.enabled
               AND source.scheduling_gate = 'ready'
-              AND source.next_fetch_at <= db_clock.now
+              AND source.next_fetch_at <= $2
               AND (
                   source.failure_cooldown_until IS NULL
-                  OR source.failure_cooldown_until <= db_clock.now
+                  OR source.failure_cooldown_until <= $2
               )
               AND (
                   source.schedule_reserved_until IS NULL
-                  OR source.schedule_reserved_until <= db_clock.now
+                  OR source.schedule_reserved_until <= $2
               )
               AND NOT EXISTS (
                   SELECT 1
@@ -168,6 +194,7 @@ impl SchedulerRepository for PostgresSchedulerRepository {
             "#,
         )
         .bind(limit)
+        .bind(db_now)
         .fetch_all(&mut *transaction)
         .await
         .map_err(SchedulerRepositoryError::Storage)?;
@@ -264,7 +291,7 @@ impl SchedulerRepository for PostgresSchedulerRepository {
             .commit()
             .await
             .map_err(SchedulerRepositoryError::Storage)?;
-        Ok(enqueued)
+        Ok(SchedulerPass::Enqueued(enqueued))
     }
 }
 
@@ -288,10 +315,10 @@ mod tests {
         };
 
         assert!(repository
-            .enqueue_due_sources(0, Duration::zero())
+            .enqueue_due_sources(0, Duration::zero(), None)
             .await
             .expect("zero limit is a no-op")
-            .is_empty());
+            .eq(&SchedulerPass::Enqueued(Vec::new())));
     }
 
     #[test]

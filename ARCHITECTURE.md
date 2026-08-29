@@ -299,13 +299,17 @@ and require an explicit successful login or operator action before automatic
 work resumes. This prevents a terminal job from being recreated immediately
 after its active deduplication key is released.
 
-The scheduler repository owns a single atomic `enqueue_due_sources(limit)`
-operation. It derives eligibility time from PostgreSQL, locks due source rows
-with `SKIP LOCKED`, excludes sources with an
-active source-sync job, inserts jobs with the canonical
+The scheduler repository owns a single atomic
+`enqueue_due_sources(limit, reservation_for, quiet_hours)` operation. It samples
+the PostgreSQL clock inside its transaction, evaluates the supplied quiet-hours
+policy against that timestamp, and returns without source writes when the
+window is active. Otherwise it locks due source rows with `SKIP LOCKED`,
+excludes sources with an active source-sync job, inserts jobs with the canonical
 `source_sync:{source_id}` deduplication key, and records the scheduling
-reservation in one transaction. Scheduler replicas never implement this as a
-read-list followed by unrelated insert calls.
+reservation in the same transaction. Scheduler replicas never implement this
+as a read-list followed by unrelated insert calls. The application owns the
+policy configuration; the repository supplies only the authoritative timestamp
+and atomic execution boundary.
 
 Each configured WeRead account has a stable `account_id`. Authenticated list,
 URL-recovery, login, and credential-refresh operations acquire a durable
@@ -814,6 +818,13 @@ produces revision-tagged cache candidates. The cache-first `FeedService` in
 rows, honors conditional ETags, and enqueues deduplicated rebuild jobs through
 the custom `jobs` table adapter. It is not yet wired to feed-token lookup, the
 database-only rebuild/publish workflow, or an HTTP route.
+
+The one-pass scheduler wrapper in `src/application/scheduler.rs` now forwards
+the configured quiet-hours policy to the atomic source-scheduling operation.
+That repository samples PostgreSQL time and applies the policy inside its
+transaction. A future runtime loop still owns polling, shutdown, retry
+backoff, and metrics; it must call this boundary rather than reimplement source
+selection.
 
 The remaining tree intentionally contains no route handlers, browser calls,
 source-configuration orchestration, scheduler loops, credential persistence,

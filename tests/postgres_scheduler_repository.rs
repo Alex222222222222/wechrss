@@ -1,12 +1,13 @@
 use std::collections::HashSet;
 
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 use wechrss::{
+    domain::pacing::QuietHours,
     domain::source::{SchedulingGate, SourceId},
     persistence::repositories::scheduler_repository::{
-        PostgresSchedulerRepository, SchedulerRepository, SchedulerRepositoryError,
+        PostgresSchedulerRepository, SchedulerPass, SchedulerRepository, SchedulerRepositoryError,
     },
 };
 
@@ -22,11 +23,18 @@ async fn postgres_scheduler_claims_disjoint_batches_across_replicas(pool: PgPool
     let repository_b = PostgresSchedulerRepository::new(pool.clone());
 
     let (batch_a, batch_b) = tokio::join!(
-        repository_a.enqueue_due_sources(2, Duration::minutes(5)),
-        repository_b.enqueue_due_sources(2, Duration::minutes(5)),
+        repository_a.enqueue_due_sources(2, Duration::minutes(5), None),
+        repository_b.enqueue_due_sources(2, Duration::minutes(5), None),
     );
-    let batch_a = batch_a.expect("first scheduler replica should succeed");
-    let batch_b = batch_b.expect("second scheduler replica should succeed");
+    let SchedulerPass::Enqueued(batch_a) = batch_a.expect("first scheduler replica should succeed")
+    else {
+        panic!("scheduler should not be quiet in this test");
+    };
+    let SchedulerPass::Enqueued(batch_b) =
+        batch_b.expect("second scheduler replica should succeed")
+    else {
+        panic!("scheduler should not be quiet in this test");
+    };
 
     assert_eq!(batch_a.len(), 2);
     assert_eq!(batch_b.len(), 2);
@@ -90,9 +98,12 @@ async fn postgres_scheduler_filters_gates_and_active_jobs(pool: PgPool) {
     enqueue_active_job(&pool, active).await;
 
     let enqueued = PostgresSchedulerRepository::new(pool.clone())
-        .enqueue_due_sources(20, Duration::minutes(5))
+        .enqueue_due_sources(20, Duration::minutes(5), None)
         .await
         .expect("scheduler should succeed");
+    let SchedulerPass::Enqueued(enqueued) = enqueued else {
+        panic!("scheduler should not be quiet in this test");
+    };
     assert_eq!(enqueued.len(), 1);
     assert_eq!(enqueued[0].source_id(), eligible);
 
@@ -120,15 +131,18 @@ async fn postgres_scheduler_reservation_and_active_dedupe_survive_repeated_passe
     let repository = PostgresSchedulerRepository::new(pool.clone());
 
     let first = repository
-        .enqueue_due_sources(1, Duration::minutes(5))
+        .enqueue_due_sources(1, Duration::minutes(5), None)
         .await
         .expect("first scheduling pass should succeed");
+    let SchedulerPass::Enqueued(first) = first else {
+        panic!("scheduler should not be quiet in this test");
+    };
     assert_eq!(first.len(), 1);
     assert!(repository
-        .enqueue_due_sources(1, Duration::minutes(5))
+        .enqueue_due_sources(1, Duration::minutes(5), None)
         .await
         .expect("second scheduling pass should succeed")
-        .is_empty());
+        .eq(&SchedulerPass::Enqueued(Vec::new())));
 
     sqlx::query(
         "UPDATE sources SET schedule_reserved_until = clock_timestamp() - interval '1 second' WHERE id = $1",
@@ -138,10 +152,10 @@ async fn postgres_scheduler_reservation_and_active_dedupe_survive_repeated_passe
     .await
     .expect("test should be able to expire the reservation");
     assert!(repository
-        .enqueue_due_sources(1, Duration::minutes(5))
+        .enqueue_due_sources(1, Duration::minutes(5), None)
         .await
         .expect("active job should still deduplicate")
-        .is_empty());
+        .eq(&SchedulerPass::Enqueued(Vec::new())));
 
     sqlx::query(
         "UPDATE jobs SET status = 'succeeded', claim_count = 1, started_at = clock_timestamp() - interval '1 second', finished_at = clock_timestamp(), updated_at = clock_timestamp() WHERE source_id = $1",
@@ -151,11 +165,41 @@ async fn postgres_scheduler_reservation_and_active_dedupe_survive_repeated_passe
     .await
     .expect("test should be able to make the job terminal");
     let rescheduled = repository
-        .enqueue_due_sources(1, Duration::minutes(5))
+        .enqueue_due_sources(1, Duration::minutes(5), None)
         .await
         .expect("terminal jobs should allow a future scheduling pass");
+    let SchedulerPass::Enqueued(rescheduled) = rescheduled else {
+        panic!("scheduler should not be quiet in this test");
+    };
     assert_eq!(rescheduled.len(), 1);
     assert_ne!(rescheduled[0].job_id(), first[0].job_id());
+}
+
+#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+async fn postgres_scheduler_uses_database_clock_for_quiet_hours(pool: PgPool) {
+    let database_now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&pool)
+        .await
+        .expect("database clock should be queryable");
+    let quiet_hours = QuietHours::new(
+        chrono_tz::UTC,
+        (database_now - chrono::Duration::hours(1)).time(),
+        (database_now + chrono::Duration::hours(1)).time(),
+    )
+    .expect("the test quiet window should have distinct endpoints");
+    insert_source(&pool, true, SchedulingGate::Ready, 1).await;
+
+    let result = PostgresSchedulerRepository::new(pool.clone())
+        .enqueue_due_sources(1, Duration::minutes(5), Some(quiet_hours))
+        .await
+        .expect("quiet-hours scheduling should succeed");
+    assert_eq!(result, SchedulerPass::SkippedQuietHours);
+
+    let job_count: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
+        .fetch_one(&pool)
+        .await
+        .expect("job count should be queryable");
+    assert_eq!(job_count, 0);
 }
 
 #[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
@@ -169,7 +213,7 @@ async fn postgres_scheduler_rolls_back_prior_inserts_when_a_source_is_invalid(po
         .expect("test should be able to create an invalid domain value");
 
     let error = PostgresSchedulerRepository::new(pool.clone())
-        .enqueue_due_sources(2, Duration::minutes(5))
+        .enqueue_due_sources(2, Duration::minutes(5), None)
         .await
         .expect_err("invalid persisted source value should fail the transaction");
     assert!(matches!(
