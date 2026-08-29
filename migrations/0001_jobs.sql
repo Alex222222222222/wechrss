@@ -156,6 +156,94 @@ CREATE TABLE IF NOT EXISTS articles (
 CREATE INDEX IF NOT EXISTS articles_feed_order_idx
     ON articles (source_id, published_at DESC, review_id ASC);
 
+-- One durable audit row per source synchronization attempt. Queue state lives
+-- in jobs; this table records the acquisition result and safe diagnostics.
+CREATE TABLE IF NOT EXISTS sync_runs (
+    id UUID PRIMARY KEY,
+    source_id UUID NOT NULL REFERENCES sources (id) ON DELETE CASCADE,
+    job_id UUID REFERENCES jobs (id) ON DELETE SET NULL,
+    outcome TEXT NOT NULL CHECK (
+        outcome IN (
+            'running',
+            'succeeded',
+            'deferred',
+            'authentication_required',
+            'risk_controlled',
+            'blocked',
+            'retryable_failure',
+            'failed'
+        )
+    ),
+    articles_seen BIGINT NOT NULL CHECK (articles_seen >= 0),
+    articles_created BIGINT NOT NULL CHECK (articles_created >= 0),
+    articles_updated BIGINT NOT NULL CHECK (articles_updated >= 0),
+    articles_failed BIGINT NOT NULL CHECK (articles_failed >= 0),
+    archived_articles BIGINT NOT NULL CHECK (archived_articles >= 0),
+    archived_assets BIGINT NOT NULL CHECK (archived_assets >= 0),
+    failure_class TEXT,
+    failure_message TEXT,
+    feed_revision BIGINT CHECK (feed_revision IS NULL OR feed_revision >= 0),
+    started_at TIMESTAMPTZ NOT NULL,
+    finished_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (
+        (outcome = 'running' AND finished_at IS NULL)
+        OR (outcome <> 'running' AND finished_at IS NOT NULL)
+    ),
+    CHECK (
+        (
+            outcome IN (
+                'authentication_required',
+                'risk_controlled',
+                'blocked',
+                'retryable_failure',
+                'failed'
+            )
+            AND failure_class IS NOT NULL
+            AND btrim(failure_class) <> ''
+            AND failure_message IS NOT NULL
+            AND btrim(failure_message) <> ''
+        )
+        OR (
+            outcome IN ('running', 'succeeded', 'deferred')
+            AND failure_class IS NULL
+            AND failure_message IS NULL
+        )
+    ),
+    CONSTRAINT sync_runs_failure_class_check CHECK (
+        failure_class IS NULL
+        OR failure_class IN (
+            'authentication_expired',
+            'risk_controlled',
+            'blocked',
+            'retryable',
+            'permanent'
+        )
+    ),
+    CONSTRAINT sync_runs_failure_class_outcome_check CHECK (
+        (
+            outcome IN ('running', 'succeeded', 'deferred')
+            AND failure_class IS NULL
+        )
+        OR (
+            outcome = 'authentication_required'
+            AND failure_class = 'authentication_expired'
+        )
+        OR (outcome = 'risk_controlled' AND failure_class = 'risk_controlled')
+        OR (outcome = 'blocked' AND failure_class = 'blocked')
+        OR (outcome = 'retryable_failure' AND failure_class = 'retryable')
+        OR (
+            outcome = 'failed'
+            AND failure_class IN ('retryable', 'permanent')
+        )
+    ),
+    CHECK (failure_message IS NULL OR length(failure_message) <= 4096)
+);
+
+CREATE INDEX IF NOT EXISTS sync_runs_source_started_idx
+    ON sync_runs (source_id, started_at DESC, id DESC);
+
 -- One current rendered document per source. XML is stored as bytes so the
 -- HTTP layer can return it without another serialization pass.
 CREATE TABLE IF NOT EXISTS feed_cache (

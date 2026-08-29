@@ -41,7 +41,7 @@ The current and target contracts must not be confused:
 | Runtime | No server, routes, scheduler, worker, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, and PostgreSQL-clocked SQLx job operations | Remove caller `now` parameters only in a later queue-port contract release |
 | Configuration | Original `AppConfig`, including legacy archive settings | Planned role, account-lease, cooldown, stale-cache, safe-admin, and optional-asset settings must be implemented and tested before deployment uses them |
-| Persistence | Job/source-scheduling/article/feed-cache tables, their PostgreSQL repositories, shared job/source/article/feed-cache transaction boundary, account leases, and feed-build leases | Source-service lifecycle orchestration, credential records, sync runs, and their remaining transaction-scoped views are design-only |
+| Persistence | Job/source-scheduling/article/sync-run/feed-cache tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Source-service lifecycle orchestration, credential records, and remaining transaction-scoped views are design-only |
 | Acquisition/web/RSS | A validated public WeChat article URL value object and pure RSS renderer | Browser capabilities, application/repository ports, and concrete adapters or handlers remain future work |
 
 Planned environment variables in this document are not parsed or effective
@@ -749,9 +749,10 @@ than add more empty module shells. Work proceeds in this order:
    rollout for later schema changes so mixed replica versions remain safe;
    upgrade and concurrency tests are a gate.
 3. Extend the shared `UnitOfWork` with transaction-scoped repository ports and
-   complete the source service, sync-run, and credential repositories plus their
+   complete the source service and credential repositories plus their
    transaction-scoped views. Source identity/create/read,
    normalized article persistence,
+   synchronization-run persistence,
    scheduling state, and feed-revision mutations are already executable. The
    revision-aware feed-cache publication view, account lease, and feed-build
    lease repositories are also executable. No source or feed application
@@ -796,12 +797,16 @@ transaction-scoped scheduling/gate/revision mutations are implemented in
 repository and its scheduling columns are implemented in
 `src/persistence/repositories/scheduler_repository.rs`; it selects due sources
 with PostgreSQL row locking, inserts canonical source-sync jobs, and records
-short reservations in one transaction. Normalized article domain values and
-the PostgreSQL article repository/transaction view are implemented in
-`src/domain/article.rs` and `src/persistence/repositories/article_repository.rs`;
-they provide idempotent upserts, feed-visible change detection, and
-source-scoped RSS ordering. Remaining source-service orchestration, sync-run,
-credential, archive, and other repository views remain future work. The pure
+short reservations in one transaction. Normalized article and sync-run domain
+values and their PostgreSQL repositories/transaction views are implemented in
+`src/domain/article.rs`, `src/persistence/repositories/article_repository.rs`,
+`src/domain/sync.rs`, and `src/persistence/repositories/sync_run_repository.rs`;
+they provide idempotent article upserts, feed-visible change detection,
+source-scoped RSS ordering, typed sync outcomes, bounded counters, and safe
+failure summaries. The sync-run repository's transaction-scoped `UnitOfWork`
+view is also included in that implementation. Remaining source-service
+orchestration, credential, archive, and other repository views remain future
+work. The pure
 RSS renderer in `src/rss/renderer.rs` is executable and
 produces revision-tagged cache candidates. The cache-first `FeedService` in
 `src/application/feed_service.rs` is also executable: it serves fresh or stale
@@ -811,8 +816,8 @@ database-only rebuild/publish workflow, or an HTTP route.
 
 The remaining tree intentionally contains no route handlers, browser calls,
 source-configuration orchestration, scheduler loops, credential persistence,
-or business implementation. Source-service, sync-run, credential, archive, and
-acquisition modules remain documentation-only; article persistence and
-`FeedService` implement only the database/cache boundaries described above.
+or business implementation. Source-service, credential, archive, and
+acquisition modules remain documentation-only; article and sync-run persistence
+and `FeedService` implement only the database/cache boundaries described above.
 `TODO(design)` markers identify existing code and migrations that must change
 before the remaining contracts are implemented.

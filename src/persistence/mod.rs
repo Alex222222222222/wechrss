@@ -22,9 +22,10 @@
 //! transaction-scoped scheduling/revision mutations are implemented in
 //! [`repositories::source_repository`], and normalized article upserts plus
 //! source-scoped feed reads are implemented in
-//! [`repositories::article_repository`]. Source-service lifecycle
-//! orchestration, sync-run, credential, and archive repository SQL remain
-//! future work.
+//! [`repositories::article_repository`]. Synchronization-run start/finish and
+//! source history reads are implemented in
+//! [`repositories::sync_run_repository`]. Source-service lifecycle
+//! orchestration, credential, and archive repository SQL remain future work.
 
 pub mod postgres;
 pub mod repositories;
