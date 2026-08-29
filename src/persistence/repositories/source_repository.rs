@@ -185,7 +185,8 @@ pub trait SourceTransactionRepository {
     ) -> Result<FeedRevision, SourceRepositoryError>;
 }
 
-/// Transaction-scoped PostgreSQL source view owned by [`UnitOfWork`].
+/// Transaction-scoped PostgreSQL source view owned by
+/// [`crate::persistence::unit_of_work::UnitOfWork`].
 pub struct PostgresSourceTransaction<'borrow, 'pool> {
     job_transaction: &'borrow mut PostgresJobTransaction<'pool>,
 }

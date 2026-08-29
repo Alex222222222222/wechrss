@@ -54,10 +54,11 @@ pub fn pool_options(config: &AppConfig) -> PgPoolOptions {
 ///
 /// SQLx parses the complete URL, including PostgreSQL SSL and certificate
 /// query parameters. The URL is never reconstructed or logged here, so those
-/// settings reach SQLx unchanged and remain protected by [`SecretString`]'s
-/// secret wrapper in [`AppConfig`]. No migrations or readiness checks are
-/// performed by this constructor; those belong to application startup and
-/// health-check orchestration.
+/// settings reach SQLx unchanged and remain protected by
+/// [`secrecy::SecretString`]'s secret wrapper in [`crate::config::AppConfig`].
+/// No migrations or readiness
+/// checks are performed by this constructor; those belong to application
+/// startup and health-check orchestration.
 pub async fn connect_pool(config: &AppConfig) -> Result<PgPool, sqlx::Error> {
     pool_options(config)
         .connect(config.database_url.expose_secret())

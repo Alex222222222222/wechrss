@@ -14,7 +14,9 @@
 //! Minimum executable contract:
 //!
 //! - `UnitOfWorkFactory::begin()` creates the transaction;
-//! - `jobs()` borrows the transaction-scoped job repository view;
+//! - `jobs()` remains the interim compatibility view;
+//! - `job_outcomes()` borrows only the transaction-scoped worker-outcome port;
+//! - `job_enqueue()` borrows only the transaction-scoped enqueue port;
 //! - `source()` borrows the transaction-scoped source mutation view;
 //! - `articles()` borrows the transaction-scoped article mutation view;
 //! - `feed_cache()` borrows the transaction-scoped feed-cache publication view;
@@ -28,10 +30,12 @@
 //!
 //! Retry, deferral, cancellation, and failure outcomes use the same boundary
 //! because they record sync results or alter source scheduling gates/cooldowns.
-//! Queue-only enqueue, claim, heartbeat, and read operations remain short
-//! independent transactions. Expired-lease recovery is a dedicated atomic
-//! persistence operation because exhausting a failure budget may also update the
-//! source cooldown.
+//! Queue-only claim, heartbeat, and read operations remain short independent
+//! transactions. Enqueueing can be independent for external requests, or can
+//! use `job_enqueue()` when another aggregate (such as a newly created source)
+//! must be published atomically with its job. Expired-lease recovery is a
+//! dedicated atomic persistence operation because exhausting a failure budget
+//! may also update the source cooldown.
 //!
 //! Synchronization data flow:
 //!
@@ -64,10 +68,17 @@ use std::fmt;
 use sqlx::PgPool;
 use thiserror::Error;
 
+use crate::domain::job::{Job, NewJob};
+
 use super::repositories::{
     article_repository::PostgresArticleTransaction,
-    feed_cache_repository::PostgresFeedCacheTransaction, job_repository::PostgresJobTransaction,
-    source_repository::PostgresSourceTransaction, sync_run_repository::PostgresSyncRunTransaction,
+    feed_cache_repository::PostgresFeedCacheTransaction,
+    job_repository::PostgresJobTransaction,
+    job_repository::{
+        EnqueueResult, JobEnqueueTransaction, JobOutcome, JobOutcomeTransaction, JobRepositoryError,
+    },
+    source_repository::PostgresSourceTransaction,
+    sync_run_repository::PostgresSyncRunTransaction,
 };
 
 /// Errors raised while opening or completing a unit of work.
@@ -113,10 +124,58 @@ pub struct UnitOfWork<'a> {
     jobs: PostgresJobTransaction<'a>,
 }
 
+/// Outcome-only view over the job transaction owned by [`UnitOfWork`].
+///
+/// This wrapper intentionally exposes no queue, recovery, or commit operation.
+/// A worker can apply one fenced [`JobOutcome`] through it, then the enclosing
+/// unit of work can persist related state and commit everything together.
+pub struct JobOutcomeView<'u, 'a> {
+    transaction: &'u mut PostgresJobTransaction<'a>,
+}
+
+/// Enqueue-only view over the job transaction owned by [`UnitOfWork`].
+///
+/// Source creation uses this capability to persist its initial sync job in the
+/// same transaction as the source row. The wrapper intentionally does not
+/// expose worker claims, outcomes, recovery, or commit.
+pub struct JobEnqueueView<'u, 'a> {
+    transaction: &'u mut PostgresJobTransaction<'a>,
+}
+
+impl JobEnqueueTransaction for JobEnqueueView<'_, '_> {
+    async fn enqueue_job(&mut self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError> {
+        JobEnqueueTransaction::enqueue_job(&mut *self.transaction, spec).await
+    }
+}
+
+impl JobOutcomeTransaction for JobOutcomeView<'_, '_> {
+    async fn apply_outcome(&mut self, outcome: JobOutcome) -> Result<Job, JobRepositoryError> {
+        JobOutcomeTransaction::apply_outcome(&mut *self.transaction, outcome).await
+    }
+}
+
 impl<'a> UnitOfWork<'a> {
     /// Borrows the job repository view without exposing an independent commit.
     pub fn jobs(&mut self) -> &mut PostgresJobTransaction<'a> {
         &mut self.jobs
+    }
+
+    /// Borrows the outcome-only job view without exposing a commit operation.
+    ///
+    /// The returned opaque view can apply a fenced [`JobOutcome`] while this
+    /// unit of work remains open. Callers should persist related business
+    /// changes through the other views and then call [`Self::commit`] once.
+    pub fn job_outcomes(&mut self) -> JobOutcomeView<'_, 'a> {
+        JobOutcomeView {
+            transaction: &mut self.jobs,
+        }
+    }
+
+    /// Borrows the enqueue-only job view without exposing a commit operation.
+    pub fn job_enqueue(&mut self) -> JobEnqueueView<'_, 'a> {
+        JobEnqueueView {
+            transaction: &mut self.jobs,
+        }
     }
 
     /// Borrows the transaction-scoped article mutation view.
@@ -165,5 +224,6 @@ impl fmt::Debug for UnitOfWork<'_> {
     }
 }
 
-// TODO(design): move verify-fence and business-coupled job outcomes behind this
-// boundary; and prevent SyncService from receiving a job-only commit API.
+// TODO(design): add the remaining verify-fence and business-coupled source,
+// article, sync-run, and archive commands behind this boundary; and prevent
+// SyncService from receiving a job-only commit API.

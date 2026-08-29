@@ -41,7 +41,7 @@ The current and target contracts must not be confused:
 | Runtime | No server, routes, scheduler, worker, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, and PostgreSQL-clocked SQLx job operations | Remove caller `now` parameters only in a later queue-port contract release |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | Runtime composition must consume the parsed role and policy values before deployment relies on them |
-| Persistence | Job/source-scheduling/article/sync-run/feed-cache tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Source-service lifecycle orchestration, credential records, and remaining transaction-scoped views are design-only |
+| Persistence | Job/source-scheduling/article/sync-run/feed-cache tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
 | Acquisition/web/RSS | A validated public WeChat article URL value object and pure RSS renderer | Browser capabilities, application/repository ports, and concrete adapters or handlers remain future work |
 
 Environment variables in this document are parsed into `AppConfig`, but the
@@ -176,8 +176,11 @@ Worker outcomes (`succeeded`, `retry_wait`, `deferred`, cancellation, and
 failure) are committed through the transaction-scoped unit-of-work outcome view
 because they may also write a sync run, source gate/cooldown, revision, or cache.
 Expired-lease recovery is a dedicated atomic persistence operation for the same
-reason. The current all-in-one job repository is an interim implementation and
-must not be injected into `SyncService` as a completion port.
+reason. `JobQueue`, `JobOutcomeTransaction`, and `ExpiredJobRecovery` now make
+these boundaries executable for PostgreSQL and the in-memory test repository.
+The all-in-one `JobRepository` and `JobRepositoryTransaction` remain temporary
+compatibility interfaces; new application services must depend on the narrower
+ports and must not receive an independently committing completion port.
 
 ## PostgreSQL job queue
 
@@ -543,8 +546,10 @@ claimed work and re-checks quiet hours between upstream operations.
 transitions. `FeedService` owns conditional reads, fresh/stale/missing
 decisions, and deduplicated rebuild enqueueing over the persisted cache.
 Feed-token lookup, single-flight cache population, and rebuild orchestration
-remain future extensions. Application services receive a `UnitOfWorkFactory` for atomic
-final writes; they do not compose independent repository transactions.
+remain future extensions. Application services receive a `UnitOfWorkFactory` for
+atomic final writes; they do not compose independent repository transactions.
+`SourceService` now uses a narrow transaction-scoped enqueue view to create an
+eligible source and its initial `source_sync` job atomically.
 
 ### Acquisition
 
@@ -747,15 +752,17 @@ Real WeChat access must not be required in CI.
 The next implementation changes must make existing contracts executable rather
 than add more empty module shells. Work proceeds in this order:
 
-1. Complete the job queue slice with the eventual queue/outcome/recovery
-   ports. The repository now supports allowed-kind claiming, while the initial
+1. Complete the job queue slice around the now-executable queue/outcome/recovery
+   ports. The repository supports allowed-kind claiming, while the initial
    `0001_jobs.sql` migration already adds `deferred`, separate claim/failure
-   counters, and PostgreSQL-authoritative lease time. Use an expand/contract
-   rollout for later schema changes so mixed replica versions remain safe;
-   upgrade and concurrency tests are a gate.
+   counters, and PostgreSQL-authoritative lease time. Replace the compatibility
+   all-in-one interfaces only after the first worker uses the narrower ports.
+   Use an expand/contract rollout for later schema changes so mixed replica
+   versions remain safe; upgrade and concurrency tests are a gate.
 2. Extend the shared `UnitOfWork` with transaction-scoped repository ports and
-   complete the source service and credential repositories plus their
-   transaction-scoped views. Source identity/create/read,
+   complete the remaining source service and credential repositories plus their
+   transaction-scoped views. Source identity/create/read and atomic initial
+   source-sync enqueue are executable;
    normalized article persistence,
    synchronization-run persistence,
    scheduling state, and feed-revision mutations are already executable. The
@@ -789,6 +796,11 @@ recovery, separate claim/failure counters, active-job deduplication, and
 allowed-kind claiming. Its
 `0001_jobs.sql` schema uses the final initial job contract, while PostgreSQL
 job and account-lease decisions use statement-local `clock_timestamp()`. The
+job persistence boundary also exposes the independently usable `JobQueue` and
+`ExpiredJobRecovery` ports plus the command-shaped `JobOutcomeTransaction`
+adapter. `UnitOfWork::job_outcomes()` hides the transaction implementation and
+keeps outcome application inside the shared commit boundary; the older
+all-in-one job traits remain only as a migration bridge. The
 pacing and configuration modules have no network, browser, database, scheduler,
 or sleeping side effects. `UnitOfWorkFactory` and its transaction-scoped job
 view are implemented in `src/persistence/unit_of_work.rs`; the account-lease
@@ -798,7 +810,9 @@ revision/feed-cache reader and transaction-scoped fenced publication are
 implemented in `src/persistence/repositories/feed_cache_repository.rs`, and
 `UnitOfWork` exposes that publication view. Source identity/create/read and
 transaction-scoped scheduling/gate/revision mutations are implemented in
-`src/persistence/repositories/source_repository.rs`. The atomic source scheduler
+`src/persistence/repositories/source_repository.rs`. `SourceService` composes
+source creation/read, operator gate changes, and atomic initial source-sync
+enqueueing in `src/application/source_service.rs`. The atomic source scheduler
 repository and its scheduling columns are implemented in
 `src/persistence/repositories/scheduler_repository.rs`; it selects due sources
 with PostgreSQL row locking, inserts canonical source-sync jobs, and records
@@ -827,9 +841,11 @@ backoff, and metrics; it must call this boundary rather than reimplement source
 selection.
 
 The remaining tree intentionally contains no route handlers, browser calls,
-source-configuration orchestration, scheduler loops, credential persistence,
-or business implementation. Source-service, credential, archive, and
-acquisition modules remain documentation-only; article and sync-run persistence
-and `FeedService` implement only the database/cache boundaries described above.
+source configuration/feed-token orchestration, scheduler loops, credential
+persistence, or business implementation. Credential, archive, and acquisition
+modules remain documentation-only; `SourceService` implements source
+create/read, operator enable/gate changes, and the initial-job slice described
+above, while article and sync-run persistence and `FeedService` implement only
+the database/cache boundaries described above.
 `TODO(design)` markers identify existing code and migrations that must change
 before the remaining contracts are implemented.

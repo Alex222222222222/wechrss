@@ -5,8 +5,8 @@ use uuid::Uuid;
 use wechrss::{
     domain::job::{JobStatus, JobType, LeaseToken, NewJob},
     persistence::repositories::job_repository::{
-        EnqueueResult, JobRepository, JobRepositoryError, JobRepositoryTransaction,
-        PostgresJobRepository,
+        EnqueueResult, ExpiredJobRecovery, JobOutcome, JobOutcomeTransaction, JobQueue,
+        JobRepository, JobRepositoryError, JobRepositoryTransaction, PostgresJobRepository,
     },
     persistence::unit_of_work::UnitOfWorkFactory,
 };
@@ -199,8 +199,7 @@ async fn postgres_repository_enforces_claims_fencing_recovery_and_transactions(p
     .execute(&pool)
     .await
     .expect("test should be able to expire the recovery lease");
-    let recovered = repository_b
-        .recover_expired(at(430), 10)
+    let recovered = ExpiredJobRecovery::recover_expired(&repository_b, at(430), 10)
         .await
         .expect("expired lease recovery should succeed");
     assert_eq!(recovered.len(), 1);
@@ -356,4 +355,58 @@ async fn postgres_repository_enforces_claims_fencing_recovery_and_transactions(p
         .expect("source job should be claimable");
     assert_eq!(source_lease.job.id(), filtered_source_id);
     assert_eq!(source_lease.job.job_type(), JobType::SourceSync);
+}
+
+#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+async fn postgres_split_ports_keep_fenced_outcome_in_unit_of_work(pool: PgPool) {
+    let repository = PostgresJobRepository::new(pool.clone());
+    let job_id = match JobQueue::enqueue(
+        &repository,
+        spec(format!("integration:split:{}", Uuid::new_v4()), 1, 0),
+    )
+    .await
+    .expect("queue port should enqueue a job")
+    {
+        EnqueueResult::Inserted(job) => job.id(),
+        EnqueueResult::AlreadyActive { .. } => panic!("unique test key should insert"),
+    };
+    let lease = JobQueue::claim_next(
+        &repository,
+        OWNER_A,
+        at(0),
+        Duration::seconds(30),
+        JobType::ALL,
+    )
+    .await
+    .expect("queue port should claim a job")
+    .expect("inserted job should be claimable");
+    assert_eq!(lease.job.id(), job_id);
+
+    let unit_of_work_factory = UnitOfWorkFactory::new(pool);
+    let mut unit_of_work = unit_of_work_factory.begin().await.unwrap();
+    let completed = {
+        let mut outcomes = unit_of_work.job_outcomes();
+        JobOutcomeTransaction::apply_outcome(
+            &mut outcomes,
+            JobOutcome::Succeeded {
+                job_id,
+                owner: OWNER_A.to_owned(),
+                token: lease.token,
+                now: at(1),
+            },
+        )
+        .await
+        .expect("outcome port should apply the current fencing token")
+    };
+    assert_eq!(completed.status(), JobStatus::Succeeded);
+    unit_of_work
+        .commit()
+        .await
+        .expect("unit-of-work outcome should commit");
+
+    let persisted = JobQueue::find(&repository, job_id)
+        .await
+        .expect("queue port should read the completed job")
+        .expect("completed job should remain persisted");
+    assert_eq!(persisted.status(), JobStatus::Succeeded);
 }

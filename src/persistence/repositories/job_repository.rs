@@ -44,12 +44,14 @@
 //! Cross-repository mutations use `persistence::unit_of_work`. This repository's
 //! current job-only transaction is an implemented interim boundary and must not
 //! become the application API for final synchronization commits.
-//! In the target interface, the general queue port exposes enqueue, claim,
-//! heartbeat, and reads, but no independent worker outcome transition.
-//! Success, retry, deferral, cancellation, and failure are available through the
-//! transaction-scoped UnitOfWork outcome view. Expired recovery is a dedicated
-//! cross-table persistence operation so terminal recovery can advance a source
-//! cooldown atomically.
+//! The executable target split is [`JobQueue`] for independent claim,
+//! heartbeat, enqueue, and read operations; [`JobEnqueueTransaction`] for
+//! creating work atomically with another aggregate; [`JobOutcomeTransaction`]
+//! for worker outcomes through the transaction-scoped UnitOfWork view; and
+//! [`ExpiredJobRecovery`] for the dedicated recovery operation. The old
+//! all-in-one traits remain only as a compatibility bridge while callers
+//! migrate. Expired recovery will become a cross-table persistence operation
+//! before it can advance a source cooldown atomically.
 //!
 //! Clock contract: PostgreSQL lease-sensitive statements derive a single
 //! statement-local `db_now` from `clock_timestamp()` for claim eligibility,
@@ -89,6 +91,170 @@ pub struct JobLease {
     pub job: Job,
     /// Fencing token for this particular claim.
     pub token: LeaseToken,
+}
+
+/// Queue operations that may commit independently of a worker's business
+/// outcome.
+///
+/// This is the public queue-facing contract for enqueueing, claiming,
+/// heartbeating, and reading jobs. It deliberately has no success, retry,
+/// deferral, cancellation, or failure method: those transitions can need to
+/// commit together with articles, source state, synchronization history, or
+/// feed-cache publication and therefore belong to [`JobOutcomeTransaction`]
+/// through a [`crate::persistence::unit_of_work::UnitOfWork`].
+///
+/// `JobRepository` remains available as a compatibility interface while
+/// callers migrate to this smaller port. PostgreSQL and the in-memory test
+/// repository both implement this trait, so application orchestration can be
+/// written against the same queue contract in production and tests.
+#[allow(async_fn_in_trait)]
+pub trait JobQueue: Send + Sync {
+    /// Inserts a job unless an active job owns its deduplication key.
+    async fn enqueue(&self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError>;
+
+    /// Claims the highest-priority due job from the allowed type set.
+    ///
+    /// The `now` argument is retained for compatibility with the interim
+    /// repository contract. PostgreSQL lease decisions use database time;
+    /// memory implementations use it as their deterministic test clock.
+    async fn claim_next(
+        &self,
+        owner: &str,
+        now: DateTime<Utc>,
+        lease_for: Duration,
+        allowed_job_types: &[JobType],
+    ) -> Result<Option<JobLease>, JobRepositoryError>;
+
+    /// Extends a live lease for its owner and fencing token.
+    async fn heartbeat(
+        &self,
+        job_id: Uuid,
+        owner: &str,
+        token: LeaseToken,
+        now: DateTime<Utc>,
+        lease_for: Duration,
+    ) -> Result<Job, JobRepositoryError>;
+
+    /// Returns a snapshot of one job, if it exists.
+    async fn find(&self, job_id: Uuid) -> Result<Option<Job>, JobRepositoryError>;
+}
+
+/// Transaction-scoped enqueue operations for mutations that create work with
+/// another aggregate.
+///
+/// A source must not become visible without its initial source-sync job. This
+/// port lets a `UnitOfWork` insert both rows and publish them together while
+/// keeping claim, heartbeat, recovery, and worker outcomes on their own
+/// narrower capabilities. It intentionally exposes no commit operation; the
+/// enclosing unit of work owns that boundary.
+#[allow(async_fn_in_trait)]
+pub trait JobEnqueueTransaction {
+    /// Enqueues one job without committing the surrounding transaction.
+    async fn enqueue_job(&mut self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError>;
+}
+
+/// Operations that recover jobs whose worker lease has expired.
+///
+/// Recovery is separate from [`JobQueue`] because exhausting the recovery
+/// budget may also advance a source cooldown or scheduling gate. The eventual
+/// implementation must keep those writes in one atomic persistence operation;
+/// the current repository implementation exposes the job-only behavior while
+/// the source-coupled recovery boundary is completed.
+#[allow(async_fn_in_trait)]
+pub trait ExpiredJobRecovery: Send + Sync {
+    /// Recovers up to `limit` expired running jobs.
+    ///
+    /// A zero limit is a valid no-op and must not mutate any job.
+    async fn recover_expired(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, JobRepositoryError>;
+}
+
+/// A worker result to apply inside a transaction-scoped job outcome view.
+///
+/// The command owns error text because it may outlive the request that
+/// created it until the unit-of-work operation executes. Error summaries must
+/// be bounded and must never contain credentials, cookies, or database URLs;
+/// those validation and redaction rules remain application responsibilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobOutcome {
+    /// Intentionally postpones a live job without consuming failure budget.
+    Deferred {
+        /// Job being deferred.
+        job_id: Uuid,
+        /// Current lease owner.
+        owner: String,
+        /// Fencing token for the current claim.
+        token: LeaseToken,
+        /// Timestamp used by the domain transition.
+        now: DateTime<Utc>,
+        /// Next instant at which the job may be claimed.
+        resume_at: DateTime<Utc>,
+    },
+    /// Marks a live job as successfully completed.
+    Succeeded {
+        /// Job being completed.
+        job_id: Uuid,
+        /// Current lease owner.
+        owner: String,
+        /// Fencing token for the current claim.
+        token: LeaseToken,
+        /// Timestamp used by the domain transition.
+        now: DateTime<Utc>,
+    },
+    /// Records a retryable failure or terminal failure after the budget is met.
+    Retry {
+        /// Job being retried.
+        job_id: Uuid,
+        /// Current lease owner.
+        owner: String,
+        /// Fencing token for the current claim.
+        token: LeaseToken,
+        /// Timestamp used by the domain transition.
+        now: DateTime<Utc>,
+        /// Earliest next retry instant.
+        retry_at: DateTime<Utc>,
+        /// Safe, bounded failure summary.
+        error: String,
+    },
+    /// Permanently fails a live job.
+    Failed {
+        /// Job being failed.
+        job_id: Uuid,
+        /// Current lease owner.
+        owner: String,
+        /// Fencing token for the current claim.
+        token: LeaseToken,
+        /// Timestamp used by the domain transition.
+        now: DateTime<Utc>,
+        /// Safe, bounded failure summary.
+        error: String,
+    },
+    /// Cancels an unclaimed job without requiring a worker lease.
+    Cancelled {
+        /// Job being cancelled.
+        job_id: Uuid,
+        /// Timestamp used by the domain transition.
+        now: DateTime<Utc>,
+        /// Safe operator-facing cancellation reason.
+        reason: String,
+    },
+}
+
+/// Transaction-scoped worker-outcome operations.
+///
+/// The caller supplies one [`JobOutcome`] and the implementation applies the
+/// existing fenced domain transition while retaining the transaction. The
+/// surrounding `UnitOfWork` then persists related business data and commits
+/// exactly once. This command-shaped API keeps worker outcome choices out of
+/// the independently committing queue port and avoids a second set of
+/// convenience transactions.
+#[allow(async_fn_in_trait)]
+pub trait JobOutcomeTransaction {
+    /// Applies one fenced worker outcome without committing the transaction.
+    async fn apply_outcome(&mut self, outcome: JobOutcome) -> Result<Job, JobRepositoryError>;
 }
 
 /// Operations available while a repository transaction is held.
@@ -188,6 +354,68 @@ pub trait JobRepositoryTransaction {
         Self: Sized;
 }
 
+/// Adapts the interim transaction contract to the narrower outcome port.
+///
+/// Keeping this adapter generic ensures the PostgreSQL and memory
+/// implementations cannot drift: every transition continues to use the same
+/// fenced implementation that backs the compatibility methods.
+impl<T> JobOutcomeTransaction for T
+where
+    T: JobRepositoryTransaction,
+{
+    async fn apply_outcome(&mut self, outcome: JobOutcome) -> Result<Job, JobRepositoryError> {
+        match outcome {
+            JobOutcome::Deferred {
+                job_id,
+                owner,
+                token,
+                now,
+                resume_at,
+            } => JobRepositoryTransaction::defer(self, job_id, &owner, token, now, resume_at).await,
+            JobOutcome::Succeeded {
+                job_id,
+                owner,
+                token,
+                now,
+            } => JobRepositoryTransaction::succeed(self, job_id, &owner, token, now).await,
+            JobOutcome::Retry {
+                job_id,
+                owner,
+                token,
+                now,
+                retry_at,
+                error,
+            } => {
+                JobRepositoryTransaction::retry(self, job_id, &owner, token, now, retry_at, &error)
+                    .await
+            }
+            JobOutcome::Failed {
+                job_id,
+                owner,
+                token,
+                now,
+                error,
+            } => JobRepositoryTransaction::fail(self, job_id, &owner, token, now, &error).await,
+            JobOutcome::Cancelled {
+                job_id,
+                now,
+                reason,
+            } => JobRepositoryTransaction::cancel(self, job_id, now, &reason).await,
+        }
+    }
+}
+
+/// Adapts the interim transaction contract to the transaction-scoped enqueue
+/// port until the old all-in-one transaction is removed.
+impl<T> JobEnqueueTransaction for T
+where
+    T: JobRepositoryTransaction,
+{
+    async fn enqueue_job(&mut self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError> {
+        JobRepositoryTransaction::enqueue(self, spec).await
+    }
+}
+
 /// Errors returned by repository implementations.
 #[derive(Debug, Error)]
 pub enum JobRepositoryError {
@@ -213,10 +441,9 @@ pub enum JobRepositoryError {
 /// intended to be used through a generic repository parameter; an application
 /// that needs dynamic dispatch can add an object-safe adapter.
 #[allow(async_fn_in_trait)]
-pub trait JobRepository: Send + Sync {
-    // TODO(design): split this interim all-in-one trait into a queue port,
-    // UnitOfWork outcome view, and atomic expired-recovery operation before any
-    // application worker is implemented.
+pub trait JobRepository: JobQueue + ExpiredJobRecovery + Send + Sync {
+    // Compatibility surface. New application code should depend on
+    // `JobQueue`, `JobOutcomeTransaction`, and `ExpiredJobRecovery` separately.
     /// Interim job-only transaction type; multi-repository work uses UnitOfWork.
     type Transaction<'a>: JobRepositoryTransaction + 'a
     where
@@ -225,30 +452,10 @@ pub trait JobRepository: Send + Sync {
     /// Begins a transaction that must be committed explicitly.
     async fn begin(&self) -> Result<Self::Transaction<'_>, JobRepositoryError>;
 
-    /// Inserts a job unless an active job already owns its deduplication key.
-    async fn enqueue(&self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError>;
-
-    /// Claims the highest-priority due job of an allowed type without waiting
-    /// on another worker. An empty set claims nothing.
-    async fn claim_next(
-        &self,
-        owner: &str,
-        now: DateTime<Utc>,
-        lease_for: Duration,
-        allowed_job_types: &[JobType],
-    ) -> Result<Option<JobLease>, JobRepositoryError>;
-
-    /// Extends a live lease for the owner and claim token.
-    async fn heartbeat(
-        &self,
-        job_id: Uuid,
-        owner: &str,
-        token: LeaseToken,
-        now: DateTime<Utc>,
-        lease_for: Duration,
-    ) -> Result<Job, JobRepositoryError>;
-
-    /// Defers a live fenced job without consuming retry budget.
+    /// Compatibility convenience for deferring a job in its own transaction.
+    ///
+    /// New synchronization code must use [`JobOutcomeTransaction`] through a
+    /// unit of work so related business writes share the same commit.
     async fn defer(
         &self,
         job_id: Uuid,
@@ -256,20 +463,30 @@ pub trait JobRepository: Send + Sync {
         token: LeaseToken,
         now: DateTime<Utc>,
         resume_at: DateTime<Utc>,
-    ) -> Result<Job, JobRepositoryError>;
+    ) -> Result<Job, JobRepositoryError> {
+        let mut transaction = self.begin().await?;
+        let result = transaction
+            .defer(job_id, owner, token, now, resume_at)
+            .await?;
+        transaction.commit().await?;
+        Ok(result)
+    }
 
-    /// Marks a live fenced job as successfully completed.
-    // TODO(design): remove this convenience method from the target public queue
-    // port so application code cannot commit success separately from data.
+    /// Compatibility convenience for marking a job successful independently.
     async fn succeed(
         &self,
         job_id: Uuid,
         owner: &str,
         token: LeaseToken,
         now: DateTime<Utc>,
-    ) -> Result<Job, JobRepositoryError>;
+    ) -> Result<Job, JobRepositoryError> {
+        let mut transaction = self.begin().await?;
+        let result = transaction.succeed(job_id, owner, token, now).await?;
+        transaction.commit().await?;
+        Ok(result)
+    }
 
-    /// Records a retry or terminal failure when the failure budget is exhausted.
+    /// Compatibility convenience for scheduling a retry independently.
     async fn retry(
         &self,
         job_id: Uuid,
@@ -278,9 +495,16 @@ pub trait JobRepository: Send + Sync {
         now: DateTime<Utc>,
         retry_at: DateTime<Utc>,
         error: &str,
-    ) -> Result<Job, JobRepositoryError>;
+    ) -> Result<Job, JobRepositoryError> {
+        let mut transaction = self.begin().await?;
+        let result = transaction
+            .retry(job_id, owner, token, now, retry_at, error)
+            .await?;
+        transaction.commit().await?;
+        Ok(result)
+    }
 
-    /// Permanently fails a live fenced job.
+    /// Compatibility convenience for permanently failing a job independently.
     async fn fail(
         &self,
         job_id: Uuid,
@@ -288,25 +512,25 @@ pub trait JobRepository: Send + Sync {
         token: LeaseToken,
         now: DateTime<Utc>,
         error: &str,
-    ) -> Result<Job, JobRepositoryError>;
+    ) -> Result<Job, JobRepositoryError> {
+        let mut transaction = self.begin().await?;
+        let result = transaction.fail(job_id, owner, token, now, error).await?;
+        transaction.commit().await?;
+        Ok(result)
+    }
 
-    /// Cancels a queued or retry-wait job without requiring a worker lease.
+    /// Compatibility convenience for cancelling a job independently.
     async fn cancel(
         &self,
         job_id: Uuid,
         now: DateTime<Utc>,
         reason: &str,
-    ) -> Result<Job, JobRepositoryError>;
-
-    /// Recovers up to `limit` expired running jobs.
-    async fn recover_expired(
-        &self,
-        now: DateTime<Utc>,
-        limit: usize,
-    ) -> Result<Vec<Job>, JobRepositoryError>;
-
-    /// Returns a snapshot of one job, if it exists.
-    async fn find(&self, job_id: Uuid) -> Result<Option<Job>, JobRepositoryError>;
+    ) -> Result<Job, JobRepositoryError> {
+        let mut transaction = self.begin().await?;
+        let result = transaction.cancel(job_id, now, reason).await?;
+        transaction.commit().await?;
+        Ok(result)
+    }
 }
 
 const JOB_COLUMNS: &str = "id, job_type, source_id, status, priority, run_after, claim_count, failure_count, max_attempts, lease_owner, lease_token, lease_until, heartbeat_at, started_at, finished_at, last_error, payload_json, dedupe_key, created_at, updated_at";
@@ -1004,7 +1228,9 @@ impl JobRepository for PostgresJobRepository {
             .await
             .map_err(storage_error)
     }
+}
 
+impl JobQueue for PostgresJobRepository {
     async fn enqueue(&self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError> {
         let mut transaction = self.begin().await?;
         let result = transaction.enqueue(spec).await?;
@@ -1043,78 +1269,15 @@ impl JobRepository for PostgresJobRepository {
         Ok(result)
     }
 
-    async fn defer(
-        &self,
-        job_id: Uuid,
-        owner: &str,
-        token: LeaseToken,
-        now: DateTime<Utc>,
-        resume_at: DateTime<Utc>,
-    ) -> Result<Job, JobRepositoryError> {
+    async fn find(&self, job_id: Uuid) -> Result<Option<Job>, JobRepositoryError> {
         let mut transaction = self.begin().await?;
-        let result = transaction
-            .defer(job_id, owner, token, now, resume_at)
-            .await?;
+        let result = transaction.find_in_transaction(job_id).await?;
         transaction.commit().await?;
         Ok(result)
     }
+}
 
-    async fn succeed(
-        &self,
-        job_id: Uuid,
-        owner: &str,
-        token: LeaseToken,
-        now: DateTime<Utc>,
-    ) -> Result<Job, JobRepositoryError> {
-        let mut transaction = self.begin().await?;
-        let result = transaction.succeed(job_id, owner, token, now).await?;
-        transaction.commit().await?;
-        Ok(result)
-    }
-
-    async fn retry(
-        &self,
-        job_id: Uuid,
-        owner: &str,
-        token: LeaseToken,
-        now: DateTime<Utc>,
-        retry_at: DateTime<Utc>,
-        error: &str,
-    ) -> Result<Job, JobRepositoryError> {
-        let mut transaction = self.begin().await?;
-        let result = transaction
-            .retry(job_id, owner, token, now, retry_at, error)
-            .await?;
-        transaction.commit().await?;
-        Ok(result)
-    }
-
-    async fn fail(
-        &self,
-        job_id: Uuid,
-        owner: &str,
-        token: LeaseToken,
-        now: DateTime<Utc>,
-        error: &str,
-    ) -> Result<Job, JobRepositoryError> {
-        let mut transaction = self.begin().await?;
-        let result = transaction.fail(job_id, owner, token, now, error).await?;
-        transaction.commit().await?;
-        Ok(result)
-    }
-
-    async fn cancel(
-        &self,
-        job_id: Uuid,
-        now: DateTime<Utc>,
-        reason: &str,
-    ) -> Result<Job, JobRepositoryError> {
-        let mut transaction = self.begin().await?;
-        let result = transaction.cancel(job_id, now, reason).await?;
-        transaction.commit().await?;
-        Ok(result)
-    }
-
+impl ExpiredJobRecovery for PostgresJobRepository {
     async fn recover_expired(
         &self,
         now: DateTime<Utc>,
@@ -1122,13 +1285,6 @@ impl JobRepository for PostgresJobRepository {
     ) -> Result<Vec<Job>, JobRepositoryError> {
         let mut transaction = self.begin().await?;
         let result = transaction.recover_expired(now, limit).await?;
-        transaction.commit().await?;
-        Ok(result)
-    }
-
-    async fn find(&self, job_id: Uuid) -> Result<Option<Job>, JobRepositoryError> {
-        let mut transaction = self.begin().await?;
-        let result = transaction.find_in_transaction(job_id).await?;
         transaction.commit().await?;
         Ok(result)
     }
@@ -1494,7 +1650,9 @@ impl JobRepository for MemoryJobRepository {
             committed: false,
         })
     }
+}
 
+impl JobQueue for MemoryJobRepository {
     async fn enqueue(&self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError> {
         let mut jobs = self.jobs.lock().await;
         enqueue_in_store(&mut jobs, spec)
@@ -1523,64 +1681,12 @@ impl JobRepository for MemoryJobRepository {
         heartbeat_in_store(&mut jobs, job_id, owner, token, now, lease_for)
     }
 
-    async fn defer(
-        &self,
-        job_id: Uuid,
-        owner: &str,
-        token: LeaseToken,
-        now: DateTime<Utc>,
-        resume_at: DateTime<Utc>,
-    ) -> Result<Job, JobRepositoryError> {
-        let mut jobs = self.jobs.lock().await;
-        defer_in_store(&mut jobs, job_id, owner, token, now, resume_at)
+    async fn find(&self, job_id: Uuid) -> Result<Option<Job>, JobRepositoryError> {
+        Ok(self.jobs.lock().await.get(&job_id).cloned())
     }
+}
 
-    async fn succeed(
-        &self,
-        job_id: Uuid,
-        owner: &str,
-        token: LeaseToken,
-        now: DateTime<Utc>,
-    ) -> Result<Job, JobRepositoryError> {
-        let mut jobs = self.jobs.lock().await;
-        succeed_in_store(&mut jobs, job_id, owner, token, now)
-    }
-
-    async fn retry(
-        &self,
-        job_id: Uuid,
-        owner: &str,
-        token: LeaseToken,
-        now: DateTime<Utc>,
-        retry_at: DateTime<Utc>,
-        error: &str,
-    ) -> Result<Job, JobRepositoryError> {
-        let mut jobs = self.jobs.lock().await;
-        retry_in_store(&mut jobs, job_id, owner, token, now, retry_at, error)
-    }
-
-    async fn fail(
-        &self,
-        job_id: Uuid,
-        owner: &str,
-        token: LeaseToken,
-        now: DateTime<Utc>,
-        error: &str,
-    ) -> Result<Job, JobRepositoryError> {
-        let mut jobs = self.jobs.lock().await;
-        fail_in_store(&mut jobs, job_id, owner, token, now, error)
-    }
-
-    async fn cancel(
-        &self,
-        job_id: Uuid,
-        now: DateTime<Utc>,
-        reason: &str,
-    ) -> Result<Job, JobRepositoryError> {
-        let mut jobs = self.jobs.lock().await;
-        cancel_in_store(&mut jobs, job_id, now, reason)
-    }
-
+impl ExpiredJobRecovery for MemoryJobRepository {
     async fn recover_expired(
         &self,
         now: DateTime<Utc>,
@@ -1588,10 +1694,6 @@ impl JobRepository for MemoryJobRepository {
     ) -> Result<Vec<Job>, JobRepositoryError> {
         let mut jobs = self.jobs.lock().await;
         Ok(recover_expired_in_store(&mut jobs, now, limit))
-    }
-
-    async fn find(&self, job_id: Uuid) -> Result<Option<Job>, JobRepositoryError> {
-        Ok(self.jobs.lock().await.get(&job_id).cloned())
     }
 }
 
@@ -1735,6 +1837,213 @@ mod tests {
             EnqueueResult::Inserted(job) => job.id(),
             EnqueueResult::AlreadyActive { .. } => panic!("job should be inserted"),
         }
+    }
+
+    #[tokio::test]
+    async fn queue_port_preserves_empty_filters_and_reads() {
+        let repository = MemoryJobRepository::new();
+        let job_id = match JobQueue::enqueue(&repository, spec("queue-port", 1, 0))
+            .await
+            .unwrap()
+        {
+            EnqueueResult::Inserted(job) => job.id(),
+            EnqueueResult::AlreadyActive { .. } => panic!("job should be inserted"),
+        };
+
+        assert!(
+            JobQueue::claim_next(&repository, OWNER, at(0), Duration::seconds(30), &[])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            JobQueue::find(&repository, job_id)
+                .await
+                .unwrap()
+                .expect("queued job should be readable")
+                .status(),
+            JobStatus::Queued
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_transaction_port_can_be_committed_by_the_unit_of_work() {
+        let repository = MemoryJobRepository::new();
+        let mut transaction = JobRepository::begin(&repository).await.unwrap();
+        let inserted =
+            JobEnqueueTransaction::enqueue_job(&mut transaction, spec("enqueue-port", 1, 0))
+                .await
+                .unwrap();
+        let job_id = match inserted {
+            EnqueueResult::Inserted(job) => job.id(),
+            EnqueueResult::AlreadyActive { .. } => panic!("job should be inserted"),
+        };
+
+        transaction.commit().await.unwrap();
+        assert!(JobQueue::find(&repository, job_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn outcome_port_defers_without_spending_failure_budget() {
+        let repository = MemoryJobRepository::new();
+        let job_id = inserted_id(&repository, spec("outcome-port", 1, 0)).await;
+        let lease = JobQueue::claim_next(
+            &repository,
+            OWNER,
+            at(0),
+            Duration::seconds(30),
+            JobType::ALL,
+        )
+        .await
+        .unwrap()
+        .expect("job should be claimed");
+        let mut transaction = JobRepository::begin(&repository).await.unwrap();
+
+        let deferred = JobOutcomeTransaction::apply_outcome(
+            &mut transaction,
+            JobOutcome::Deferred {
+                job_id,
+                owner: OWNER.to_owned(),
+                token: lease.token,
+                now: at(1),
+                resume_at: at(100),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(deferred.status(), JobStatus::Deferred);
+        assert_eq!(deferred.claim_count(), 1);
+        assert_eq!(deferred.failure_count(), 0);
+        transaction.commit().await.unwrap();
+
+        assert!(JobQueue::claim_next(
+            &repository,
+            OWNER,
+            at(99),
+            Duration::seconds(30),
+            JobType::ALL
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn outcome_port_rejects_empty_failure_details_without_mutating_the_job() {
+        let repository = MemoryJobRepository::new();
+        let job_id = inserted_id(&repository, spec("invalid-outcome", 1, 0)).await;
+        let lease = JobQueue::claim_next(
+            &repository,
+            OWNER,
+            at(0),
+            Duration::seconds(30),
+            JobType::ALL,
+        )
+        .await
+        .unwrap()
+        .expect("job should be claimed");
+        let mut transaction = JobRepository::begin(&repository).await.unwrap();
+
+        let result = JobOutcomeTransaction::apply_outcome(
+            &mut transaction,
+            JobOutcome::Retry {
+                job_id,
+                owner: OWNER.to_owned(),
+                token: lease.token,
+                now: at(1),
+                retry_at: at(100),
+                error: "  ".to_owned(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(JobRepositoryError::Domain(JobError::EmptyError))
+        ));
+        drop(transaction);
+
+        let unchanged = JobQueue::find(&repository, job_id)
+            .await
+            .unwrap()
+            .expect("job should remain stored");
+        assert_eq!(unchanged.status(), JobStatus::Running);
+        assert_eq!(unchanged.failure_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn outcome_port_applies_failed_and_cancelled_commands() {
+        let repository = MemoryJobRepository::new();
+        let failed_id = inserted_id(&repository, spec("failed-outcome", 1, 0)).await;
+        let lease = JobQueue::claim_next(
+            &repository,
+            OWNER,
+            at(0),
+            Duration::seconds(30),
+            JobType::ALL,
+        )
+        .await
+        .unwrap()
+        .expect("job should be claimed");
+        let mut transaction = JobRepository::begin(&repository).await.unwrap();
+        let failed = JobOutcomeTransaction::apply_outcome(
+            &mut transaction,
+            JobOutcome::Failed {
+                job_id: failed_id,
+                owner: OWNER.to_owned(),
+                token: lease.token,
+                now: at(1),
+                error: "permanent failure".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed.status(), JobStatus::Failed);
+        transaction.commit().await.unwrap();
+
+        let cancelled_id = inserted_id(&repository, spec("cancelled-outcome", 1, 0)).await;
+        let mut transaction = JobRepository::begin(&repository).await.unwrap();
+        let cancelled = JobOutcomeTransaction::apply_outcome(
+            &mut transaction,
+            JobOutcome::Cancelled {
+                job_id: cancelled_id,
+                now: at(2),
+                reason: "operator stopped source".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(cancelled.status(), JobStatus::Failed);
+        assert_eq!(cancelled.last_error(), Some("operator stopped source"));
+        transaction.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_port_zero_limit_does_not_mutate_a_live_lease() {
+        let repository = MemoryJobRepository::new();
+        let job_id = inserted_id(&repository, spec("recovery-port", 1, 0)).await;
+        let lease = JobQueue::claim_next(
+            &repository,
+            OWNER,
+            at(0),
+            Duration::seconds(30),
+            JobType::ALL,
+        )
+        .await
+        .unwrap()
+        .expect("job should be claimed");
+
+        assert!(
+            ExpiredJobRecovery::recover_expired(&repository, at(1000), 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let current = JobQueue::find(&repository, job_id)
+            .await
+            .unwrap()
+            .expect("claimed job should still exist");
+        assert_eq!(current.status(), JobStatus::Running);
+        assert_eq!(current.lease_token(), Some(lease.token));
     }
 
     #[tokio::test]
