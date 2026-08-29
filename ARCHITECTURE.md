@@ -4,10 +4,10 @@ This document describes the planned Rust implementation of the existing
 `wechrss-main` Python service. The current Rust tree remains intentionally
 incremental: it defines boundaries and ownership, with the domain/configuration
 policies and the first PostgreSQL job/cache-persistence slices implemented
-while network access, browser automation, and HTTP behavior remain
-unimplemented. The pure RSS renderer, normalized article persistence, and
-cache-first feed delivery decision service are executable, but they are not yet
-wired to a feed-token lookup or HTTP route.
+while authenticated protocol work and HTTP behavior remain unimplemented. The
+pure RSS renderer, normalized article persistence, cache-first feed delivery
+decision service, and unauthenticated public article browser path are
+executable, but they are not yet wired to a feed-token lookup or HTTP route.
 
 ## Goals
 
@@ -32,7 +32,8 @@ foundations are typed environment parsing for the target configuration set,
 pure pacing/quiet-hours policy, PostgreSQL pool/migration helpers, the job and
 feed-cache domain/repository slices, their shared transaction boundary, the
 stable account identity plus distributed account-lease slice, the per-source
-feed-build lease slice, and atomic due-source scheduling persistence.
+feed-build lease slice, atomic due-source scheduling persistence, and the
+unauthenticated Thirtyfour public-page navigation/extraction slice.
 
 The current and target contracts must not be confused:
 
@@ -42,7 +43,7 @@ The current and target contracts must not be confused:
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, and PostgreSQL-clocked SQLx job operations | Remove caller `now` parameters only in a later queue-port contract release |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | Runtime composition must consume the parsed role and policy values before deployment relies on them |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
-| Acquisition/web/RSS | A validated public WeChat article URL value object and pure RSS renderer | Browser capabilities, application/repository ports, and concrete adapters or handlers remain future work |
+| Acquisition/web/RSS | A validated public WeChat article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction, and pure RSS renderer | Authenticated protocol adapter, pacing/scroll integration, application handlers, and feed-token routing remain future work |
 
 Environment variables in this document are parsed into `AppConfig`, but the
 binary is still a no-op and does not construct role-specific runtime
@@ -525,7 +526,7 @@ requests.
 ### Domain
 
 Pure business concepts and invariants. Domain modules do not depend on Axum,
-Fantoccini, SQLx, or concrete storage. Article storage identity is the pair
+Thirtyfour, SQLx, or concrete storage. Article storage identity is the pair
 `(source_id, review_id)`; `review_id` is the stable upstream identity within a
 source. URLs and content may be absent in a partial list observation and are
 merged with previously known detail data rather than treated as deletions.
@@ -553,7 +554,7 @@ eligible source and its initial `source_sync` job atomically.
 
 ### Acquisition
 
-Browser and WeRead protocol adapters. Fantoccini/WebDriver details are confined
+Browser and WeRead protocol adapters. Thirtyfour/WebDriver details are confined
 here. The existing Python fetching path does not include article-content
 fetching, so Rust keeps the two upstream paths explicit: WeRead credentials are
 used only for account/session and article-list operations, while the rendered
@@ -575,16 +576,50 @@ The concrete capability contract is:
   non-default ports, and ambiguous encoded hosts are rejected. The final URL is
   revalidated after every navigation or redirect before extraction. The
   domain-side value object is implemented in `src/domain/source.rs`; the
-  acquisition constructor and post-navigation revalidation remain TODOs.
+  acquisition ports accept it directly, and the public WebDriver adapter
+  revalidates the browser-observed URL before extraction.
 - `PublicBrowserSession` is a non-cloneable fresh WebDriver session with no
   imported profile, cookies, local storage, credential handle, or account-lease
   guard. It is destroyed after the public operation.
 - `AuthenticatedBrowserSession` is a distinct non-cloneable capability created
   only with a live `AccountLeaseGuard` for one stable account ID. The guard owns
   cancellation state; losing its fence prevents another authenticated request.
-- `ArticlePageFetcher` accepts `VerifiedWechatArticleUrl` and
-  `&mut PublicBrowserSession`. `WeReadAdapter` accepts
-  `&mut AuthenticatedBrowserSession`; neither API accepts a generic session.
+- `AuthenticatedBrowserSession::prepare_request` performs a PostgreSQL-clocked
+  heartbeat and returns a one-request authenticated capability. An expired
+  lease cannot be handed to the protocol adapter; the application must repeat
+  preparation for each request or bounded protocol operation.
+- `ArticlePageFetcher` accepts `VerifiedWechatArticleUrl` and consumes a
+  `PublicBrowserSession`. Consuming the capability makes the one-operation
+  lifetime explicit and releases local browser capacity when the fetch future
+  completes or is cancelled. `WeReadAdapter` accepts only the authenticated
+  request capability returned by `prepare_request`; neither API accepts a
+  generic session.
+
+The executable acquisition boundary currently includes `BrowserPool`, a
+Tokio-semaphore process-local capacity limit, the storage-neutral
+`AccountLeaseStore` port, `AccountLeaseGuard`, the two non-cloneable session
+capabilities, `WebDriverFactory`, and the public article fetcher. A public
+session has no account or credential state; an authenticated request
+capability is created only after a durable account heartbeat. A failed
+heartbeat permanently cancels the capability. The public adapter creates a
+Thirtyfour session, applies the configured browser profile, navigates to the
+verified URL, rejects an unsafe final URL, and parses common rendered WeChat
+metadata/body selectors. Browser health and pacing/scroll execution remain
+behind TODOs. The adapter exposes an environment diagnostic, and the optional
+sidecar test verifies the configured timezone and other measurable profile
+values.
+Environment/CAPTCHA verification pages are returned as a distinct terminal
+acquisition result; the service must not attempt to bypass them. The complete
+browser-session environment is part of the upstream risk-control input: the
+engine, operating system, WebDriver mode, fresh profile, headers, viewport,
+and network identity can all differ. An otherwise valid public page may be
+returned as an environment-verification page by a server-side automated
+Chromium session while it renders normally in a local interactive Chromium
+session or a server-side Firefox session. This is not evidence that the URL is
+invalid, and it must not be hidden by treating the verification document as an
+article. Operators may select the sidecar engine explicitly with
+`BROWSER_ENGINE`; automatic cross-engine retries and automation-evasion
+changes are out of scope.
 
 ### Persistence
 
@@ -628,7 +663,8 @@ reserved for the remaining modules.
 - Axum and Tower HTTP middleware for the API boundary.
 - SQLx with PostgreSQL for the pool, transactions, repositories, and embedded
   migrations (`postgres`, `runtime-tokio-rustls`, and `migrate` features).
-- Fantoccini for WebDriver browser sessions.
+- Thirtyfour for WebDriver browser sessions, including typed capabilities,
+  explicit waits, and request/page-load timeout configuration.
 - Serde, URL, Base64, and HTML parsing libraries for normalized data.
 - The `rss` crate for RSS 2.0 serialization, stable GUIDs, namespaces, and
   `content:encoded` output; the renderer hashes the resulting bytes for ETags.
@@ -652,6 +688,8 @@ categories:
 DATABASE_URL
 DATABASE_POOL_MIN_CONNECTIONS / DATABASE_POOL_MAX_CONNECTIONS
 WEBDRIVER_URL / BROWSER_ENGINE / WORKER_CONCURRENCY
+BROWSER_USER_AGENT / BROWSER_LOCALE / BROWSER_VIEWPORT_WIDTH /
+BROWSER_VIEWPORT_HEIGHT / BROWSER_EXTRA_ARGS
 APP_INSTANCE_ID / HTTP_BIND / HTTP_PORT
 APP_ROLES
 APP_TIMEZONE / QUIET_HOURS_START / QUIET_HOURS_END
@@ -684,6 +722,41 @@ Pacing, worker concurrency, cooldown, stale-cache, and cache-miss values have
 practical upper bounds before conversion to runtime durations. Diagnostics
 expose names and validation failures, never secret values. Environment parsing
 uses typed deserialization followed by domain validation.
+
+Browser profile diagnostics are configured through `BROWSER_USER_AGENT` (an
+optional fixed page User-Agent), `BROWSER_LOCALE` (default `zh-CN`),
+`BROWSER_VIEWPORT_WIDTH` and `BROWSER_VIEWPORT_HEIGHT` (defaults `1280` and
+`2000`), and `BROWSER_EXTRA_ARGS` (up to 32 whitespace-separated arguments).
+The User-Agent must match the actual browser engine and installed version; it
+must not be randomly changed between requests or made inconsistent with the
+browser's other observable values. `APP_TIMEZONE` remains the expected
+browser-visible timezone. The sidecar must set the same timezone, while the
+real-browser diagnostic verifies the value rather than trying to change the
+sidecar's operating-system timezone.
+Extra arguments cannot override controlled locale, User-Agent, viewport,
+headless, or profile settings, including Chromium `--user-data-dir` and
+Firefox `-profile`; public sessions therefore cannot opt into a persistent
+credential-bearing browser profile through this setting.
+
+### Reference: `we-mp-rss` browser anti-detection approach
+
+The upstream `we-mp-rss` implementation is recorded here as a research
+reference, not as a promise that its technique defeats WeChat risk controls.
+Its Playwright controller combines a generated desktop/mobile User-Agent,
+viewport, Chinese locale, explicit timezone, Chromium launch arguments such as
+`--disable-blink-features=AutomationControlled`, and an initialization script
+that changes several WebDriver-visible properties. Its article path waits for
+DOM content, waits briefly for page stabilization, inspects the verification
+text, extracts `#js_content`, and scrolls in bounded increments to trigger lazy
+images. See its [browser controller](https://raw.githubusercontent.com/rachelos/we-mp-rss/main/driver/playwright_driver.py),
+[article fetcher](https://raw.githubusercontent.com/rachelos/we-mp-rss/main/driver/wxarticle.py),
+and [anti-crawler script](https://github.com/rachelos/we-mp-rss/blob/main/driver/anti_crawler_advanced.js).
+
+Our first diagnostic slice adopts only the measurable profile inputs: fixed
+User-Agent, viewport, locale, timezone verification, and explicit browser
+arguments. It intentionally does not inject that JavaScript or claim to hide
+`navigator.webdriver`; the diagnostic must remain attributable and must
+continue to classify verification pages as a terminal upstream result.
 
 `APP_ROLES` is a validated set containing `api`, `scheduler`, and/or `worker`;
 `all` expands to all three. Worker concurrency is configured independently from
@@ -736,16 +809,60 @@ without exposing it in logs.
 The implementation phase should add domain tests, fixture tests for current and
 legacy upstream responses, fake-browser tests, real WebDriver container tests,
 PostgreSQL repository tests, cache/ETag tests, lease-recovery tests, and a
-Docker Compose end-to-end test. Add pacing tests for bounds, seeded normal
-sampling, quiet-window boundaries, timezone/DST behavior, and interruption
-between page operations. Add a browser-sidecar test that checks the browser's
-reported timezone. Add unit-of-work rollback/fencing tests, scheduler tests that
-prove terminal and operator-blocked sources are not immediately recreated,
-non-failure deferral tests, distributed account-lease contention tests, public
-session isolation/redirect tests, and cache revision/CAS stampede tests. Add a
-PostgreSQL test whose application replicas deliberately supply skewed local
-clocks and prove that claim, heartbeat, and recovery still follow database time.
-Real WeChat access must not be required in CI.
+Docker Compose end-to-end test. The optional ignored test in
+`tests/real_browser.rs` exercises one real public WeChat page through a
+Chromium WebDriver sidecar; it uses no credentials and is never required in
+CI. It succeeds when content is extracted and also accepts the typed
+`VerificationRequired` result when the upstream blocks the test environment;
+it must never treat a verification page as article content. Run it only after
+the sidecar is reachable through a local port forward:
+
+```sh
+WEBDRIVER_URL=http://127.0.0.1:4444 \
+  cargo test --locked --test real_browser -- --ignored --nocapture
+```
+
+Set `BROWSER_ENGINE=firefox` when the sidecar uses Firefox. The same test
+asserts the known article title after successful extraction, so a working
+Firefox deployment exercises the Rust navigation and parser rather than only
+checking sidecar availability.
+
+The real-browser test also applies the optional browser profile variables and
+prints the effective browser values. For example, an operator may run a
+controlled comparison with values matching the installed sidecar browser:
+
+```sh
+APP_TIMEZONE=Asia/Shanghai \
+BROWSER_LOCALE=zh-CN \
+BROWSER_VIEWPORT_WIDTH=1280 \
+BROWSER_VIEWPORT_HEIGHT=2000 \
+BROWSER_USER_AGENT='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/<installed-version> Safari/537.36' \
+BROWSER_EXTRA_ARGS='--disable-blink-features=AutomationControlled' \
+BROWSER_ENGINE=chromium \
+WEBDRIVER_URL=http://127.0.0.1:4444 \
+  cargo test --locked --test real_browser -- --ignored --nocapture
+```
+
+Do not interpret one successful or failed profile as proof of a universal
+workaround. Compare one changed variable at a time and retain the printed
+User-Agent, language, viewport, timezone, final URL, and verification result.
+
+The requested browser dimensions are outer window dimensions. The effective
+CSS inner viewport can be smaller because the driver or sidecar constrains the
+window; the diagnostic therefore requires positive dimensions no larger than
+the request rather than assuming exact equality. This keeps the test portable
+across Chromium and Firefox sidecars while still detecting an ignored or
+invalid profile.
+
+Add pacing tests for bounds, seeded normal sampling, quiet-window boundaries,
+timezone/DST behavior, and interruption between page operations. Add a
+browser-sidecar test that checks the browser's reported timezone. Add
+unit-of-work rollback/fencing tests, scheduler tests that prove terminal and
+operator-blocked sources are not immediately recreated, non-failure deferral
+tests, distributed account-lease contention tests, public session isolation/
+redirect tests, and cache revision/CAS stampede tests. Add a PostgreSQL test
+whose application replicas deliberately supply skewed local clocks and prove
+that claim, heartbeat, and recovery still follow database time.
 
 ## Contract freeze and implementation order
 
@@ -774,8 +891,10 @@ than add more empty module shells. Work proceeds in this order:
    remaining source/archive queries and database-only rebuild orchestration.
 4. Build role-aware runtime composition, scheduler/worker loops, heartbeat
    cancellation, and degraded browser health behavior.
-5. Implement verified URL and browser capability types before Fantoccini
-   navigation or authenticated WeRead behavior.
+5. Complete the acquisition slice with fresh-profile creation, pacing/scroll
+   execution, and browser-side timezone checks behind the now-executable
+   verified-URL, Thirtyfour, and browser-capability ports. Public navigation,
+   redirect rejection, and common article extraction are already executable.
 6. Implement synchronization, RSS publication, and HTTP/UI boundaries, followed
    by multi-replica fencing, DST, redirect-isolation, cache-stampede, and
    end-to-end tests.
@@ -840,10 +959,13 @@ transaction. A future runtime loop still owns polling, shutdown, retry
 backoff, and metrics; it must call this boundary rather than reimplement source
 selection.
 
-The remaining tree intentionally contains no route handlers, browser calls,
-source configuration/feed-token orchestration, scheduler loops, credential
-persistence, or business implementation. Credential, archive, and acquisition
-modules remain documentation-only; `SourceService` implements source
+The remaining tree intentionally contains no route handlers, source
+configuration/feed-token orchestration, scheduler loops, credential
+persistence, or business implementation. Credential and archive modules remain
+documentation-only. Acquisition now contains executable capability/session
+ports, local capacity/lease ownership, public WebDriver navigation, and common
+article extraction; authenticated protocol work, pacing/scroll integration,
+and browser health remain future work. `SourceService` implements source
 create/read, operator enable/gate changes, and the initial-job slice described
 above, while article and sync-run persistence and `FeedService` implement only
 the database/cache boundaries described above.

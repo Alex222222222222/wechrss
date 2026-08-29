@@ -1,28 +1,642 @@
-//! Fantoccini/WebDriver adapter.
+//! Thirtyfour/WebDriver adapter boundary.
 //!
-//! Encapsulates connecting to Chromium/ChromeDriver or Firefox/GeckoDriver,
-//! creating and closing sessions, navigation, waits, DOM/script evaluation,
-//! page-source capture, cookies, and browser-context HTTP requests.
+//! This module encapsulates connections to Chromium/ChromeDriver or
+//! Firefox/GeckoDriver, navigation, waits, DOM/script evaluation, page-source
+//! capture, and browser-session cleanup. Thirtyfour and the sidecar endpoint
+//! remain private implementation details; application services receive
+//! capability-specific session types instead of a general driver handle.
 //!
-//! The future adapter should expose small, capability-specific authenticated
-//! and public session interfaces rather than leaking Fantoccini types or one
-//! overly powerful `BrowserSession` into application code. WebDriver is an
-//! internal dependency and endpoint; it must not be exposed publicly.
-//! `PublicBrowserSession` owns a newly created profile/session and has no cookie,
-//! storage-import, credential, or account-lease API.
-//! `AuthenticatedBrowserSession` carries one account ID and live lease guard; it
-//! cannot be converted into the public capability.
+//! [`PublicBrowserSession`] is a clean, non-cloneable capability for public
+//! WeChat article pages. It owns one local browser-pool permit and has no API
+//! for cookies, storage import, credentials, or account leases.
+//! [`AuthenticatedBrowserSession`] is a separate non-cloneable capability for
+//! WeRead account/list operations. It carries one account lease guard and
+//! cannot be converted into a public session. Dropping either session releases
+//! only local capacity; authenticated callers should explicitly call
+//! `release()` so the durable account lease is removed promptly.
 //!
-//! Non-responsibilities: article parsing, PostgreSQL, job leases, or login API
-//! responses. Browser timeouts and session loss become typed acquisition
-//! errors with retry classification.
+//! The concrete public adapter now connects a fresh WebDriver session and
+//! exposes only safe navigation, current-URL, source, close, and environment
+//! diagnostic operations to sibling acquisition code. It does not expose
+//! cookies, storage, raw protocol commands, or an authenticated session. The
+//! caller must compare the diagnostic's browser-visible IANA timezone with
+//! application configuration; a later slice must use the shared pacing policy
+//! for waits and bounded scrolls, and inspect/revalidate every post-navigation
+//! URL before extraction.
+//! Browser timeouts, sidecar loss, verification pages, and session loss must
+//! map to typed acquisition errors. Browser failures must not prevent API
+//! replicas from serving persisted RSS cache bytes.
 //!
-//! The sidecar image must include `tzdata` and set `TZ` to the configured IANA
-//! timezone. Future browser-session construction should verify the browser-
-//! visible timezone and fail worker readiness or session setup if it disagrees
-//! with application configuration. Browser failure alone must not make an API
-//! process unable to serve persisted RSS cache bytes.
+//! TODO(implementation): add fresh-profile options, browser health checks, and
+//! pacing/scroll orchestration. The concrete session lifecycle, profile
+//! application, and browser-environment diagnostic are implemented here;
+//! article extraction remains in [`super::article_page`].
 
-// TODO(design): implement the non-convertible session capabilities,
-// fresh-profile public sessions, redirect inspection, account-guard
-// cancellation, and role-aware browser health reporting.
+use crate::config::BrowserEngine;
+use chrono_tz::Tz;
+use serde::Deserialize;
+#[cfg(test)]
+use serde_json::{json, Value};
+use thirtyfour::common::capabilities::firefox::FirefoxPreferences;
+use thirtyfour::prelude::{ChromiumLikeCapabilities, DesiredCapabilities};
+use thirtyfour::{Capabilities, WebDriver};
+use thiserror::Error;
+use url::Url;
+use uuid::Uuid;
+
+use super::browser_pool::{
+    AccountLeaseError, AccountLeaseGuard, AccountLeaseStore, BrowserPool, BrowserPoolError,
+};
+
+const WEBDRIVER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const WEBDRIVER_PAGE_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Errors raised while creating or operating a WebDriver session.
+#[derive(Debug, Error)]
+pub enum WebDriverError {
+    /// The process-local browser capacity could not be acquired.
+    #[error(transparent)]
+    Pool(#[from] BrowserPoolError),
+    /// The sidecar rejected or failed a new browser session.
+    #[error("WebDriver session could not be created: {0}")]
+    Connect(String),
+    /// An existing browser session rejected a command or disconnected.
+    #[error("WebDriver command failed: {0}")]
+    Command(String),
+    /// A command was requested on a pool capability that has no client.
+    #[error("browser session is not connected to WebDriver")]
+    NotConnected,
+}
+
+/// Configuration for one private WebDriver sidecar endpoint.
+#[derive(Debug, Clone)]
+pub struct WebDriverFactory {
+    endpoint: Url,
+    engine: BrowserEngine,
+    profile: BrowserProfile,
+}
+
+/// Browser settings that are applied consistently to one fresh session.
+///
+/// The values are deliberately explicit so a real-browser diagnostic can
+/// compare the effective User-Agent, viewport, locale, timezone, and browser
+/// arguments as one profile. `expected_timezone` is only an assertion target:
+/// the browser sidecar must still set its own `TZ` and timezone data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserProfile {
+    /// Optional page User-Agent override. `None` preserves the browser default.
+    pub user_agent: Option<String>,
+    /// Requested outer browser window dimensions.
+    pub viewport: BrowserViewport,
+    /// Browser locale used for language negotiation.
+    pub locale: String,
+    /// Optional browser-visible timezone expected from the sidecar.
+    pub expected_timezone: Option<Tz>,
+    /// Additional operator-selected browser arguments.
+    pub extra_args: Vec<String>,
+}
+
+impl Default for BrowserProfile {
+    fn default() -> Self {
+        Self {
+            user_agent: None,
+            viewport: BrowserViewport::new(1_280, 2_000),
+            locale: "zh-CN".to_owned(),
+            expected_timezone: None,
+            extra_args: Vec::new(),
+        }
+    }
+}
+
+/// Requested browser window dimensions in CSS pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserViewport {
+    /// Requested outer window width.
+    pub width: u32,
+    /// Requested outer window height.
+    pub height: u32,
+}
+
+impl BrowserViewport {
+    /// Creates viewport dimensions. Configuration validation happens before
+    /// the profile reaches the WebDriver adapter.
+    pub const fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+}
+
+/// Browser-visible values captured by an opt-in integration diagnostic.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct BrowserEnvironment {
+    /// Effective page User-Agent.
+    #[serde(rename = "userAgent")]
+    pub user_agent: String,
+    /// Effective primary locale.
+    pub language: String,
+    /// Effective ordered language list.
+    pub languages: Vec<String>,
+    /// IANA timezone reported by `Intl`.
+    pub timezone: String,
+    /// WebDriver exposure, when the browser reports it.
+    pub webdriver: Option<bool>,
+    /// Effective inner viewport width. The driver may report a value smaller
+    /// than the requested outer window width.
+    #[serde(rename = "innerWidth")]
+    pub inner_width: u32,
+    /// Effective inner viewport height. The driver may report a value smaller
+    /// than the requested outer window height.
+    #[serde(rename = "innerHeight")]
+    pub inner_height: u32,
+}
+
+impl WebDriverFactory {
+    /// Creates a factory for the configured browser sidecar.
+    pub fn new(endpoint: Url, engine: BrowserEngine) -> Self {
+        Self {
+            endpoint,
+            engine,
+            profile: BrowserProfile::default(),
+        }
+    }
+
+    /// Replaces the default browser profile with an explicit diagnostic or
+    /// runtime profile.
+    pub fn with_profile(mut self, mut profile: BrowserProfile) -> Self {
+        if profile.locale.is_empty() {
+            profile.locale = "zh-CN".to_owned();
+        }
+        self.profile = profile;
+        self
+    }
+
+    /// Opens a clean public-page browser session using one pool permit.
+    ///
+    /// If WebDriver session creation fails, the partially acquired pool
+    /// capability is dropped before the error is returned. No account lease is
+    /// involved in this path.
+    pub async fn open_public(
+        &self,
+        pool: &BrowserPool,
+    ) -> Result<PublicBrowserSession, WebDriverError> {
+        let session = pool.open_public().await?;
+        let client = connect(self.endpoint.clone(), self.engine, &self.profile)
+            .await
+            .map_err(WebDriverError::Connect)?;
+        Ok(session.attach_client(client))
+    }
+}
+
+async fn connect(
+    endpoint: Url,
+    engine: BrowserEngine,
+    profile: &BrowserProfile,
+) -> Result<WebDriver, String> {
+    let capabilities = capabilities_for(engine, profile)?;
+    let driver = WebDriver::builder(endpoint.as_str(), capabilities)
+        .request_timeout(WEBDRIVER_REQUEST_TIMEOUT)
+        .connect()
+        .await
+        .map_err(|error| error.to_string())?;
+    for result in [
+        driver
+            .set_page_load_timeout(WEBDRIVER_PAGE_LOAD_TIMEOUT)
+            .await,
+        driver
+            .set_window_rect(0, 0, profile.viewport.width, profile.viewport.height)
+            .await,
+    ] {
+        if let Err(error) = result {
+            let message = error.to_string();
+            let _ = driver.quit().await;
+            return Err(message);
+        }
+    }
+    Ok(driver)
+}
+
+fn capabilities_for(
+    engine: BrowserEngine,
+    profile: &BrowserProfile,
+) -> Result<Capabilities, String> {
+    validate_profile(profile)?;
+    match engine {
+        BrowserEngine::Chromium => {
+            let mut capabilities = DesiredCapabilities::chrome();
+            for argument in [
+                "--headless=new",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                &format!(
+                    "--window-size={},{}",
+                    profile.viewport.width, profile.viewport.height
+                ),
+                &format!("--lang={}", profile.locale),
+            ] {
+                capabilities
+                    .add_arg(argument)
+                    .map_err(|error| error.to_string())?;
+            }
+            if let Some(user_agent) = &profile.user_agent {
+                capabilities
+                    .add_arg(&format!("--user-agent={user_agent}"))
+                    .map_err(|error| error.to_string())?;
+            }
+            for argument in &profile.extra_args {
+                capabilities
+                    .add_arg(argument)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(capabilities.into())
+        }
+        BrowserEngine::Firefox => {
+            let mut capabilities = DesiredCapabilities::firefox();
+            capabilities
+                .add_arg("-headless")
+                .map_err(|error| error.to_string())?;
+            let mut preferences = FirefoxPreferences::new();
+            preferences
+                .set("intl.accept_languages", &profile.locale)
+                .map_err(|error| error.to_string())?;
+            preferences
+                .set("intl.locale.requested", &profile.locale)
+                .map_err(|error| error.to_string())?;
+            if let Some(user_agent) = &profile.user_agent {
+                preferences
+                    .set("general.useragent.override", user_agent)
+                    .map_err(|error| error.to_string())?;
+            }
+            capabilities
+                .set_preferences(preferences)
+                .map_err(|error| error.to_string())?;
+            for argument in &profile.extra_args {
+                capabilities
+                    .add_arg(argument)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(capabilities.into())
+        }
+    }
+}
+
+fn validate_profile(profile: &BrowserProfile) -> Result<(), String> {
+    if profile.viewport.width == 0 || profile.viewport.height == 0 {
+        return Err("viewport dimensions must be positive".to_owned());
+    }
+    if profile.locale.trim().is_empty()
+        || profile
+            .locale
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err("locale must be a non-empty token without whitespace".to_owned());
+    }
+    if profile.user_agent.as_deref().is_some_and(|user_agent| {
+        user_agent.trim().is_empty() || user_agent.chars().any(char::is_control)
+    }) {
+        return Err("user agent must be non-empty and free of control characters".to_owned());
+    }
+    if profile.extra_args.iter().any(|argument| {
+        browser_argument_name(argument).is_none_or(|name| {
+            matches!(
+                name,
+                "--lang"
+                    | "--user-agent"
+                    | "--window-size"
+                    | "--user-data-dir"
+                    | "--headless"
+                    | "-headless"
+                    | "-profile"
+            )
+        })
+    }) {
+        return Err(
+            "extra arguments must not override controlled browser profile arguments".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn browser_argument_name(argument: &str) -> Option<&str> {
+    argument
+        .split_once('=')
+        .map_or(Some(argument), |(name, _)| {
+            (!name.is_empty()).then_some(name)
+        })
+}
+
+/// A clean, unauthenticated public-page browser session.
+pub struct PublicBrowserSession {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    session_id: Uuid,
+    client: Option<WebDriver>,
+}
+
+impl PublicBrowserSession {
+    pub(crate) fn from_permit(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self {
+            _permit: permit,
+            session_id: Uuid::new_v4(),
+            client: None,
+        }
+    }
+
+    fn attach_client(mut self, client: WebDriver) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// Returns a non-secret identifier useful for tracing one local session.
+    pub const fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    /// Navigates the clean session to a validated public-page destination.
+    pub(crate) async fn goto(&self, url: &str) -> Result<(), WebDriverError> {
+        self.client
+            .as_ref()
+            .ok_or(WebDriverError::NotConnected)?
+            .goto(url)
+            .await
+            .map_err(|error| WebDriverError::Command(error.to_string()))
+    }
+
+    /// Returns the browser-observed URL after navigation and redirects.
+    pub(crate) async fn current_url(&self) -> Result<Url, WebDriverError> {
+        self.client
+            .as_ref()
+            .ok_or(WebDriverError::NotConnected)?
+            .current_url()
+            .await
+            .map_err(|error| WebDriverError::Command(error.to_string()))
+    }
+
+    /// Captures the current rendered page source.
+    pub(crate) async fn source(&self) -> Result<String, WebDriverError> {
+        self.client
+            .as_ref()
+            .ok_or(WebDriverError::NotConnected)?
+            .source()
+            .await
+            .map_err(|error| WebDriverError::Command(error.to_string()))
+    }
+
+    /// Captures browser-visible profile values for diagnostics and health
+    /// checks. It does not attempt to hide automation signals.
+    pub async fn environment(&self) -> Result<BrowserEnvironment, WebDriverError> {
+        let result = self
+            .client
+            .as_ref()
+            .ok_or(WebDriverError::NotConnected)?
+            .execute(
+                r#"return {
+                    userAgent: navigator.userAgent,
+                    language: navigator.language,
+                    languages: Array.from(navigator.languages || []),
+                    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
+                    webdriver: navigator.webdriver === undefined ? null : navigator.webdriver,
+                    innerWidth: window.innerWidth,
+                    innerHeight: window.innerHeight
+                };"#,
+                Vec::new(),
+            )
+            .await
+            .map_err(|error| WebDriverError::Command(error.to_string()))?;
+        result
+            .convert()
+            .map_err(|error| WebDriverError::Command(error.to_string()))
+    }
+
+    pub(crate) async fn close_client(&mut self) -> Result<(), WebDriverError> {
+        if let Some(client) = self.client.take() {
+            client
+                .quit()
+                .await
+                .map_err(|error| WebDriverError::Command(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Closes the remote browser session and releases the local permit.
+    pub async fn close(mut self) -> Result<(), WebDriverError> {
+        self.close_client().await
+    }
+}
+
+impl std::fmt::Debug for PublicBrowserSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublicBrowserSession")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An authenticated browser capability fenced to one WeRead account lease.
+pub struct AuthenticatedBrowserSession<R>
+where
+    R: AccountLeaseStore,
+{
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    session_id: Uuid,
+    lease: AccountLeaseGuard<R>,
+}
+
+impl<R> AuthenticatedBrowserSession<R>
+where
+    R: AccountLeaseStore,
+{
+    pub(crate) fn from_permit(
+        permit: tokio::sync::OwnedSemaphorePermit,
+        lease: AccountLeaseGuard<R>,
+    ) -> Self {
+        Self {
+            _permit: permit,
+            session_id: Uuid::new_v4(),
+            lease,
+        }
+    }
+
+    /// Returns a non-secret identifier useful for tracing one local session.
+    pub const fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    /// Returns the stable account identity used by this session.
+    pub const fn account_id(&self) -> crate::domain::credentials::WeReadAccountId {
+        self.lease.account_id()
+    }
+
+    /// Heartbeats the account lease before more authenticated work.
+    pub async fn heartbeat(
+        &mut self,
+        lease_for: chrono::Duration,
+    ) -> Result<(), AccountLeaseError> {
+        self.lease.heartbeat(lease_for).await
+    }
+
+    /// Proves account-lease liveness immediately before one authenticated
+    /// protocol request.
+    ///
+    /// The heartbeat uses the lease store's authoritative clock, so this
+    /// cannot succeed for an already-expired durable lease. The returned
+    /// capability is the only session value accepted by authenticated protocol
+    /// adapters; callers cannot pass the raw session directly to them.
+    pub async fn prepare_request(
+        &mut self,
+        lease_for: chrono::Duration,
+    ) -> Result<AuthenticatedRequest<'_, R>, AccountLeaseError> {
+        self.lease.heartbeat(lease_for).await?;
+        Ok(AuthenticatedRequest { session: self })
+    }
+
+    /// Releases the durable account lease and then drops local browser capacity.
+    pub async fn release(self) -> Result<(), AccountLeaseError> {
+        let Self { _permit, lease, .. } = self;
+        lease.release().await
+    }
+}
+
+impl<R> std::fmt::Debug for AuthenticatedBrowserSession<R>
+where
+    R: AccountLeaseStore,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedBrowserSession")
+            .field("session_id", &self.session_id)
+            .field("account_id", &self.account_id())
+            .field("lease", &self.lease)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A one-request authenticated capability created only after a successful
+/// server-clock account-lease heartbeat.
+pub struct AuthenticatedRequest<'a, R>
+where
+    R: AccountLeaseStore,
+{
+    session: &'a mut AuthenticatedBrowserSession<R>,
+}
+
+impl<R> AuthenticatedRequest<'_, R>
+where
+    R: AccountLeaseStore,
+{
+    /// Returns the account identity whose lease was just proven live.
+    pub const fn account_id(&self) -> crate::domain::credentials::WeReadAccountId {
+        self.session.account_id()
+    }
+
+    /// Returns the local browser-session identifier for tracing.
+    pub const fn session_id(&self) -> Uuid {
+        self.session.session_id()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chromium_capabilities_request_a_headless_chrome_without_credentials() {
+        let capabilities =
+            capabilities_for(BrowserEngine::Chromium, &BrowserProfile::default()).unwrap();
+        assert_eq!(capabilities.get("browserName"), Some(&json!("chrome")));
+        assert_eq!(
+            capabilities
+                .get("goog:chromeOptions")
+                .and_then(|options| options.get("args"))
+                .and_then(Value::as_array)
+                .and_then(|args| args.first())
+                .and_then(Value::as_str),
+            Some("--headless=new")
+        );
+        assert!(!capabilities.contains_key("proxy"));
+    }
+
+    #[test]
+    fn firefox_capabilities_request_headless_firefox() {
+        let capabilities =
+            capabilities_for(BrowserEngine::Firefox, &BrowserProfile::default()).unwrap();
+        assert_eq!(capabilities.get("browserName"), Some(&json!("firefox")));
+        assert_eq!(
+            capabilities
+                .get("moz:firefoxOptions")
+                .and_then(|options| options.get("args"))
+                .and_then(Value::as_array)
+                .and_then(|args| args.first())
+                .and_then(Value::as_str),
+            Some("-headless")
+        );
+    }
+
+    #[test]
+    fn capabilities_apply_profile_values_without_credentials() {
+        let profile = BrowserProfile {
+            user_agent: Some("Mozilla/5.0 TestBrowser/1.0".to_owned()),
+            viewport: BrowserViewport::new(1_440, 900),
+            locale: "en-US".to_owned(),
+            expected_timezone: Some(chrono_tz::Asia::Shanghai),
+            extra_args: vec!["--disable-features=SomeFeature".to_owned()],
+        };
+        let capabilities = capabilities_for(BrowserEngine::Chromium, &profile).unwrap();
+        let args = capabilities
+            .get("goog:chromeOptions")
+            .and_then(|options| options.get("args"))
+            .and_then(Value::as_array)
+            .unwrap();
+        let args = args.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+        assert!(args.contains(&"--window-size=1440,900"));
+        assert!(args.contains(&"--lang=en-US"));
+        assert!(args.contains(&"--user-agent=Mozilla/5.0 TestBrowser/1.0"));
+        assert!(args.contains(&"--disable-features=SomeFeature"));
+        assert!(!capabilities.contains_key("proxy"));
+
+        let firefox = capabilities_for(BrowserEngine::Firefox, &profile).unwrap();
+        assert_eq!(
+            firefox
+                .get("moz:firefoxOptions")
+                .and_then(|options| options.get("prefs"))
+                .and_then(|prefs| prefs.get("intl.accept_languages")),
+            Some(&json!("en-US"))
+        );
+        assert_eq!(
+            firefox
+                .get("moz:firefoxOptions")
+                .and_then(|options| options.get("prefs"))
+                .and_then(|prefs| prefs.get("general.useragent.override")),
+            Some(&json!("Mozilla/5.0 TestBrowser/1.0"))
+        );
+    }
+
+    #[test]
+    fn rejects_extra_arguments_that_override_controlled_profile_values() {
+        for argument in [
+            "--lang=en-US",
+            "--user-agent=other",
+            "--window-size=1,1",
+            "--user-data-dir=/tmp/other-profile",
+            "--headless=false",
+            "-profile=/tmp/other-profile",
+        ] {
+            let profile = BrowserProfile {
+                extra_args: vec![argument.to_owned()],
+                ..BrowserProfile::default()
+            };
+            let error = capabilities_for(BrowserEngine::Chromium, &profile)
+                .expect_err("conflicting profile argument should be rejected");
+            assert!(error.contains("controlled browser profile arguments"));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unconnected_pool_session_cannot_issue_browser_commands() {
+        let pool = BrowserPool::new(1).unwrap();
+        let session = pool.open_public().await.unwrap();
+        assert!(matches!(
+            session.current_url().await,
+            Err(WebDriverError::NotConnected)
+        ));
+    }
+}

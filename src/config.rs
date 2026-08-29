@@ -16,6 +16,8 @@
 //! DATABASE_URL
 //! DATABASE_POOL_MIN_CONNECTIONS / DATABASE_POOL_MAX_CONNECTIONS
 //! WEBDRIVER_URL / BROWSER_ENGINE / WORKER_CONCURRENCY
+//! BROWSER_USER_AGENT / BROWSER_LOCALE / BROWSER_VIEWPORT_WIDTH /
+//! BROWSER_VIEWPORT_HEIGHT / BROWSER_EXTRA_ARGS
 //! APP_INSTANCE_ID / HTTP_BIND / HTTP_PORT / APP_ROLES
 //! APP_TIMEZONE / QUIET_HOURS_START / QUIET_HOURS_END
 //! JOB_POLL_SECONDS / JOB_LEASE_SECONDS / JOB_HEARTBEAT_SECONDS /
@@ -73,6 +75,12 @@ const MAX_WORKER_CONCURRENCY: u32 = 1_024;
 const MAX_SOURCE_FAILURE_COOLDOWN_SECONDS: u64 = 7 * 24 * 60 * 60;
 const MAX_STALE_WHILE_REVALIDATE_SECONDS: u64 = 24 * 60 * 60;
 const MAX_CACHE_MISS_WAIT_MS: u64 = 60_000;
+const DEFAULT_BROWSER_LOCALE: &str = "zh-CN";
+const DEFAULT_BROWSER_VIEWPORT_WIDTH: u32 = 1_280;
+const DEFAULT_BROWSER_VIEWPORT_HEIGHT: u32 = 2_000;
+const MAX_BROWSER_VIEWPORT_DIMENSION: u32 = 8_192;
+const MAX_BROWSER_USER_AGENT_LENGTH: usize = 512;
+const MAX_BROWSER_EXTRA_ARGS: usize = 32;
 
 const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "DATABASE_URL",
@@ -80,6 +88,11 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "DATABASE_POOL_MAX_CONNECTIONS",
     "WEBDRIVER_URL",
     "BROWSER_ENGINE",
+    "BROWSER_USER_AGENT",
+    "BROWSER_LOCALE",
+    "BROWSER_VIEWPORT_WIDTH",
+    "BROWSER_VIEWPORT_HEIGHT",
+    "BROWSER_EXTRA_ARGS",
     "WORKER_CONCURRENCY",
     "APP_INSTANCE_ID",
     "HTTP_BIND",
@@ -331,6 +344,18 @@ pub struct AppConfig {
     pub webdriver_url: Url,
     /// Browser implementation expected behind the WebDriver endpoint.
     pub browser_engine: BrowserEngine,
+    /// Optional fixed browser User-Agent used for controlled diagnostics.
+    pub browser_user_agent: Option<String>,
+    /// Locale passed to the browser profile.
+    pub browser_locale: String,
+    /// Requested browser viewport width in CSS pixels.
+    pub browser_viewport_width: u32,
+    /// Requested browser viewport height in CSS pixels.
+    pub browser_viewport_height: u32,
+    /// Additional browser arguments, one argument per whitespace-separated
+    /// token. These are operator-controlled and are applied only to the
+    /// selected WebDriver browser.
+    pub browser_extra_args: Vec<String>,
     /// Stable identity used in PostgreSQL job leases.
     pub instance_id: String,
     /// HTTP bind address or hostname.
@@ -502,6 +527,19 @@ impl AppConfig {
             .browser_engine
             .unwrap_or_else(|| "chromium".to_owned())
             .parse()?;
+        let browser_user_agent = parse_browser_user_agent(raw.browser_user_agent)?;
+        let browser_locale = parse_browser_locale(raw.browser_locale)?;
+        let browser_viewport_width = bounded_browser_viewport(
+            raw.browser_viewport_width
+                .unwrap_or(DEFAULT_BROWSER_VIEWPORT_WIDTH),
+            "BROWSER_VIEWPORT_WIDTH",
+        )?;
+        let browser_viewport_height = bounded_browser_viewport(
+            raw.browser_viewport_height
+                .unwrap_or(DEFAULT_BROWSER_VIEWPORT_HEIGHT),
+            "BROWSER_VIEWPORT_HEIGHT",
+        )?;
+        let browser_extra_args = parse_browser_extra_args(raw.browser_extra_args)?;
         let http_port = raw.http_port.unwrap_or(8080);
         if http_port == 0 {
             return Err(ConfigError::InvalidValue {
@@ -654,6 +692,11 @@ impl AppConfig {
             database_pool_max_connections,
             webdriver_url,
             browser_engine,
+            browser_user_agent,
+            browser_locale,
+            browser_viewport_width,
+            browser_viewport_height,
+            browser_extra_args,
             instance_id: raw
                 .app_instance_id
                 .filter(|value| !value.trim().is_empty())
@@ -693,6 +736,11 @@ struct RawConfig {
     database_pool_max_connections: Option<u32>,
     webdriver_url: Option<String>,
     browser_engine: Option<String>,
+    browser_user_agent: Option<String>,
+    browser_locale: Option<String>,
+    browser_viewport_width: Option<u32>,
+    browser_viewport_height: Option<u32>,
+    browser_extra_args: Option<String>,
     worker_concurrency: Option<u32>,
     app_instance_id: Option<String>,
     http_bind: Option<String>,
@@ -743,6 +791,104 @@ struct RawConfig {
     admin_password: Option<String>,
     session_signing_key: Option<String>,
     credential_encryption_key: Option<String>,
+}
+
+fn parse_browser_user_agent(value: Option<String>) -> Result<Option<String>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_BROWSER_USER_AGENT_LENGTH {
+        return Err(ConfigError::InvalidValue {
+            variable: "BROWSER_USER_AGENT",
+            reason: "must be non-empty and no longer than 512 characters",
+        });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ConfigError::InvalidValue {
+            variable: "BROWSER_USER_AGENT",
+            reason: "must not contain control characters",
+        });
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn parse_browser_locale(value: Option<String>) -> Result<String, ConfigError> {
+    let value = value.unwrap_or_else(|| DEFAULT_BROWSER_LOCALE.to_owned());
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 64
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(ConfigError::InvalidValue {
+            variable: "BROWSER_LOCALE",
+            reason: "must be a non-empty locale token without whitespace",
+        });
+    }
+    Ok(value.to_owned())
+}
+
+fn bounded_browser_viewport(value: u32, variable: &'static str) -> Result<u32, ConfigError> {
+    if value == 0 || value > MAX_BROWSER_VIEWPORT_DIMENSION {
+        return Err(ConfigError::InvalidValue {
+            variable,
+            reason: "must be between 1 and 8192 pixels",
+        });
+    }
+    Ok(value)
+}
+
+fn parse_browser_extra_args(value: Option<String>) -> Result<Vec<String>, ConfigError> {
+    let arguments = value
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if arguments.len() > MAX_BROWSER_EXTRA_ARGS {
+        return Err(ConfigError::InvalidValue {
+            variable: "BROWSER_EXTRA_ARGS",
+            reason: "must contain no more than 32 arguments",
+        });
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument.is_empty() || !argument.starts_with('-'))
+    {
+        return Err(ConfigError::InvalidValue {
+            variable: "BROWSER_EXTRA_ARGS",
+            reason: "each argument must begin with '-'",
+        });
+    }
+    if arguments.iter().any(|argument| {
+        browser_argument_name(argument).is_some_and(|name| {
+            matches!(
+                name,
+                "--lang"
+                    | "--user-agent"
+                    | "--window-size"
+                    | "--user-data-dir"
+                    | "--headless"
+                    | "-headless"
+                    | "-profile"
+            )
+        })
+    }) {
+        return Err(ConfigError::InvalidValue {
+            variable: "BROWSER_EXTRA_ARGS",
+            reason: "must not override controlled browser profile arguments",
+        });
+    }
+    Ok(arguments)
+}
+
+fn browser_argument_name(argument: &str) -> Option<&str> {
+    argument
+        .split_once('=')
+        .map_or(Some(argument), |(name, _)| {
+            (!name.is_empty()).then_some(name)
+        })
 }
 
 fn reject_legacy_variables(variables: &[(String, String)]) -> Result<(), ConfigError> {
@@ -1047,6 +1193,11 @@ mod tests {
         let config = AppConfig::from_env_iter(valid_environment()).unwrap();
 
         assert_eq!(config.browser_engine, BrowserEngine::Chromium);
+        assert!(config.browser_user_agent.is_none());
+        assert_eq!(config.browser_locale, "zh-CN");
+        assert_eq!(config.browser_viewport_width, 1_280);
+        assert_eq!(config.browser_viewport_height, 2_000);
+        assert!(config.browser_extra_args.is_empty());
         assert!(config.roles.contains(AppRole::Api));
         assert!(config.roles.contains(AppRole::Scheduler));
         assert!(config.roles.contains(AppRole::Worker));
@@ -1079,7 +1230,7 @@ mod tests {
 
     #[test]
     fn does_not_require_quiet_hours_when_both_values_are_absent() {
-        let environment = valid_environment()
+        let environment: Vec<(String, String)> = valid_environment()
             .into_iter()
             .filter(|(key, _)| key != "QUIET_HOURS_START" && key != "QUIET_HOURS_END")
             .collect::<Vec<_>>();
@@ -1593,5 +1744,66 @@ mod tests {
         assert_eq!(config.pacing.max_scroll_steps, 6);
         assert_eq!(config.pacing.max_scroll_pixels, 5_000);
         assert_eq!(config.pacing.request.mean_ms, 2_500.0);
+    }
+
+    #[test]
+    fn parses_browser_profile_settings_from_environment() {
+        let environment: Vec<(String, String)> = valid_environment()
+            .into_iter()
+            .chain([
+                (
+                    "BROWSER_USER_AGENT".to_owned(),
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36"
+                        .to_owned(),
+                ),
+                ("BROWSER_LOCALE".to_owned(), "en-US".to_owned()),
+                ("BROWSER_VIEWPORT_WIDTH".to_owned(), "1440".to_owned()),
+                ("BROWSER_VIEWPORT_HEIGHT".to_owned(), "900".to_owned()),
+                (
+                    "BROWSER_EXTRA_ARGS".to_owned(),
+                    "--disable-features=SomeFeature --force-device-scale-factor=1".to_owned(),
+                ),
+            ])
+            .collect();
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        assert_eq!(
+            config.browser_user_agent.as_deref(),
+            Some(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36"
+            )
+        );
+        assert_eq!(config.browser_locale, "en-US");
+        assert_eq!(config.browser_viewport_width, 1_440);
+        assert_eq!(config.browser_viewport_height, 900);
+        assert_eq!(
+            config.browser_extra_args,
+            vec![
+                "--disable-features=SomeFeature".to_owned(),
+                "--force-device-scale-factor=1".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_browser_profile_settings() {
+        for (variable, value) in [
+            ("BROWSER_USER_AGENT", " "),
+            ("BROWSER_LOCALE", "zh CN"),
+            ("BROWSER_VIEWPORT_WIDTH", "0"),
+            ("BROWSER_VIEWPORT_HEIGHT", "8193"),
+            ("BROWSER_EXTRA_ARGS", "not-an-argument"),
+            ("BROWSER_EXTRA_ARGS", "--user-agent=other"),
+            ("BROWSER_EXTRA_ARGS", "--user-data-dir=/tmp/other-profile"),
+        ] {
+            let environment = replace_environment(valid_environment(), variable, value);
+            assert!(
+                matches!(
+                    AppConfig::from_env_iter(environment),
+                    Err(ConfigError::InvalidValue { variable: actual, .. }) if actual == variable
+                ),
+                "{variable}={value:?} should be rejected"
+            );
+        }
     }
 }

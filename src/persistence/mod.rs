@@ -13,8 +13,9 @@
 //! The first implemented persistence slices are the PostgreSQL pool/migration
 //! helpers in [`postgres`], the shared transaction owner in [`unit_of_work`],
 //! the job repository contract plus SQLx and memory implementations in
-//! [`repositories::job_repository`], and the PostgreSQL/memory account lease
-//! repository in [`repositories::account_lease_repository`] plus the durable
+//! [`repositories::job_repository`], and the PostgreSQL/memory implementation
+//! of the storage-neutral account-lease port in
+//! [`repositories::account_lease_repository`] plus the durable
 //! feed-build lease and revision-aware feed-cache repository in
 //! [`repositories::feed_cache_repository`]. The PostgreSQL scheduler repository
 //! in [`repositories::scheduler_repository`] now atomically enqueues due source

@@ -21,7 +21,7 @@
 //! Non-responsibilities: feed-token lookup, source/article queries, RSS XML
 //! rendering, browser work, source synchronization, asset handling, HTTP
 //! header construction, and final job completion. Those concerns remain in
-//! their owning modules. In particular, this service never calls Fantoccini or
+//! their owning modules. In particular, this service never calls Thirtyfour or
 //! waits for a synchronization job.
 //!
 //! Expected interfaces: the web layer supplies a source id and an optional

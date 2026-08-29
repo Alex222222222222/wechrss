@@ -2,7 +2,7 @@
 //!
 //! These modules define the vocabulary shared by application services,
 //! acquisition adapters, repositories, and the RSS renderer. They must remain
-//! independent of Axum, Fantoccini, SQLx, HTML parsers, and deployment details.
+//! independent of Axum, Thirtyfour, SQLx, HTML parsers, and deployment details.
 //!
 //! The domain owns invariants such as stable `review_id` article identity,
 //! explicit job state transitions, bounded retry semantics, and risk-control

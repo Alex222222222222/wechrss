@@ -2,7 +2,7 @@
 //!
 //! This subsystem is the only place that knows how WeChat and WeRead are
 //! reached. It exposes typed, storage-independent results to application
-//! services and hides Fantoccini, WebDriver URLs, browser capabilities, page
+//! services and hides Thirtyfour, WebDriver URLs, browser capabilities, page
 //! selectors, and protocol response envelopes.
 //!
 //! Browser access is private to the application network. Browser failures,
@@ -15,6 +15,11 @@
 //! persisted account session.
 //! Authenticated and public browser sessions are separate capabilities. Public
 //! sessions use clean ephemeral profiles and accept only verified WeChat URLs.
+//!
+//! The capability ports, process-local browser capacity boundary, concrete
+//! public Thirtyfour navigation, and common article extraction are executable;
+//! fresh-profile lifecycle details, authenticated protocol work, pacing, and
+//! browser sidecar health checks remain TODOs in the child modules.
 
 pub mod article_page;
 pub mod browser_pool;

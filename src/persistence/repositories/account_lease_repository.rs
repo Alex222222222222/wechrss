@@ -4,6 +4,7 @@
 //! application replicas. Source job leases prevent duplicate source work but do
 //! not prevent two different sources from using the same account concurrently.
 //!
+//! This module implements the storage-neutral [`AccountLeaseStore`] port.
 //! Expected operations are `acquire(account_id, owner, lease_for)`,
 //! `heartbeat(account_id, owner, token, lease_for)`, and
 //! `release(account_id, owner, token)`. Acquisition returns a fresh fencing
@@ -12,7 +13,8 @@
 //! The concrete production interface omits caller-provided `now`: SQL derives
 //! one statement-local PostgreSQL timestamp for acquisition, heartbeat,
 //! release, expiry, and takeover. An injectable clock belongs only to the memory
-//! test implementation.
+//! test implementation. The old `AccountLeaseRepository` name is retained
+//! here only as a compatibility re-export of that port.
 //!
 //! Authenticated article-list, detail-URL recovery, login exchange, and
 //! credential refresh operations hold this lease and heartbeat it through a
@@ -34,64 +36,15 @@ use std::{collections::HashMap, fmt, sync::Arc};
 
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{postgres::PgRow, PgPool, Row};
-use thiserror::Error;
 use tokio::sync::Mutex;
 
+pub use crate::acquisition::browser_pool::{AccountLeaseError, AccountLeaseStore};
 use crate::domain::credentials::{AccountLease, AccountLeaseToken, WeReadAccountId};
 
-/// Errors returned by account-lease repositories.
-#[derive(Debug, Error)]
-pub enum AccountLeaseError {
-    /// A nil UUID cannot identify a configured account.
-    #[error("account id must not be nil")]
-    InvalidAccountId,
-    /// Lease ownership must identify an application instance.
-    #[error("account lease owner must not be empty")]
-    EmptyOwner,
-    /// A lease must be positive and representable by the repository.
-    #[error("account lease duration must be positive and fit in milliseconds")]
-    InvalidLeaseDuration,
-    /// The current owner or fencing token no longer controls the lease.
-    #[error("account lease for {account_id} is no longer owned by this claim")]
-    LeaseLost { account_id: WeReadAccountId },
-    /// The database could not complete the operation.
-    #[error("account lease storage error: {0}")]
-    Storage(String),
-}
-
-/// Distributed account-lease operations.
-///
-/// Production implementations derive all lease-sensitive timestamps from the
-/// database clock. The interface therefore does not accept a caller-supplied
-/// wall clock, preventing one replica with a skewed clock from taking over a
-/// live lease or extending an expired one.
-#[allow(async_fn_in_trait)]
-pub trait AccountLeaseRepository: Send + Sync {
-    /// Acquires a lease or returns `None` when another live owner holds it.
-    async fn acquire(
-        &self,
-        account_id: WeReadAccountId,
-        owner: &str,
-        lease_for: Duration,
-    ) -> Result<Option<AccountLease>, AccountLeaseError>;
-
-    /// Extends a lease only when owner, token, and lease liveness all match.
-    async fn heartbeat(
-        &self,
-        account_id: WeReadAccountId,
-        owner: &str,
-        token: AccountLeaseToken,
-        lease_for: Duration,
-    ) -> Result<AccountLease, AccountLeaseError>;
-
-    /// Releases a live lease only for its current owner and fencing token.
-    async fn release(
-        &self,
-        account_id: WeReadAccountId,
-        owner: &str,
-        token: AccountLeaseToken,
-    ) -> Result<(), AccountLeaseError>;
-}
+/// Compatibility re-export for callers that used the old persistence-local
+/// name. New code should depend on the storage-neutral [`AccountLeaseStore`]
+/// port from the acquisition boundary.
+pub use crate::acquisition::browser_pool::AccountLeaseStore as AccountLeaseRepository;
 
 /// PostgreSQL-backed account lease repository.
 #[derive(Clone)]
@@ -115,7 +68,7 @@ impl PostgresAccountLeaseRepository {
     }
 }
 
-impl AccountLeaseRepository for PostgresAccountLeaseRepository {
+impl AccountLeaseStore for PostgresAccountLeaseRepository {
     async fn acquire(
         &self,
         account_id: WeReadAccountId,
@@ -285,7 +238,7 @@ fn lease_milliseconds(lease_for: Duration) -> Result<i64, AccountLeaseError> {
 }
 
 fn storage_error(error: impl fmt::Display) -> AccountLeaseError {
-    AccountLeaseError::Storage(error.to_string())
+    AccountLeaseError::Backend(error.to_string())
 }
 
 #[derive(Debug)]
@@ -329,7 +282,7 @@ impl MemoryAccountLeaseRepository {
     }
 }
 
-impl AccountLeaseRepository for MemoryAccountLeaseRepository {
+impl AccountLeaseStore for MemoryAccountLeaseRepository {
     async fn acquire(
         &self,
         account_id: WeReadAccountId,
