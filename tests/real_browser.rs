@@ -84,7 +84,11 @@ async fn fetches_a_real_public_article_without_credentials() {
     assert!(environment.inner_width <= profile.viewport.width);
     assert!(environment.inner_height <= profile.viewport.height);
     if let Some(timezone) = profile.expected_timezone {
-        assert_eq!(environment.timezone, timezone.to_string());
+        let canonical_timezone = session
+            .canonical_timezone(timezone)
+            .await
+            .expect("browser timezone canonicalization should succeed");
+        assert_eq!(environment.timezone, canonical_timezone);
     }
 
     let fetch_timezone = article_fetch_timezone(&profile);
@@ -179,4 +183,36 @@ fn article_fetch_timezone_follows_the_profile_timezone() {
     };
     assert_eq!(article_fetch_timezone(&profile), chrono_tz::UTC);
     assert_eq!(article_fetch_timezone(&BrowserProfile::default()), Shanghai);
+}
+
+#[tokio::test]
+#[ignore = "requires a WebDriver sidecar configured with the requested timezone"]
+async fn browser_canonicalizes_an_iana_timezone_alias() {
+    let endpoint = env::var("WEBDRIVER_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:4444".to_owned())
+        .parse::<Url>()
+        .expect("WEBDRIVER_URL must be a valid URL");
+    let expected_timezone = "US/Pacific"
+        .parse::<chrono_tz::Tz>()
+        .expect("test timezone alias should parse");
+    let profile = BrowserProfile {
+        expected_timezone: Some(expected_timezone),
+        ..BrowserProfile::default()
+    };
+    let factory = WebDriverFactory::new(endpoint, BrowserEngine::Chromium).with_profile(profile);
+    let pool = BrowserPool::new(1).expect("positive browser capacity");
+    let session = tokio::time::timeout(Duration::from_secs(30), factory.open_public(&pool))
+        .await
+        .expect("WebDriver session creation timed out")
+        .expect("sidecar should accept the configured timezone");
+
+    let environment = session
+        .environment()
+        .await
+        .expect("browser environment diagnostic should succeed");
+    let canonical_timezone = session
+        .canonical_timezone(expected_timezone)
+        .await
+        .expect("browser timezone canonicalization should succeed");
+    assert_eq!(environment.timezone, canonical_timezone);
 }

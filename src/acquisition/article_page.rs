@@ -22,10 +22,11 @@
 //! asynchronous browser cleanup on both success and failure, and therefore
 //! releases its pool permit when the operation completes or is cancelled.
 //!
-//! TODO(implementation): add browser-visible timezone verification, richer
-//! extraction fallbacks, and content-specific verification-page classification.
-//! The public navigation, final URL validation, bounded pacing/scroll
-//! execution, and common WeChat selectors are implemented below.
+//! TODO(implementation): add richer extraction fallbacks and content-specific
+//! verification-page classification. Browser-visible timezone validation is
+//! owned by [`super::webdriver`]. The public navigation, final URL validation,
+//! bounded pacing/scroll execution, and common WeChat selectors are implemented
+//! below.
 
 use std::{future::Future, time::Duration};
 

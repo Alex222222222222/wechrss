@@ -19,18 +19,20 @@
 //! exposes only safe navigation, current-URL, source, bounded scrolling, close,
 //! and environment diagnostic operations to sibling acquisition code. It does
 //! not expose cookies, storage, raw protocol commands, or an authenticated
-//! session. The caller must compare the diagnostic's browser-visible IANA
-//! timezone with application configuration; public article pacing and bounded
-//! scroll execution are coordinated by [`super::pacing`].
+//! session. The factory asks the browser's `Intl` implementation to
+//! canonicalize the configured IANA timezone and compares that result with the
+//! browser diagnostic when the profile declares an expected timezone; public
+//! article pacing and bounded scroll execution are coordinated by
+//! [`super::pacing`].
 //! Browser timeouts, sidecar loss, verification pages, and session loss must
 //! map to typed acquisition errors. Browser failures must not prevent API
 //! replicas from serving persisted RSS cache bytes.
 //!
 //! TODO(implementation): add fresh-profile options and browser health checks.
-//! The concrete session lifecycle, profile application, environment diagnostic,
-//! and low-level scroll operation are implemented here; article extraction and
-//! pacing orchestration remain in [`super::article_page`] and
-//! [`super::pacing`].
+//! The concrete session lifecycle, profile application, browser timezone
+//! validation, environment diagnostic, and low-level scroll operation are
+//! implemented here; article extraction and pacing orchestration remain in
+//! [`super::article_page`] and [`super::pacing`].
 
 use crate::config::BrowserEngine;
 use chrono_tz::Tz;
@@ -67,6 +69,16 @@ pub enum WebDriverError {
     /// A command was requested on a pool capability that has no client.
     #[error("browser session is not connected to WebDriver")]
     NotConnected,
+    /// The browser-visible environment did not match the configured profile.
+    #[error("browser environment field {field} mismatch: expected {expected:?}, got {actual:?}")]
+    EnvironmentMismatch {
+        /// Profile field that failed validation.
+        field: &'static str,
+        /// Configured value.
+        expected: String,
+        /// Browser-reported value.
+        actual: String,
+    },
 }
 
 /// Configuration for one private WebDriver sidecar endpoint.
@@ -81,8 +93,9 @@ pub struct WebDriverFactory {
 ///
 /// The values are deliberately explicit so a real-browser diagnostic can
 /// compare the effective User-Agent, viewport, locale, timezone, and browser
-/// arguments as one profile. `expected_timezone` is only an assertion target:
-/// the browser sidecar must still set its own `TZ` and timezone data.
+/// arguments as one profile. If `expected_timezone` is set, session creation
+/// validates the browser-reported timezone; the browser sidecar must still set
+/// its own `TZ` and timezone data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserProfile {
     /// Optional page User-Agent override. `None` preserves the browser default.
@@ -172,9 +185,10 @@ impl WebDriverFactory {
 
     /// Opens a clean public-page browser session using one pool permit.
     ///
-    /// If WebDriver session creation fails, the partially acquired pool
-    /// capability is dropped before the error is returned. No account lease is
-    /// involved in this path.
+    /// If WebDriver session creation or the configured browser-environment
+    /// validation fails, the partially acquired pool capability is dropped
+    /// before the error is returned. No account lease is involved in this
+    /// path.
     pub async fn open_public(
         &self,
         pool: &BrowserPool,
@@ -183,8 +197,44 @@ impl WebDriverFactory {
         let client = connect(self.endpoint.clone(), self.engine, &self.profile)
             .await
             .map_err(WebDriverError::Connect)?;
-        Ok(session.attach_client(client))
+        let mut session = session.attach_client(client);
+        if let Err(error) = self.validate_environment(&session).await {
+            if let Err(cleanup_error) = session.close_client().await {
+                tracing::warn!(
+                    error = %cleanup_error,
+                    "browser cleanup failed after environment validation error"
+                );
+            }
+            return Err(error);
+        }
+        Ok(session)
     }
+
+    async fn validate_environment(
+        &self,
+        session: &PublicBrowserSession,
+    ) -> Result<(), WebDriverError> {
+        let Some(expected_timezone) = self.profile.expected_timezone else {
+            return Ok(());
+        };
+        let environment = session.environment().await?;
+        let canonical_expected_timezone = session.canonical_timezone(expected_timezone).await?;
+        validate_expected_environment(&canonical_expected_timezone, &environment)
+    }
+}
+
+fn validate_expected_environment(
+    expected_timezone: &str,
+    environment: &BrowserEnvironment,
+) -> Result<(), WebDriverError> {
+    if environment.timezone != expected_timezone {
+        return Err(WebDriverError::EnvironmentMismatch {
+            field: "timezone",
+            expected: expected_timezone.to_owned(),
+            actual: environment.timezone.clone(),
+        });
+    }
+    Ok(())
 }
 
 async fn connect(
@@ -438,6 +488,28 @@ impl PublicBrowserSession {
             .map_err(|error| WebDriverError::Command(error.to_string()))
     }
 
+    /// Returns the browser's canonical IANA name for a configured timezone.
+    ///
+    /// This asks the browser's own `Intl` implementation to resolve aliases,
+    /// keeping validation aligned with the ICU timezone database used by the
+    /// sidecar instead of maintaining a second alias table in the service.
+    pub async fn canonical_timezone(&self, timezone: Tz) -> Result<String, WebDriverError> {
+        let result = self
+            .client
+            .as_ref()
+            .ok_or(WebDriverError::NotConnected)?
+            .execute(
+                r#"return new Intl.DateTimeFormat("en-US", { timeZone: arguments[0] })
+                    .resolvedOptions().timeZone;"#,
+                vec![serde_json::json!(timezone.name())],
+            )
+            .await
+            .map_err(|error| WebDriverError::Command(error.to_string()))?;
+        result
+            .convert()
+            .map_err(|error| WebDriverError::Command(error.to_string()))
+    }
+
     pub(crate) async fn close_client(&mut self) -> Result<(), WebDriverError> {
         if let Some(client) = self.client.take() {
             // Keep a shared handle so a timeout or error can disable
@@ -683,6 +755,39 @@ mod tests {
         }
     }
 
+    fn browser_environment(timezone: &str) -> BrowserEnvironment {
+        BrowserEnvironment {
+            user_agent: "test-agent".to_owned(),
+            language: "zh-CN".to_owned(),
+            languages: vec!["zh-CN".to_owned()],
+            timezone: timezone.to_owned(),
+            webdriver: Some(true),
+            inner_width: 1_280,
+            inner_height: 2_000,
+        }
+    }
+
+    #[test]
+    fn expected_timezone_mismatch_is_rejected() {
+        assert!(matches!(
+            validate_expected_environment("UTC", &browser_environment("Asia/Shanghai")),
+            Err(WebDriverError::EnvironmentMismatch {
+                field: "timezone",
+                expected,
+                actual,
+            }) if expected == "UTC" && actual == "Asia/Shanghai"
+        ));
+    }
+
+    #[test]
+    fn canonical_expected_timezone_is_accepted() {
+        assert!(validate_expected_environment(
+            "America/Los_Angeles",
+            &browser_environment("America/Los_Angeles")
+        )
+        .is_ok());
+    }
+
     #[tokio::test]
     async fn an_unconnected_pool_session_cannot_issue_browser_commands() {
         let pool = BrowserPool::new(1).unwrap();
@@ -697,6 +802,10 @@ mod tests {
         ));
         assert!(matches!(
             session.scroll_by(100).await,
+            Err(WebDriverError::NotConnected)
+        ));
+        assert!(matches!(
+            session.canonical_timezone(chrono_tz::UTC).await,
             Err(WebDriverError::NotConnected)
         ));
     }
