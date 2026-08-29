@@ -9,6 +9,10 @@
 //! settle. It must not be represented as an anti-detection or control-bypass
 //! feature. Quiet hours prevent new upstream work during a configured local-
 //! time window while allowing RSS reads and cached responses to continue.
+//!
+//! `PacingPolicy` values are created through [`PacingPolicy::new`]. Their
+//! validated fields are intentionally private so callers cannot mutate a
+//! policy after validation and bypass the scroll-operation safety limits.
 
 use std::time::Duration;
 
@@ -17,6 +21,11 @@ use chrono_tz::Tz;
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
 use thiserror::Error;
+
+/// Maximum number of scroll actions permitted for one page operation.
+pub const MAX_SCROLL_STEPS: u32 = 64;
+/// Maximum cumulative scroll distance permitted for one page operation.
+pub const MAX_SCROLL_PIXELS: u32 = 1_000_000;
 
 /// The operation for which a delay is being sampled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +55,9 @@ pub enum PacingError {
     /// A scroll policy would permit no useful operation.
     #[error("scroll limits must be greater than zero")]
     InvalidScrollLimits,
+    /// A scroll limit could cause an unbounded page operation.
+    #[error("{field} exceeds the supported maximum")]
+    ScrollLimitTooLarge { field: &'static str },
 }
 
 /// Parameters for a bounded normal distribution in milliseconds.
@@ -111,22 +123,26 @@ impl DelayDistribution {
 }
 
 /// Limits and delay distributions shared by all acquisition adapters.
+///
+/// Construct this type with [`PacingPolicy::new`]. Keeping the fields private
+/// makes the constructor's validation an invariant for every controller that
+/// accepts a policy.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PacingPolicy {
     /// Delay before WeRead or other upstream requests.
-    pub request: DelayDistribution,
+    request: DelayDistribution,
     /// Delay before article-page navigation.
-    pub page_navigation: DelayDistribution,
+    page_navigation: DelayDistribution,
     /// Delay between page actions.
-    pub page_action: DelayDistribution,
+    page_action: DelayDistribution,
     /// Delay after a scroll action.
-    pub scroll_settle: DelayDistribution,
+    scroll_settle: DelayDistribution,
     /// Maximum number of scroll actions on one page.
-    pub max_scroll_steps: u32,
+    max_scroll_steps: u32,
     /// Maximum cumulative scroll distance in CSS pixels.
-    pub max_scroll_pixels: u32,
+    max_scroll_pixels: u32,
     /// Maximum time allowed for page interaction and scrolling.
-    pub max_page_operation: Duration,
+    max_page_operation: Duration,
 }
 
 impl PacingPolicy {
@@ -142,6 +158,16 @@ impl PacingPolicy {
     ) -> Result<Self, PacingError> {
         if max_scroll_steps == 0 || max_scroll_pixels == 0 || max_page_operation.is_zero() {
             return Err(PacingError::InvalidScrollLimits);
+        }
+        if max_scroll_steps > MAX_SCROLL_STEPS {
+            return Err(PacingError::ScrollLimitTooLarge {
+                field: "max_scroll_steps",
+            });
+        }
+        if max_scroll_pixels > MAX_SCROLL_PIXELS {
+            return Err(PacingError::ScrollLimitTooLarge {
+                field: "max_scroll_pixels",
+            });
         }
         Ok(Self {
             request,
@@ -162,6 +188,21 @@ impl PacingPolicy {
             DelayKind::PageAction => self.page_action,
             DelayKind::ScrollSettle => self.scroll_settle,
         }
+    }
+
+    /// Returns the maximum number of scroll actions on one page.
+    pub const fn max_scroll_steps(&self) -> u32 {
+        self.max_scroll_steps
+    }
+
+    /// Returns the maximum cumulative scroll distance in CSS pixels.
+    pub const fn max_scroll_pixels(&self) -> u32 {
+        self.max_scroll_pixels
+    }
+
+    /// Returns the maximum time allowed for page interaction and scrolling.
+    pub const fn max_page_operation(&self) -> Duration {
+        self.max_page_operation
     }
 }
 
@@ -277,6 +318,26 @@ mod tests {
             PacingPolicy::new(d, d, d, d, 1, 100, Duration::ZERO),
             Err(PacingError::InvalidScrollLimits)
         );
+        assert_eq!(
+            PacingPolicy::new(
+                d,
+                d,
+                d,
+                d,
+                MAX_SCROLL_STEPS + 1,
+                100,
+                Duration::from_secs(1),
+            ),
+            Err(PacingError::ScrollLimitTooLarge {
+                field: "max_scroll_steps"
+            })
+        );
+        assert_eq!(
+            PacingPolicy::new(d, d, d, d, 1, MAX_SCROLL_PIXELS + 1, Duration::from_secs(1),),
+            Err(PacingError::ScrollLimitTooLarge {
+                field: "max_scroll_pixels"
+            })
+        );
     }
 
     #[test]
@@ -303,6 +364,16 @@ mod tests {
         );
         assert_eq!(policy.distribution(DelayKind::PageAction), page_action);
         assert_eq!(policy.distribution(DelayKind::ScrollSettle), scroll_settle);
+    }
+
+    #[test]
+    fn policy_accessors_expose_only_the_validated_limits() {
+        let d = distribution();
+        let policy = PacingPolicy::new(d, d, d, d, 6, 5_000, Duration::from_secs(30)).unwrap();
+
+        assert_eq!(policy.max_scroll_steps(), 6);
+        assert_eq!(policy.max_scroll_pixels(), 5_000);
+        assert_eq!(policy.max_page_operation(), Duration::from_secs(30));
     }
 
     #[test]

@@ -40,7 +40,8 @@
 //! generated for the process so replicas do not share lease ownership. The
 //! lease must exceed the heartbeat interval plus the maximum page-operation
 //! duration. Pacing delays and page-operation duration are also capped by the
-//! loader before they can be converted to runtime durations.
+//! loader before they can be converted to runtime durations. Scroll action and
+//! pixel limits are bounded before they can reach the browser adapter.
 //!
 //! PostgreSQL SSL mode, CA certificates, client certificates, private keys,
 //! passwords, and other connection options belong in `DATABASE_URL` (including
@@ -67,7 +68,9 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
-use crate::domain::pacing::{DelayDistribution, PacingError, PacingPolicy, QuietHours};
+use crate::domain::pacing::{
+    DelayDistribution, PacingError, PacingPolicy, QuietHours, MAX_SCROLL_PIXELS, MAX_SCROLL_STEPS,
+};
 
 const MAX_CONFIGURED_DELAY_MS: f64 = 300_000.0;
 const MAX_PAGE_OPERATION_SECONDS: u64 = 3_600;
@@ -628,6 +631,16 @@ impl AppConfig {
                 reason: "exceeds the maximum supported page-operation duration",
             });
         }
+        let scroll_max_steps = bounded_positive_u32(
+            raw.scroll_max_steps.unwrap_or(4),
+            "SCROLL_MAX_STEPS",
+            MAX_SCROLL_STEPS,
+        )?;
+        let scroll_max_pixels = bounded_positive_u32(
+            raw.scroll_max_pixels.unwrap_or(4_000),
+            "SCROLL_MAX_PIXELS",
+            MAX_SCROLL_PIXELS,
+        )?;
 
         let required_lease_seconds = job_heartbeat_seconds
             .checked_add(scroll_max_operation_seconds)
@@ -671,8 +684,8 @@ impl AppConfig {
                 raw.pacing_scroll_settle_max_ms,
                 (1_000.0, 200.0, 500.0, 3_000.0),
             )?,
-            raw.scroll_max_steps.unwrap_or(4),
-            raw.scroll_max_pixels.unwrap_or(4_000),
+            scroll_max_steps,
+            scroll_max_pixels,
             Duration::from_secs(scroll_max_operation_seconds),
         )?;
 
@@ -1476,6 +1489,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unbounded_scroll_limits_before_building_the_policy() {
+        for (variable, value) in [
+            ("SCROLL_MAX_STEPS", (MAX_SCROLL_STEPS + 1).to_string()),
+            ("SCROLL_MAX_PIXELS", (MAX_SCROLL_PIXELS + 1).to_string()),
+        ] {
+            let environment = replace_environment(valid_environment(), variable, &value);
+            assert!(matches!(
+                AppConfig::from_env_iter(environment),
+                Err(ConfigError::InvalidValue { variable: actual, .. }) if actual == variable
+            ));
+        }
+    }
+
+    #[test]
     fn requires_complete_admin_credentials_only_when_enabled() {
         let environment = replace_environment(valid_environment(), "ADMIN_ENABLED", "true");
         assert!(matches!(
@@ -1741,9 +1768,15 @@ mod tests {
 
         let config = AppConfig::from_env_iter(environment).unwrap();
         assert_eq!(config.browser_engine, BrowserEngine::Firefox);
-        assert_eq!(config.pacing.max_scroll_steps, 6);
-        assert_eq!(config.pacing.max_scroll_pixels, 5_000);
-        assert_eq!(config.pacing.request.mean_ms, 2_500.0);
+        assert_eq!(config.pacing.max_scroll_steps(), 6);
+        assert_eq!(config.pacing.max_scroll_pixels(), 5_000);
+        assert_eq!(
+            config
+                .pacing
+                .distribution(crate::domain::pacing::DelayKind::Request)
+                .mean_ms,
+            2_500.0
+        );
     }
 
     #[test]

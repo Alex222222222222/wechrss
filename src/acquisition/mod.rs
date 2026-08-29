@@ -17,8 +17,9 @@
 //! sessions use clean ephemeral profiles and accept only verified WeChat URLs.
 //!
 //! The capability ports, process-local browser capacity boundary, concrete
-//! public Thirtyfour navigation, and common article extraction are executable;
-//! fresh-profile lifecycle details, authenticated protocol work, pacing, and
+//! public Thirtyfour navigation, common article extraction, and bounded public
+//! page pacing/scroll execution are executable. Fresh-profile lifecycle
+//! details, authenticated protocol work, authenticated pacing hooks, and
 //! browser sidecar health checks remain TODOs in the child modules.
 
 pub mod article_page;

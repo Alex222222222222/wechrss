@@ -6,11 +6,15 @@
 //! credentials or an authenticated browser capability.
 //!
 //! The concrete adapter navigates in a clean profile, revalidates the final
-//! URL after navigation, and returns normalized metadata plus body HTML. This
-//! first slice does not yet apply the shared pacing/scroll policy. It also does
-//! not sanitize HTML, archive binary assets, persist articles, or render RSS.
-//! Asset archiving remains optional for version one; the normalized page may
-//! retain approved external asset URLs when it is disabled.
+//! URL after navigation, optionally applies the shared pacing/scroll policy,
+//! and returns normalized metadata plus body HTML. Pacing is opt-in on the
+//! constructor so callers can keep unit tests and local diagnostics fast;
+//! production composition should always pass the configured controller. The
+//! controller's page-operation deadline covers waits, navigation, scrolling,
+//! and source capture. This module does not sanitize HTML, archive binary
+//! assets, persist articles, or render RSS. Asset archiving remains optional
+//! for version one; the normalized page may retain approved external asset URLs
+//! when it is disabled.
 //!
 //! Browser and extraction failures are typed at this boundary so application
 //! code can distinguish retryable browser problems from invalid or unavailable
@@ -18,19 +22,24 @@
 //! asynchronous browser cleanup on both success and failure, and therefore
 //! releases its pool permit when the operation completes or is cancelled.
 //!
-//! TODO(implementation): add bounded pacing/scroll actions, browser-visible
-//! timezone verification, richer extraction fallbacks, and content-specific
-//! verification-page classification. The basic public navigation, final URL
-//! validation, and common WeChat selectors are implemented below.
+//! TODO(implementation): add browser-visible timezone verification, richer
+//! extraction fallbacks, and content-specific verification-page classification.
+//! The public navigation, final URL validation, bounded pacing/scroll
+//! execution, and common WeChat selectors are implemented below.
+
+use std::{future::Future, time::Duration};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use scraper::{ElementRef, Html, Selector};
 use thiserror::Error;
 
-use crate::domain::source::VerifiedWechatArticleUrl;
+use crate::domain::{pacing::DelayKind, source::VerifiedWechatArticleUrl};
 
-use super::webdriver::{PublicBrowserSession, WebDriverError};
+use super::{
+    pacing::PacingController,
+    webdriver::{PublicBrowserSession, WebDriverError},
+};
 
 /// Normalized data extracted from one public article page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,19 +75,33 @@ pub enum ArticlePageError {
     /// WeChat returned an environment or CAPTCHA verification page.
     #[error("WeChat requires environment verification before the article can be fetched")]
     VerificationRequired,
+    /// The configured page-operation deadline expired.
+    #[error("article page operation exceeded its configured deadline")]
+    OperationTimedOut,
 }
 
 /// Thirtyfour-backed public article fetcher.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct WebDriverArticlePageFetcher {
     timezone: Tz,
+    pacing: Option<PacingController>,
 }
 
 impl WebDriverArticlePageFetcher {
     /// Creates a fetcher using the configured timezone for local publication
     /// timestamps that are converted to UTC.
     pub const fn new(timezone: Tz) -> Self {
-        Self { timezone }
+        Self {
+            timezone,
+            pacing: None,
+        }
+    }
+
+    /// Adds a shared pacing controller to waits, scrolling, and the page
+    /// operation deadline.
+    pub fn with_pacing(mut self, pacing: PacingController) -> Self {
+        self.pacing = Some(pacing);
+        self
     }
 }
 
@@ -88,7 +111,16 @@ impl ArticlePageFetcher for WebDriverArticlePageFetcher {
         url: VerifiedWechatArticleUrl,
         mut session: PublicBrowserSession,
     ) -> Result<ExtractedArticlePage, ArticlePageError> {
-        let result = self.fetch_without_cleanup(url, &mut session).await;
+        let result = match &self.pacing {
+            Some(pacing) => {
+                within_page_deadline(
+                    pacing.max_page_operation(),
+                    self.fetch_without_cleanup(url, &mut session, Some(pacing)),
+                )
+                .await
+            }
+            None => self.fetch_without_cleanup(url, &mut session, None).await,
+        };
         let cleanup_result = session.close_client().await;
         match (result, cleanup_result) {
             (Ok(page), Ok(())) => Ok(page),
@@ -107,18 +139,48 @@ impl ArticlePageFetcher for WebDriverArticlePageFetcher {
     }
 }
 
+async fn within_page_deadline<T, F>(deadline: Duration, operation: F) -> Result<T, ArticlePageError>
+where
+    F: Future<Output = Result<T, ArticlePageError>>,
+{
+    tokio::time::timeout(deadline, operation)
+        .await
+        .map_err(|_| ArticlePageError::OperationTimedOut)?
+}
+
 impl WebDriverArticlePageFetcher {
     async fn fetch_without_cleanup(
         &self,
         url: VerifiedWechatArticleUrl,
         session: &mut PublicBrowserSession,
+        pacing: Option<&PacingController>,
     ) -> Result<ExtractedArticlePage, ArticlePageError> {
+        if let Some(pacing) = pacing {
+            pacing.wait(DelayKind::PageNavigation).await;
+        }
         session
             .goto(url.as_str())
             .await
             .map_err(map_webdriver_error)?;
         let final_url = session.current_url().await.map_err(map_webdriver_error)?;
         let canonical_url = verify_final_url(final_url)?;
+        if let Some(pacing) = pacing {
+            let viewport_height = session
+                .viewport_height()
+                .await
+                .map_err(map_webdriver_error)?;
+            for step in pacing.scroll_plan(viewport_height).await {
+                pacing.wait(DelayKind::PageAction).await;
+                session
+                    .scroll_by(step.distance)
+                    .await
+                    .map_err(map_webdriver_error)?;
+                if !step.settle.is_zero() {
+                    tokio::time::sleep(step.settle).await;
+                }
+            }
+            pacing.wait(DelayKind::PageAction).await;
+        }
         let html = session.source().await.map_err(map_webdriver_error)?;
         parse_article_html(&html, canonical_url, self.timezone)
     }
@@ -271,11 +333,27 @@ pub trait ArticlePageFetcher: Send + Sync {
 mod tests {
     use super::*;
     use crate::acquisition::browser_pool::BrowserPool;
+    use crate::domain::pacing::{DelayDistribution, PacingPolicy};
 
     fn article_url() -> VerifiedWechatArticleUrl {
         "https://mp.weixin.qq.com/s/example"
             .parse()
             .expect("test URL should be valid")
+    }
+
+    fn zero_delay_pacing() -> PacingController {
+        let zero = DelayDistribution::new(0.0, 0.0, 0.0, 0.0).unwrap();
+        let policy = PacingPolicy::new(
+            zero,
+            zero,
+            zero,
+            zero,
+            2,
+            1_000,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        PacingController::from_seed(policy, 7)
     }
 
     struct FakeFetcher;
@@ -337,6 +415,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paced_fetch_releases_capacity_when_browser_operation_fails() {
+        let pool = BrowserPool::new(1).unwrap();
+        let session = pool.open_public().await.unwrap();
+
+        let result = WebDriverArticlePageFetcher::new(chrono_tz::Asia::Shanghai)
+            .with_pacing(zero_delay_pacing())
+            .fetch(article_url(), session)
+            .await;
+
+        assert!(matches!(result, Err(ArticlePageError::Browser(message))
+            if message.contains("not connected to WebDriver")));
+        let replacement =
+            tokio::time::timeout(std::time::Duration::from_millis(10), pool.open_public())
+                .await
+                .expect("paced fetch should release its pool permit")
+                .unwrap();
+        replacement.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn cancelling_a_fetch_releases_public_session_capacity() {
         let pool = BrowserPool::new(1).unwrap();
         let session = pool.open_public().await.unwrap();
@@ -354,6 +452,17 @@ mod tests {
                 .expect("cancelling the fetch should release the pool permit")
                 .unwrap();
         replacement.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn page_deadline_converts_a_stuck_operation_to_a_typed_error() {
+        let result = within_page_deadline(
+            std::time::Duration::from_millis(1),
+            std::future::pending::<Result<(), ArticlePageError>>(),
+        )
+        .await;
+
+        assert_eq!(result, Err(ArticlePageError::OperationTimedOut));
     }
 
     #[test]

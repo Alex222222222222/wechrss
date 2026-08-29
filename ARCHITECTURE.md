@@ -33,7 +33,8 @@ pure pacing/quiet-hours policy, PostgreSQL pool/migration helpers, the job and
 feed-cache domain/repository slices, their shared transaction boundary, the
 stable account identity plus distributed account-lease slice, the per-source
 feed-build lease slice, atomic due-source scheduling persistence, and the
-unauthenticated Thirtyfour public-page navigation/extraction slice.
+unauthenticated Thirtyfour public-page navigation/extraction and bounded
+pacing/scroll slice.
 
 The current and target contracts must not be confused:
 
@@ -43,7 +44,7 @@ The current and target contracts must not be confused:
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, and PostgreSQL-clocked SQLx job operations | Remove caller `now` parameters only in a later queue-port contract release |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | Runtime composition must consume the parsed role and policy values before deployment relies on them |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
-| Acquisition/web/RSS | A validated public WeChat article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction, and pure RSS renderer | Authenticated protocol adapter, pacing/scroll integration, application handlers, and feed-token routing remain future work |
+| Acquisition/web/RSS | A validated public WeChat article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll, and pure RSS renderer | Authenticated protocol adapter, application handlers, and feed-token routing remain future work |
 
 Environment variables in this document are parsed into `AppConfig`, but the
 binary is still a no-op and does not construct role-specific runtime
@@ -436,7 +437,10 @@ anti-detection mechanism.
 Scrolling is a small configurable sequence of bounded viewport increments with
 settling waits. Its purpose is to trigger legitimate lazy-loaded article
 content, not to simulate arbitrary human input. The policy must cap total
-scroll distance, action count, and page duration.
+scroll distance, action count, and page duration. Version one caps
+`SCROLL_MAX_STEPS` at 64 actions and `SCROLL_MAX_PIXELS` at 1,000,000 CSS
+pixels before the policy reaches the browser adapter, preventing malformed
+environment values from causing an unbounded allocation or page operation.
 
 Quiet hours use an IANA timezone and a local start/end time, for example:
 
@@ -598,16 +602,17 @@ The concrete capability contract is:
 The executable acquisition boundary currently includes `BrowserPool`, a
 Tokio-semaphore process-local capacity limit, the storage-neutral
 `AccountLeaseStore` port, `AccountLeaseGuard`, the two non-cloneable session
-capabilities, `WebDriverFactory`, and the public article fetcher. A public
-session has no account or credential state; an authenticated request
-capability is created only after a durable account heartbeat. A failed
-heartbeat permanently cancels the capability. The public adapter creates a
-Thirtyfour session, applies the configured browser profile, navigates to the
-verified URL, rejects an unsafe final URL, and parses common rendered WeChat
-metadata/body selectors. Browser health and pacing/scroll execution remain
-behind TODOs. The adapter exposes an environment diagnostic, and the optional
-sidecar test verifies the configured timezone and other measurable profile
-values.
+capabilities, `WebDriverFactory`, the public article fetcher, and its
+`PacingController`. A public session has no account or credential state; an
+authenticated request capability is created only after a durable account
+heartbeat. A failed heartbeat permanently cancels the capability. The public
+adapter creates a Thirtyfour session, applies the configured browser profile,
+navigates to the verified URL, rejects an unsafe final URL, executes bounded
+navigation/action/settling waits and downward scrolls, and parses common
+rendered WeChat metadata/body selectors. Browser health and browser-visible
+timezone enforcement remain behind TODOs. The adapter exposes an environment
+diagnostic, and the optional sidecar test verifies the configured timezone and
+other measurable profile values.
 Environment/CAPTCHA verification pages are returned as a distinct terminal
 acquisition result; the service must not attempt to bypass them. The complete
 browser-session environment is part of the upstream risk-control input: the
@@ -891,10 +896,12 @@ than add more empty module shells. Work proceeds in this order:
    remaining source/archive queries and database-only rebuild orchestration.
 4. Build role-aware runtime composition, scheduler/worker loops, heartbeat
    cancellation, and degraded browser health behavior.
-5. Complete the acquisition slice with fresh-profile creation, pacing/scroll
-   execution, and browser-side timezone checks behind the now-executable
-   verified-URL, Thirtyfour, and browser-capability ports. Public navigation,
-   redirect rejection, and common article extraction are already executable.
+5. Complete the acquisition slice with fresh-profile creation and
+   browser-side timezone checks behind the now-executable verified-URL,
+   Thirtyfour, browser-capability, and public pacing/scroll ports. Public
+   navigation, redirect rejection, common article extraction, and bounded
+   public-page pacing/scroll execution are already executable. Authenticated
+   protocol pacing hooks remain part of the WeRead adapter work.
 6. Implement synchronization, RSS publication, and HTTP/UI boundaries, followed
    by multi-replica fencing, DST, redirect-isolation, cache-stampede, and
    end-to-end tests.
@@ -963,9 +970,10 @@ The remaining tree intentionally contains no route handlers, source
 configuration/feed-token orchestration, scheduler loops, credential
 persistence, or business implementation. Credential and archive modules remain
 documentation-only. Acquisition now contains executable capability/session
-ports, local capacity/lease ownership, public WebDriver navigation, and common
-article extraction; authenticated protocol work, pacing/scroll integration,
-and browser health remain future work. `SourceService` implements source
+ports, local capacity/lease ownership, public WebDriver navigation, common
+article extraction, and bounded public-page pacing/scroll execution;
+authenticated protocol work, authenticated pacing hooks, and browser health
+remain future work. `SourceService` implements source
 create/read, operator enable/gate changes, and the initial-job slice described
 above, while article and sync-run persistence and `FeedService` implement only
 the database/cache boundaries described above.

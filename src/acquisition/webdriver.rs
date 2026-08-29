@@ -16,21 +16,21 @@
 //! `release()` so the durable account lease is removed promptly.
 //!
 //! The concrete public adapter now connects a fresh WebDriver session and
-//! exposes only safe navigation, current-URL, source, close, and environment
-//! diagnostic operations to sibling acquisition code. It does not expose
-//! cookies, storage, raw protocol commands, or an authenticated session. The
-//! caller must compare the diagnostic's browser-visible IANA timezone with
-//! application configuration; a later slice must use the shared pacing policy
-//! for waits and bounded scrolls, and inspect/revalidate every post-navigation
-//! URL before extraction.
+//! exposes only safe navigation, current-URL, source, bounded scrolling, close,
+//! and environment diagnostic operations to sibling acquisition code. It does
+//! not expose cookies, storage, raw protocol commands, or an authenticated
+//! session. The caller must compare the diagnostic's browser-visible IANA
+//! timezone with application configuration; public article pacing and bounded
+//! scroll execution are coordinated by [`super::pacing`].
 //! Browser timeouts, sidecar loss, verification pages, and session loss must
 //! map to typed acquisition errors. Browser failures must not prevent API
 //! replicas from serving persisted RSS cache bytes.
 //!
-//! TODO(implementation): add fresh-profile options, browser health checks, and
-//! pacing/scroll orchestration. The concrete session lifecycle, profile
-//! application, and browser-environment diagnostic are implemented here;
-//! article extraction remains in [`super::article_page`].
+//! TODO(implementation): add fresh-profile options and browser health checks.
+//! The concrete session lifecycle, profile application, environment diagnostic,
+//! and low-level scroll operation are implemented here; article extraction and
+//! pacing orchestration remain in [`super::article_page`] and
+//! [`super::pacing`].
 
 use crate::config::BrowserEngine;
 use chrono_tz::Tz;
@@ -50,6 +50,7 @@ use super::browser_pool::{
 
 const WEBDRIVER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const WEBDRIVER_PAGE_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const WEBDRIVER_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Errors raised while creating or operating a WebDriver session.
 #[derive(Debug, Error)]
@@ -380,6 +381,37 @@ impl PublicBrowserSession {
             .map_err(|error| WebDriverError::Command(error.to_string()))
     }
 
+    /// Returns the current CSS viewport height for bounded scroll planning.
+    pub(crate) async fn viewport_height(&self) -> Result<u32, WebDriverError> {
+        let result = self
+            .client
+            .as_ref()
+            .ok_or(WebDriverError::NotConnected)?
+            .execute(
+                "return Math.max(1, Math.floor(window.innerHeight || 1));",
+                Vec::new(),
+            )
+            .await
+            .map_err(|error| WebDriverError::Command(error.to_string()))?;
+        result
+            .convert()
+            .map_err(|error| WebDriverError::Command(error.to_string()))
+    }
+
+    /// Scrolls down by a bounded number of CSS pixels.
+    pub(crate) async fn scroll_by(&self, distance: u32) -> Result<(), WebDriverError> {
+        self.client
+            .as_ref()
+            .ok_or(WebDriverError::NotConnected)?
+            .execute(
+                "window.scrollBy(0, arguments[0]);",
+                vec![serde_json::json!(distance)],
+            )
+            .await
+            .map_err(|error| WebDriverError::Command(error.to_string()))?;
+        Ok(())
+    }
+
     /// Captures browser-visible profile values for diagnostics and health
     /// checks. It does not attempt to hide automation signals.
     pub async fn environment(&self) -> Result<BrowserEnvironment, WebDriverError> {
@@ -408,10 +440,31 @@ impl PublicBrowserSession {
 
     pub(crate) async fn close_client(&mut self) -> Result<(), WebDriverError> {
         if let Some(client) = self.client.take() {
-            client
-                .quit()
-                .await
-                .map_err(|error| WebDriverError::Command(error.to_string()))?;
+            // Keep a shared handle so a timeout or error can disable
+            // Thirtyfour's synchronous Drop fallback before the owned client
+            // is released. The cleanup task is detached on timeout and may
+            // finish the remote DELETE independently of the request path.
+            let abandon_guard = client.clone();
+            let cleanup = tokio::spawn(async move { client.quit().await });
+            match tokio::time::timeout(WEBDRIVER_CLEANUP_TIMEOUT, cleanup).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    let _ = abandon_guard.leak();
+                    return Err(WebDriverError::Command(error.to_string()));
+                }
+                Ok(Err(error)) => {
+                    let _ = abandon_guard.leak();
+                    return Err(WebDriverError::Command(format!(
+                        "browser cleanup task failed: {error}"
+                    )));
+                }
+                Err(_) => {
+                    let _ = abandon_guard.leak();
+                    return Err(WebDriverError::Command(
+                        "browser cleanup timed out".to_owned(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -636,6 +689,14 @@ mod tests {
         let session = pool.open_public().await.unwrap();
         assert!(matches!(
             session.current_url().await,
+            Err(WebDriverError::NotConnected)
+        ));
+        assert!(matches!(
+            session.viewport_height().await,
+            Err(WebDriverError::NotConnected)
+        ));
+        assert!(matches!(
+            session.scroll_by(100).await,
             Err(WebDriverError::NotConnected)
         ));
     }

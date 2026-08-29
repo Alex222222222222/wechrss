@@ -21,8 +21,9 @@
 //!
 //! Non-responsibilities: WebDriver commands, navigation, article parsing,
 //! source scheduling, credential persistence, or RSS caching. Browser-side
-//! timezone enforcement, health checks, pacing, and scroll orchestration are
-//! TODOs in [`super::webdriver`].
+//! timezone enforcement and health checks remain TODOs in
+//! [`super::webdriver`]; pacing and scroll orchestration belong to
+//! [`super::pacing`] and [`super::article_page`].
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},

@@ -7,17 +7,39 @@ use chrono::Utc;
 use uuid::Uuid;
 use wechrss::{
     acquisition::{
-        article_page::{ArticlePageError, ArticlePageFetcher, ExtractedArticlePage},
+        article_page::{
+            ArticlePageError, ArticlePageFetcher, ExtractedArticlePage, WebDriverArticlePageFetcher,
+        },
         browser_pool::{AccountLeaseError, AccountLeaseStore, BrowserPool},
+        pacing::PacingController,
         webdriver::{AuthenticatedRequest, PublicBrowserSession},
         weread::{WeReadAdapter, WeReadAdapterError, WeReadArticleReference},
     },
-    domain::{credentials::WeReadAccountId, source::VerifiedWechatArticleUrl},
+    domain::{
+        credentials::WeReadAccountId,
+        pacing::{DelayDistribution, PacingPolicy},
+        source::VerifiedWechatArticleUrl,
+    },
     persistence::repositories::account_lease_repository::MemoryAccountLeaseRepository,
 };
 
 fn account_id() -> WeReadAccountId {
     WeReadAccountId::from_uuid(Uuid::from_u128(1))
+}
+
+fn zero_delay_pacing() -> PacingController {
+    let zero = DelayDistribution::new(0.0, 0.0, 0.0, 0.0).expect("zero delay is valid");
+    let policy = PacingPolicy::new(
+        zero,
+        zero,
+        zero,
+        zero,
+        2,
+        1_000,
+        std::time::Duration::from_secs(1),
+    )
+    .expect("test pacing policy should be valid");
+    PacingController::from_seed(policy, 7)
 }
 
 struct PublicFetcher;
@@ -78,6 +100,35 @@ async fn public_article_fetching_uses_no_account_lease() {
 
     assert_eq!(page.canonical_url, url);
     assert_eq!(page.title, "Public article");
+}
+
+#[tokio::test]
+async fn paced_public_fetch_releases_capacity_after_a_browser_failure() {
+    let pool = BrowserPool::new(1).expect("positive browser capacity");
+    let session = pool
+        .open_public()
+        .await
+        .expect("public session should be available");
+    let url = "https://mp.weixin.qq.com/s/public-article"
+        .parse::<VerifiedWechatArticleUrl>()
+        .expect("test URL should be valid");
+
+    let result = WebDriverArticlePageFetcher::new(chrono_tz::Asia::Shanghai)
+        .with_pacing(zero_delay_pacing())
+        .fetch(url, session)
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(ArticlePageError::Browser(message))
+            if message.contains("not connected to WebDriver")
+    ));
+    let replacement =
+        tokio::time::timeout(std::time::Duration::from_millis(10), pool.open_public())
+            .await
+            .expect("failed paced fetch should release capacity")
+            .expect("replacement public session should be available");
+    replacement.close().await.expect("close should be a no-op");
 }
 
 #[tokio::test]

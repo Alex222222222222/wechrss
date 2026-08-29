@@ -2,9 +2,10 @@
 //!
 //! This test is ignored by default because it needs a reachable WebDriver
 //! sidecar and upstream network access. It deliberately uses the public
-//! article fetcher, never creates an account lease, and does not assert on
-//! mutable article text. Run it manually after forwarding a development
-//! WebDriver service:
+//! article fetcher, never creates an account lease, and exercises bounded
+//! pacing/scrolling before extraction. It does not assert on mutable article
+//! text beyond the known fixture title. Run it manually after forwarding a
+//! development WebDriver service:
 //!
 //! ```text
 //! WEBDRIVER_URL=http://127.0.0.1:4444 \
@@ -19,10 +20,14 @@ use wechrss::{
     acquisition::{
         article_page::{ArticlePageFetcher, WebDriverArticlePageFetcher},
         browser_pool::BrowserPool,
+        pacing::PacingController,
         webdriver::{BrowserProfile, BrowserViewport, WebDriverFactory},
     },
     config::BrowserEngine,
-    domain::source::VerifiedWechatArticleUrl,
+    domain::{
+        pacing::{DelayDistribution, PacingPolicy},
+        source::VerifiedWechatArticleUrl,
+    },
 };
 
 const PUBLIC_ARTICLE_URL: &str = "https://mp.weixin.qq.com/s/5CqpNShrLGIM93XoJD7s5g";
@@ -83,9 +88,12 @@ async fn fetches_a_real_public_article_without_credentials() {
     }
 
     let fetch_timezone = article_fetch_timezone(&profile);
+    let pacing = PacingController::from_seed(real_browser_pacing_policy(), 42);
     let fetch_result = tokio::time::timeout(
         Duration::from_secs(90),
-        WebDriverArticlePageFetcher::new(fetch_timezone).fetch(url, session),
+        WebDriverArticlePageFetcher::new(fetch_timezone)
+            .with_pacing(pacing)
+            .fetch(url, session),
     )
     .await
     .expect("public article navigation timed out");
@@ -103,6 +111,23 @@ async fn fetches_a_real_public_article_without_credentials() {
         }
         Err(error) => panic!("public article fetch failed unexpectedly: {error}"),
     }
+}
+
+fn real_browser_pacing_policy() -> PacingPolicy {
+    let delay = |milliseconds| {
+        DelayDistribution::new(milliseconds, 0.0, milliseconds, milliseconds)
+            .expect("fixed integration-test delay should be valid")
+    };
+    PacingPolicy::new(
+        delay(5.0),
+        delay(5.0),
+        delay(5.0),
+        delay(5.0),
+        4,
+        4_000,
+        Duration::from_secs(30),
+    )
+    .expect("integration-test pacing policy should be valid")
 }
 
 fn article_fetch_timezone(profile: &BrowserProfile) -> chrono_tz::Tz {
