@@ -28,7 +28,7 @@ wired to a feed-token lookup or HTTP route.
 
 This document describes the target version-one architecture, not the behavior
 of a deployable server. The binary is currently a no-op. The executable
-foundations are typed environment parsing for the original configuration set,
+foundations are typed environment parsing for the target configuration set,
 pure pacing/quiet-hours policy, PostgreSQL pool/migration helpers, the job and
 feed-cache domain/repository slices, their shared transaction boundary, the
 stable account identity plus distributed account-lease slice, the per-source
@@ -40,18 +40,16 @@ The current and target contracts must not be confused:
 | --- | --- | --- |
 | Runtime | No server, routes, scheduler, worker, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, and PostgreSQL-clocked SQLx job operations | Remove caller `now` parameters only in a later queue-port contract release |
-| Configuration | Original `AppConfig`, including legacy archive settings | Planned role, account-lease, cooldown, stale-cache, safe-admin, and optional-asset settings must be implemented and tested before deployment uses them |
+| Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | Runtime composition must consume the parsed role and policy values before deployment relies on them |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Source-service lifecycle orchestration, credential records, and remaining transaction-scoped views are design-only |
 | Acquisition/web/RSS | A validated public WeChat article URL value object and pure RSS renderer | Browser capabilities, application/repository ports, and concrete adapters or handlers remain future work |
 
-Planned environment variables in this document are not parsed or effective
-runtime configuration merely because they are documented. Until the
-configuration gate is implemented, deployment examples must label them as
-planned and must not assume that setting them changes behavior. The future
-loader must have an
-explicit allowlist for application-owned names and reject unknown names within
-that allowlist or prefix so misspellings cannot be silently ignored, while
-ordinary container variables such as `PATH` remain permitted.
+Environment variables in this document are parsed into `AppConfig`, but the
+binary is still a no-op and does not construct role-specific runtime
+components. The loader has an explicit allowlist for application-owned names
+and rejects unknown names within those prefixes so misspellings cannot be
+silently ignored, while ordinary container variables such as `PATH` remain
+permitted.
 
 Application-owned prefixes are `APP_`, `HTTP_`, `WORKER_`, `JOB_`, `ACCOUNT_`,
 `SOURCE_`, `RSS_`, `FEED_`, `PACING_`, `SCROLL_`, `ASSET_`, `ADMIN_`, `SESSION_`,
@@ -631,14 +629,14 @@ reserved for the remaining modules.
 
 ## Target version-one configuration
 
-Once the configuration implementation gate is complete, configuration is loaded
-intentionally only from environment variables in the first version. There is no
-application configuration file and no command-line override layer. Kubernetes
-ConfigMaps and Secrets may inject environment variables, but the Rust process
-consumes them through its environment. The implementation-status table above
-identifies which settings the current parser does not yet accept.
+Configuration is loaded only from environment variables in the first version.
+There is no application configuration file and no command-line override layer.
+Kubernetes ConfigMaps and Secrets may inject environment variables, but the Rust
+process consumes them through its environment. The implementation-status table
+above distinguishes settings that are parsed from settings whose runtime
+components are not yet composed.
 
-The typed configuration loader should group and validate variables in these
+The typed configuration loader groups and validates variables in these
 categories:
 
 ```text
@@ -656,21 +654,27 @@ RSS_CACHE_TTL_SECONDS / RSS_STALE_WHILE_REVALIDATE_SECONDS /
 RSS_CACHE_MISS_WAIT_MS
 FEED_BUILD_LEASE_SECONDS / FEED_BUILD_HEARTBEAT_SECONDS
 PACING_* / SCROLL_*
-ASSET_ARCHIVE_BACKEND / ASSET_ARCHIVE_LOCAL_PATH / object-storage settings
+ASSET_ARCHIVE_BACKEND / ASSET_ARCHIVE_LOCAL_PATH /
+ASSET_ARCHIVE_S3_ENDPOINT / ASSET_ARCHIVE_S3_BUCKET /
+ASSET_ARCHIVE_S3_REGION / ASSET_ARCHIVE_S3_ACCESS_KEY /
+ASSET_ARCHIVE_S3_SECRET_KEY
 ADMIN_ENABLED / ADMIN_PASSWORD / SESSION_SIGNING_KEY /
 CREDENTIAL_ENCRYPTION_KEY
 ```
 
-`APP_TIMEZONE` is an IANA timezone name and defaults only when a safe default
-is explicitly documented. `APP_INSTANCE_ID` may be omitted for local use; the
-loader then generates a random per-process UUID so application replicas do not
-share job-lease ownership. Required secrets and connection strings must fail
-startup when absent or invalid. `JOB_LEASE_SECONDS` must exceed the heartbeat
-interval plus the maximum page-operation duration. Pacing and page-operation
-values have practical upper bounds before conversion to runtime durations.
-Diagnostics expose names and validation errors, never secret values.
-Environment parsing should use typed deserialization (for example, the `envy`
-dependency) followed by domain validation.
+`APP_TIMEZONE` is an IANA timezone name and defaults to `UTC`. `APP_INSTANCE_ID`
+may be omitted for local use; the loader then generates a random per-process
+UUID so application replicas do not share job-lease ownership. `APP_ROLES`
+defaults to `all`, `WORKER_CONCURRENCY` defaults to `1`, and account/feed-build
+leases default to 600 seconds with 60-second heartbeats. The source failure
+cooldown defaults to 300 seconds, RSS stale-while-revalidate defaults to 60
+seconds, and a cache miss wait defaults to 5 seconds. Required secrets and
+connection strings fail startup when absent or invalid. `JOB_LEASE_SECONDS`
+must exceed the heartbeat interval plus the maximum page-operation duration.
+Pacing, worker concurrency, cooldown, stale-cache, and cache-miss values have
+practical upper bounds before conversion to runtime durations. Diagnostics
+expose names and validation failures, never secret values. Environment parsing
+uses typed deserialization followed by domain validation.
 
 `APP_ROLES` is a validated set containing `api`, `scheduler`, and/or `worker`;
 `all` expands to all three. Worker concurrency is configured independently from
@@ -678,9 +682,10 @@ API replica count. `ASSET_ARCHIVE_BACKEND` is the enum `disabled | local | s3`
 and defaults to `disabled`; local paths or object-store credentials are
 validated only for the selected enabled backend.
 
-Feed-build lease duration exceeds its heartbeat interval plus the maximum
-configured RSS render duration. `RSS_CACHE_MISS_WAIT_MS` is a short bounded wait
-and never approaches browser or source-sync timeouts.
+The current loader requires a feed-build lease to exceed its heartbeat
+interval. Once RSS rendering exposes a configurable maximum render duration,
+the same validation must include that duration. `RSS_CACHE_MISS_WAIT_MS` is a
+short bounded wait and never approaches browser or source-sync timeouts.
 
 `ADMIN_ENABLED` defaults to false. When true, both `ADMIN_PASSWORD` and an
 independent `SESSION_SIGNING_KEY` are required and startup fails if either is
@@ -738,17 +743,13 @@ Real WeChat access must not be required in CI.
 The next implementation changes must make existing contracts executable rather
 than add more empty module shells. Work proceeds in this order:
 
-1. Freeze domain error/state contracts and implement the configuration target,
-   including safe admin defaults, disabled-by-default asset storage, runtime
-   roles, lease/cooldown settings, and tests that reject misspelled
-   application-owned variables.
-2. Complete the job queue slice with the eventual queue/outcome/recovery
+1. Complete the job queue slice with the eventual queue/outcome/recovery
    ports. The repository now supports allowed-kind claiming, while the initial
    `0001_jobs.sql` migration already adds `deferred`, separate claim/failure
    counters, and PostgreSQL-authoritative lease time. Use an expand/contract
    rollout for later schema changes so mixed replica versions remain safe;
    upgrade and concurrency tests are a gate.
-3. Extend the shared `UnitOfWork` with transaction-scoped repository ports and
+2. Extend the shared `UnitOfWork` with transaction-scoped repository ports and
    complete the source service and credential repositories plus their
    transaction-scoped views. Source identity/create/read,
    normalized article persistence,
@@ -757,14 +758,14 @@ than add more empty module shells. Work proceeds in this order:
    revision-aware feed-cache publication view, account lease, and feed-build
    lease repositories are also executable. No source or feed application
    service may bypass these boundaries with convenience transactions.
-4. Make `FeedService` executable over the persisted cache (cache-first
+3. Make `FeedService` executable over the persisted cache (cache-first
    delivery and deduplicated rebuild enqueueing are implemented), then add the
    remaining source/archive queries and database-only rebuild orchestration.
-5. Build role-aware runtime composition, scheduler/worker loops, heartbeat
+4. Build role-aware runtime composition, scheduler/worker loops, heartbeat
    cancellation, and degraded browser health behavior.
-6. Implement verified URL and browser capability types before Fantoccini
+5. Implement verified URL and browser capability types before Fantoccini
    navigation or authenticated WeRead behavior.
-7. Implement synchronization, RSS publication, and HTTP/UI boundaries, followed
+6. Implement synchronization, RSS publication, and HTTP/UI boundaries, followed
    by multi-replica fencing, DST, redirect-isolation, cache-stampede, and
    end-to-end tests.
 
@@ -774,8 +775,8 @@ PostgreSQL integration tests green before the next phase begins.
 ## Current implementation scope
 
 The implemented foundation includes the pure pacing and quiet-hours policy in
-`src/domain/pacing.rs`, the environment-only typed configuration loader in
-`src/config.rs`, SQLx PostgreSQL pool/migration helpers in
+`src/domain/pacing.rs`, the environment-only typed target-configuration loader
+in `src/config.rs`, SQLx PostgreSQL pool/migration helpers in
 `src/persistence/postgres.rs`, and the domain plus PostgreSQL/in-memory job
 repositories in `src/domain/job.rs` and
 `src/persistence/repositories/job_repository.rs`. The job repository supports

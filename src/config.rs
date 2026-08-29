@@ -5,9 +5,10 @@
 //! no application configuration file and no command-line override layer.
 //!
 //! The raw environment representation is private. Callers receive a validated
-//! [`AppConfig`] containing parsed URLs, durations, browser settings, pacing,
-//! quiet hours, and secret wrappers. Required connection and encryption values
-//! fail startup; optional operational values have documented defaults.
+//! [`AppConfig`] containing parsed URLs, durations, role settings, browser
+//! settings, pacing, quiet hours, asset-storage policy, and secret wrappers.
+//! Required connection and encryption values fail startup; optional operational
+//! values have documented defaults.
 //!
 //! Environment names are grouped by concern:
 //!
@@ -25,7 +26,10 @@
 //! RSS_CACHE_MISS_WAIT_MS
 //! FEED_BUILD_LEASE_SECONDS / FEED_BUILD_HEARTBEAT_SECONDS
 //! PACING_* / SCROLL_*
-//! ASSET_ARCHIVE_BACKEND / ASSET_ARCHIVE_LOCAL_PATH
+//! ASSET_ARCHIVE_BACKEND / ASSET_ARCHIVE_LOCAL_PATH /
+//! ASSET_ARCHIVE_S3_ENDPOINT / ASSET_ARCHIVE_S3_BUCKET /
+//! ASSET_ARCHIVE_S3_REGION / ASSET_ARCHIVE_S3_ACCESS_KEY /
+//! ASSET_ARCHIVE_S3_SECRET_KEY
 //! ADMIN_ENABLED / ADMIN_PASSWORD / SESSION_SIGNING_KEY /
 //! CREDENTIAL_ENCRYPTION_KEY
 //! ```
@@ -45,17 +49,11 @@
 //! application still consumes them through its environment. Diagnostics must
 //! expose variable names and validation failures, never secret contents.
 //!
-//! Implementation status: the current `RawConfig` still parses the original
-//! field set, including `ARCHIVE_BACKEND` and `ARCHIVE_LOCAL_PATH`. The role,
-//! worker-concurrency, account-lease, failure-cooldown, stale-cache,
-//! `ADMIN_ENABLED`, session-signing, and `ASSET_ARCHIVE_*` names above are the
-//! target contract and are not parsed or effective yet. Deployment must not
-//! rely on them until the configuration TODOs are implemented. The future
-//! loader must detect misspelled application-owned names without rejecting
-//! unrelated process variables supplied by the container runtime. It does this
-//! by filtering and validating the owned prefixes documented in
-//! `ARCHITECTURE.md`, not by applying Serde `deny_unknown_fields` to every
-//! process variable.
+//! Unknown settings under the documented application-owned prefixes are
+//! rejected, while unrelated process variables remain ignored. The two legacy
+//! `ARCHIVE_*` names are rejected with a migration hint instead of being
+//! silently ignored. This keeps a misspelled deployment from appearing to
+//! start with a different policy than the operator configured.
 
 use std::{env, str::FromStr, time::Duration};
 
@@ -71,6 +69,197 @@ use crate::domain::pacing::{DelayDistribution, PacingError, PacingPolicy, QuietH
 
 const MAX_CONFIGURED_DELAY_MS: f64 = 300_000.0;
 const MAX_PAGE_OPERATION_SECONDS: u64 = 3_600;
+const MAX_WORKER_CONCURRENCY: u32 = 1_024;
+const MAX_SOURCE_FAILURE_COOLDOWN_SECONDS: u64 = 7 * 24 * 60 * 60;
+const MAX_STALE_WHILE_REVALIDATE_SECONDS: u64 = 24 * 60 * 60;
+const MAX_CACHE_MISS_WAIT_MS: u64 = 60_000;
+
+const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
+    "DATABASE_URL",
+    "DATABASE_POOL_MIN_CONNECTIONS",
+    "DATABASE_POOL_MAX_CONNECTIONS",
+    "WEBDRIVER_URL",
+    "BROWSER_ENGINE",
+    "WORKER_CONCURRENCY",
+    "APP_INSTANCE_ID",
+    "HTTP_BIND",
+    "HTTP_PORT",
+    "APP_ROLES",
+    "APP_TIMEZONE",
+    "QUIET_HOURS_START",
+    "QUIET_HOURS_END",
+    "JOB_POLL_SECONDS",
+    "JOB_LEASE_SECONDS",
+    "JOB_HEARTBEAT_SECONDS",
+    "JOB_MAX_ATTEMPTS",
+    "ACCOUNT_LEASE_SECONDS",
+    "ACCOUNT_HEARTBEAT_SECONDS",
+    "SOURCE_FAILURE_COOLDOWN_SECONDS",
+    "RSS_CACHE_TTL_SECONDS",
+    "RSS_STALE_WHILE_REVALIDATE_SECONDS",
+    "RSS_CACHE_MISS_WAIT_MS",
+    "FEED_BUILD_LEASE_SECONDS",
+    "FEED_BUILD_HEARTBEAT_SECONDS",
+    "PACING_REQUEST_MEAN_MS",
+    "PACING_REQUEST_STDDEV_MS",
+    "PACING_REQUEST_MIN_MS",
+    "PACING_REQUEST_MAX_MS",
+    "PACING_PAGE_NAVIGATION_MEAN_MS",
+    "PACING_PAGE_NAVIGATION_STDDEV_MS",
+    "PACING_PAGE_NAVIGATION_MIN_MS",
+    "PACING_PAGE_NAVIGATION_MAX_MS",
+    "PACING_PAGE_ACTION_MEAN_MS",
+    "PACING_PAGE_ACTION_STDDEV_MS",
+    "PACING_PAGE_ACTION_MIN_MS",
+    "PACING_PAGE_ACTION_MAX_MS",
+    "PACING_SCROLL_SETTLE_MEAN_MS",
+    "PACING_SCROLL_SETTLE_STDDEV_MS",
+    "PACING_SCROLL_SETTLE_MIN_MS",
+    "PACING_SCROLL_SETTLE_MAX_MS",
+    "SCROLL_MAX_STEPS",
+    "SCROLL_MAX_PIXELS",
+    "SCROLL_MAX_OPERATION_SECONDS",
+    "ASSET_ARCHIVE_BACKEND",
+    "ASSET_ARCHIVE_LOCAL_PATH",
+    "ASSET_ARCHIVE_S3_ENDPOINT",
+    "ASSET_ARCHIVE_S3_BUCKET",
+    "ASSET_ARCHIVE_S3_REGION",
+    "ASSET_ARCHIVE_S3_ACCESS_KEY",
+    "ASSET_ARCHIVE_S3_SECRET_KEY",
+    "ADMIN_ENABLED",
+    "ADMIN_PASSWORD",
+    "SESSION_SIGNING_KEY",
+    "CREDENTIAL_ENCRYPTION_KEY",
+];
+
+const APPLICATION_ENVIRONMENT_PREFIXES: &[&str] = &[
+    "APP_",
+    "HTTP_",
+    "WORKER_",
+    "JOB_",
+    "ACCOUNT_",
+    "SOURCE_",
+    "RSS_",
+    "FEED_",
+    "PACING_",
+    "SCROLL_",
+    "ASSET_",
+    "ADMIN_",
+    "SESSION_",
+    "CREDENTIAL_",
+    "QUIET_",
+    "WEBDRIVER_",
+    "BROWSER_",
+    "DATABASE_POOL_",
+];
+
+const LEGACY_ENVIRONMENT_VARIABLES: &[&str] = &["ARCHIVE_BACKEND", "ARCHIVE_LOCAL_PATH"];
+const IGNORED_RUNTIME_ENVIRONMENT_VARIABLES: &[&str] = &["HTTP_PROXY"];
+
+/// A component that may be enabled in one process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AppRole {
+    /// Serve feed, health, and optionally administrative HTTP routes.
+    Api,
+    /// Enqueue due source work and recover abandoned jobs.
+    Scheduler,
+    /// Claim and execute browser-backed or database-only jobs.
+    Worker,
+}
+
+/// Validated set of process roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppRoles(u8);
+
+impl AppRoles {
+    const API: u8 = 0b001;
+    const SCHEDULER: u8 = 0b010;
+    const WORKER: u8 = 0b100;
+
+    /// Returns the role set containing every component.
+    pub const fn all() -> Self {
+        Self(Self::API | Self::SCHEDULER | Self::WORKER)
+    }
+
+    /// Parses `all` or a comma-separated role set.
+    pub fn parse(value: &str) -> Result<Self, ConfigError> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                variable: "APP_ROLES",
+                reason: "must contain api, scheduler, worker, or all",
+            });
+        }
+        if value.eq_ignore_ascii_case("all") {
+            return Ok(Self::all());
+        }
+
+        let mut bits = 0;
+        for role in value.split(',') {
+            match role.trim().to_ascii_lowercase().as_str() {
+                "api" => bits |= Self::API,
+                "scheduler" => bits |= Self::SCHEDULER,
+                "worker" => bits |= Self::WORKER,
+                _ => {
+                    return Err(ConfigError::InvalidValue {
+                        variable: "APP_ROLES",
+                        reason: "must contain only api, scheduler, and worker",
+                    });
+                }
+            }
+        }
+
+        if bits == 0 {
+            return Err(ConfigError::InvalidValue {
+                variable: "APP_ROLES",
+                reason: "must contain at least one role",
+            });
+        }
+        Ok(Self(bits))
+    }
+
+    /// Reports whether the process should construct the requested component.
+    pub const fn contains(self, role: AppRole) -> bool {
+        let bit = match role {
+            AppRole::Api => Self::API,
+            AppRole::Scheduler => Self::SCHEDULER,
+            AppRole::Worker => Self::WORKER,
+        };
+        self.0 & bit != 0
+    }
+}
+
+impl Default for AppRoles {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+/// Asset storage policy. Binary asset archiving remains optional in version
+/// one; disabled mode does not require any asset-store configuration.
+#[derive(Debug)]
+pub enum AssetArchiveConfig {
+    /// Keep approved external asset URLs and do not persist binary assets.
+    Disabled,
+    /// Store binary assets below a persistent local directory.
+    Local {
+        /// Persistent local asset directory.
+        path: String,
+    },
+    /// Store binary assets in an S3-compatible object store.
+    S3 {
+        /// Endpoint used by the object-store client.
+        endpoint: Url,
+        /// Object-store bucket name.
+        bucket: String,
+        /// Object-store region or signing scope.
+        region: String,
+        /// Object-store access key.
+        access_key: SecretString,
+        /// Object-store secret key.
+        secret_key: SecretString,
+    },
+}
 
 /// Browser implementation selected for a WebDriver sidecar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +300,12 @@ pub enum ConfigError {
         variable: &'static str,
         reason: &'static str,
     },
+    /// An unknown setting used an application-owned environment prefix.
+    #[error("unknown application environment variable {variable}")]
+    UnknownVariable {
+        /// Unknown environment variable name.
+        variable: String,
+    },
     /// Quiet-hours configuration is only partially supplied.
     #[error("QUIET_HOURS_START and QUIET_HOURS_END must be set together")]
     IncompleteQuietHours,
@@ -122,12 +317,10 @@ pub enum ConfigError {
 /// Validated configuration used by future runtime components.
 #[derive(Debug)]
 pub struct AppConfig {
-    // TODO(design): add validated process roles so API, scheduler, and worker
-    // capacity can be deployed independently; also add worker concurrency,
-    // account/feed-build lease and heartbeat settings, source failure cooldown,
-    // and stale/miss response windows required by the corrected architecture.
-    // TODO(design): pre-validate application-owned environment prefixes so a
-    // documented setting cannot be misspelled and silently ignored.
+    /// Components constructed by this process.
+    pub roles: AppRoles,
+    /// Maximum number of jobs executed concurrently by a worker process.
+    pub worker_concurrency: u32,
     /// PostgreSQL URL, retained as a secret because it may contain a password.
     pub database_url: SecretString,
     /// Minimum number of PostgreSQL connections kept in the pool.
@@ -156,22 +349,33 @@ pub struct AppConfig {
     pub job_heartbeat: Duration,
     /// Maximum attempts for retryable jobs.
     pub job_max_attempts: u32,
+    /// Duration for which one authenticated account may be leased.
+    pub account_lease: Duration,
+    /// Maximum interval between authenticated-account lease heartbeats.
+    pub account_heartbeat: Duration,
+    /// Cooldown applied after a source failure before automatic re-enqueueing.
+    pub source_failure_cooldown: Duration,
     /// Freshness period for persisted RSS XML.
     pub rss_cache_ttl: Duration,
+    /// Additional period for serving stale RSS while rebuilding in the
+    /// background.
+    pub rss_stale_while_revalidate: Duration,
+    /// Bounded wait associated with a cache miss before returning retry advice.
+    pub rss_cache_miss_wait: Duration,
+    /// Duration for which one feed rebuild may hold its distributed lease.
+    pub feed_build_lease: Duration,
+    /// Maximum interval between feed-build lease heartbeats.
+    pub feed_build_heartbeat: Duration,
     /// Shared request/page/scroll pacing policy.
     pub pacing: PacingPolicy,
-    /// Legacy archive backend field pending replacement by an optional asset
-    /// archive enum whose default is `Disabled`.
-    pub archive_backend: String,
-    /// Legacy local archive root, used only when the future asset backend is
-    /// explicitly enabled as local.
-    pub archive_local_path: String,
-    /// Optional administrator password. Until route construction implements the
-    /// documented admin-enabled policy, absence must never imply anonymous
-    /// administrative access.
+    /// Optional binary asset archive configuration.
+    pub asset_archive: AssetArchiveConfig,
+    /// Whether administrative routes should be constructed.
+    pub admin_enabled: bool,
+    /// Administrator password, present only when administration is enabled.
     pub admin_password: Option<SecretString>,
-    // TODO(design): add ADMIN_ENABLED and SESSION_SIGNING_KEY. Disabled admin
-    // routes are not registered; enabled admin must require both secrets.
+    /// Session-signing key, present only when administration is enabled.
+    pub session_signing_key: Option<SecretString>,
     /// Credential-encryption key.
     pub credential_encryption_key: SecretString,
 }
@@ -190,14 +394,50 @@ impl AppConfig {
     where
         I: IntoIterator<Item = (String, String)>,
     {
+        let variables: Vec<_> = variables.into_iter().collect();
+        reject_legacy_variables(&variables)?;
+        reject_unknown_variables(&variables)?;
         let raw: RawConfig = envy::from_iter(variables)?;
         Self::from_raw(raw)
     }
 
     fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
+        let roles = AppRoles::parse(raw.app_roles.as_deref().unwrap_or("all"))?;
+        let worker_concurrency = bounded_positive_u32(
+            raw.worker_concurrency.unwrap_or(1),
+            "WORKER_CONCURRENCY",
+            MAX_WORKER_CONCURRENCY,
+        )?;
+        let asset_archive = asset_archive_config(&raw)?;
+
         let database_url = required(raw.database_url, "DATABASE_URL")?;
         let credential_encryption_key =
             required(raw.credential_encryption_key, "CREDENTIAL_ENCRYPTION_KEY")?;
+
+        let admin_enabled = parse_bool(
+            raw.admin_enabled.as_deref().unwrap_or("false"),
+            "ADMIN_ENABLED",
+        )?;
+        let (admin_password, session_signing_key) = if admin_enabled {
+            let admin_password = required(raw.admin_password.clone(), "ADMIN_PASSWORD")?;
+            let session_signing_key =
+                required(raw.session_signing_key.clone(), "SESSION_SIGNING_KEY")?;
+            if session_signing_key == admin_password
+                || session_signing_key == credential_encryption_key
+            {
+                return Err(ConfigError::InvalidValue {
+                    variable: "SESSION_SIGNING_KEY",
+                    reason: "must be independent from the other configured secrets",
+                });
+            }
+            (
+                Some(SecretString::new(admin_password.into_boxed_str())),
+                Some(SecretString::new(session_signing_key.into_boxed_str())),
+            )
+        } else {
+            (None, None)
+        };
+
         let parsed_database_url =
             Url::parse(&database_url).map_err(|_| ConfigError::InvalidValue {
                 variable: "DATABASE_URL",
@@ -291,10 +531,57 @@ impl AppConfig {
                 reason: "must be greater than zero",
             });
         }
+
+        let account_lease_seconds = positive_u64(
+            raw.account_lease_seconds.unwrap_or(600),
+            "ACCOUNT_LEASE_SECONDS",
+        )?;
+        let account_heartbeat_seconds = positive_u64(
+            raw.account_heartbeat_seconds.unwrap_or(60),
+            "ACCOUNT_HEARTBEAT_SECONDS",
+        )?;
+        if account_heartbeat_seconds >= account_lease_seconds {
+            return Err(ConfigError::InvalidValue {
+                variable: "ACCOUNT_LEASE_SECONDS",
+                reason: "must be greater than ACCOUNT_HEARTBEAT_SECONDS",
+            });
+        }
+
+        let source_failure_cooldown_seconds = bounded_non_negative_u64(
+            raw.source_failure_cooldown_seconds.unwrap_or(300),
+            "SOURCE_FAILURE_COOLDOWN_SECONDS",
+            MAX_SOURCE_FAILURE_COOLDOWN_SECONDS,
+        )?;
+
         let rss_cache_seconds = positive_u64(
             raw.rss_cache_ttl_seconds.unwrap_or(1_800),
             "RSS_CACHE_TTL_SECONDS",
         )?;
+        let rss_stale_while_revalidate_seconds = bounded_non_negative_u64(
+            raw.rss_stale_while_revalidate_seconds.unwrap_or(60),
+            "RSS_STALE_WHILE_REVALIDATE_SECONDS",
+            MAX_STALE_WHILE_REVALIDATE_SECONDS,
+        )?;
+        let rss_cache_miss_wait_ms = bounded_positive_u64(
+            raw.rss_cache_miss_wait_ms.unwrap_or(5_000),
+            "RSS_CACHE_MISS_WAIT_MS",
+            MAX_CACHE_MISS_WAIT_MS,
+        )?;
+
+        let feed_build_lease_seconds = positive_u64(
+            raw.feed_build_lease_seconds.unwrap_or(600),
+            "FEED_BUILD_LEASE_SECONDS",
+        )?;
+        let feed_build_heartbeat_seconds = positive_u64(
+            raw.feed_build_heartbeat_seconds.unwrap_or(60),
+            "FEED_BUILD_HEARTBEAT_SECONDS",
+        )?;
+        if feed_build_heartbeat_seconds >= feed_build_lease_seconds {
+            return Err(ConfigError::InvalidValue {
+                variable: "FEED_BUILD_LEASE_SECONDS",
+                reason: "must be greater than FEED_BUILD_HEARTBEAT_SECONDS",
+            });
+        }
 
         let scroll_max_operation_seconds = raw.scroll_max_operation_seconds.unwrap_or(30);
         if scroll_max_operation_seconds > MAX_PAGE_OPERATION_SECONDS {
@@ -359,29 +646,9 @@ impl AppConfig {
             });
         }
 
-        // TODO(design): replace these legacy settings with
-        // AssetArchiveConfig::{Disabled, Local, S3}, defaulting to Disabled,
-        // and validate backend-specific values only when enabled.
-        let archive_backend = raw.archive_backend.unwrap_or_else(|| "local".to_owned());
-        if !matches!(archive_backend.as_str(), "local" | "s3") {
-            return Err(ConfigError::InvalidValue {
-                variable: "ARCHIVE_BACKEND",
-                reason: "expected local or s3",
-            });
-        }
-        let archive_local_path = raw
-            .archive_local_path
-            .unwrap_or_else(|| "./data/archive".to_owned())
-            .trim()
-            .to_owned();
-        if archive_backend == "local" && archive_local_path.is_empty() {
-            return Err(ConfigError::InvalidValue {
-                variable: "ARCHIVE_LOCAL_PATH",
-                reason: "must not be empty when ARCHIVE_BACKEND is local",
-            });
-        }
-
         Ok(Self {
+            roles,
+            worker_concurrency,
             database_url: SecretString::new(database_url.into_boxed_str()),
             database_pool_min_connections,
             database_pool_max_connections,
@@ -399,16 +666,19 @@ impl AppConfig {
             job_lease: Duration::from_secs(job_lease_seconds),
             job_heartbeat: Duration::from_secs(job_heartbeat_seconds),
             job_max_attempts,
+            account_lease: Duration::from_secs(account_lease_seconds),
+            account_heartbeat: Duration::from_secs(account_heartbeat_seconds),
+            source_failure_cooldown: Duration::from_secs(source_failure_cooldown_seconds),
             rss_cache_ttl: Duration::from_secs(rss_cache_seconds),
+            rss_stale_while_revalidate: Duration::from_secs(rss_stale_while_revalidate_seconds),
+            rss_cache_miss_wait: Duration::from_millis(rss_cache_miss_wait_ms),
+            feed_build_lease: Duration::from_secs(feed_build_lease_seconds),
+            feed_build_heartbeat: Duration::from_secs(feed_build_heartbeat_seconds),
             pacing,
-            archive_backend,
-            archive_local_path,
-            // TODO(design): validate this together with ADMIN_ENABLED and a
-            // distinct SESSION_SIGNING_KEY before admin routes are implemented.
-            admin_password: raw
-                .admin_password
-                .filter(|value| !value.is_empty())
-                .map(|value| SecretString::new(value.into_boxed_str())),
+            asset_archive,
+            admin_enabled,
+            admin_password,
+            session_signing_key,
             credential_encryption_key: SecretString::new(
                 credential_encryption_key.into_boxed_str(),
             ),
@@ -423,9 +693,11 @@ struct RawConfig {
     database_pool_max_connections: Option<u32>,
     webdriver_url: Option<String>,
     browser_engine: Option<String>,
+    worker_concurrency: Option<u32>,
     app_instance_id: Option<String>,
     http_bind: Option<String>,
     http_port: Option<u16>,
+    app_roles: Option<String>,
     app_timezone: Option<String>,
     quiet_hours_start: Option<String>,
     quiet_hours_end: Option<String>,
@@ -433,7 +705,14 @@ struct RawConfig {
     job_lease_seconds: Option<u64>,
     job_heartbeat_seconds: Option<u64>,
     job_max_attempts: Option<u32>,
+    account_lease_seconds: Option<u64>,
+    account_heartbeat_seconds: Option<u64>,
+    source_failure_cooldown_seconds: Option<u64>,
     rss_cache_ttl_seconds: Option<u64>,
+    rss_stale_while_revalidate_seconds: Option<u64>,
+    rss_cache_miss_wait_ms: Option<u64>,
+    feed_build_lease_seconds: Option<u64>,
+    feed_build_heartbeat_seconds: Option<u64>,
     pacing_request_mean_ms: Option<f64>,
     pacing_request_stddev_ms: Option<f64>,
     pacing_request_min_ms: Option<f64>,
@@ -453,16 +732,142 @@ struct RawConfig {
     scroll_max_steps: Option<u32>,
     scroll_max_pixels: Option<u32>,
     scroll_max_operation_seconds: Option<u64>,
-    archive_backend: Option<String>,
-    archive_local_path: Option<String>,
+    asset_archive_backend: Option<String>,
+    asset_archive_local_path: Option<String>,
+    asset_archive_s3_endpoint: Option<String>,
+    asset_archive_s3_bucket: Option<String>,
+    asset_archive_s3_region: Option<String>,
+    asset_archive_s3_access_key: Option<String>,
+    asset_archive_s3_secret_key: Option<String>,
+    admin_enabled: Option<String>,
     admin_password: Option<String>,
+    session_signing_key: Option<String>,
     credential_encryption_key: Option<String>,
+}
+
+fn reject_legacy_variables(variables: &[(String, String)]) -> Result<(), ConfigError> {
+    for (name, _) in variables {
+        if LEGACY_ENVIRONMENT_VARIABLES.contains(&name.as_str()) {
+            return Err(ConfigError::InvalidValue {
+                variable: if name == "ARCHIVE_BACKEND" {
+                    "ARCHIVE_BACKEND"
+                } else {
+                    "ARCHIVE_LOCAL_PATH"
+                },
+                reason: "use ASSET_ARCHIVE_* instead",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn reject_unknown_variables(variables: &[(String, String)]) -> Result<(), ConfigError> {
+    for (name, _) in variables {
+        let owned = APPLICATION_ENVIRONMENT_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+        if owned
+            && !KNOWN_ENVIRONMENT_VARIABLES.contains(&name.as_str())
+            && !IGNORED_RUNTIME_ENVIRONMENT_VARIABLES.contains(&name.as_str())
+        {
+            return Err(ConfigError::UnknownVariable {
+                variable: name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn asset_archive_config(raw: &RawConfig) -> Result<AssetArchiveConfig, ConfigError> {
+    let backend = raw
+        .asset_archive_backend
+        .as_deref()
+        .unwrap_or("disabled")
+        .trim()
+        .to_ascii_lowercase();
+    match backend.as_str() {
+        "disabled" => Ok(AssetArchiveConfig::Disabled),
+        "local" => Ok(AssetArchiveConfig::Local {
+            path: required_path(
+                raw.asset_archive_local_path.clone(),
+                "ASSET_ARCHIVE_LOCAL_PATH",
+            )?,
+        }),
+        "s3" => {
+            let endpoint = required(
+                raw.asset_archive_s3_endpoint.clone(),
+                "ASSET_ARCHIVE_S3_ENDPOINT",
+            )?
+            .trim()
+            .parse::<Url>()
+            .map_err(|_| ConfigError::InvalidValue {
+                variable: "ASSET_ARCHIVE_S3_ENDPOINT",
+                reason: "expected an http or https URL without credentials",
+            })?;
+            if !matches!(endpoint.scheme(), "http" | "https")
+                || endpoint.host().is_none()
+                || !endpoint.username().is_empty()
+                || endpoint.password().is_some()
+                || endpoint.query().is_some()
+                || endpoint.fragment().is_some()
+            {
+                return Err(ConfigError::InvalidValue {
+                    variable: "ASSET_ARCHIVE_S3_ENDPOINT",
+                    reason: "expected an http or https URL without credentials",
+                });
+            }
+            Ok(AssetArchiveConfig::S3 {
+                endpoint,
+                bucket: required(
+                    raw.asset_archive_s3_bucket.clone(),
+                    "ASSET_ARCHIVE_S3_BUCKET",
+                )?
+                .trim()
+                .to_owned(),
+                region: required(
+                    raw.asset_archive_s3_region.clone(),
+                    "ASSET_ARCHIVE_S3_REGION",
+                )?
+                .trim()
+                .to_owned(),
+                access_key: SecretString::new(
+                    required(
+                        raw.asset_archive_s3_access_key.clone(),
+                        "ASSET_ARCHIVE_S3_ACCESS_KEY",
+                    )?
+                    .into_boxed_str(),
+                ),
+                secret_key: SecretString::new(
+                    required(
+                        raw.asset_archive_s3_secret_key.clone(),
+                        "ASSET_ARCHIVE_S3_SECRET_KEY",
+                    )?
+                    .into_boxed_str(),
+                ),
+            })
+        }
+        _ => Err(ConfigError::InvalidValue {
+            variable: "ASSET_ARCHIVE_BACKEND",
+            reason: "expected disabled, local, or s3",
+        }),
+    }
 }
 
 fn required(value: Option<String>, variable: &'static str) -> Result<String, ConfigError> {
     value
         .filter(|value| !value.trim().is_empty())
         .ok_or(ConfigError::Missing { variable })
+}
+
+fn required_path(value: Option<String>, variable: &'static str) -> Result<String, ConfigError> {
+    match value {
+        None => Err(ConfigError::Missing { variable }),
+        Some(value) if value.trim().is_empty() => Err(ConfigError::InvalidValue {
+            variable,
+            reason: "must not be empty",
+        }),
+        Some(value) => Ok(value.trim().to_owned()),
+    }
 }
 
 fn parse_time(value: &str, variable: &'static str) -> Result<NaiveTime, ConfigError> {
@@ -480,6 +885,72 @@ fn positive_u64(value: u64, variable: &'static str) -> Result<u64, ConfigError> 
         })
     } else {
         Ok(value)
+    }
+}
+
+fn bounded_positive_u64(
+    value: u64,
+    variable: &'static str,
+    maximum: u64,
+) -> Result<u64, ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::InvalidValue {
+            variable,
+            reason: "must be greater than zero",
+        });
+    }
+    if value > maximum {
+        return Err(ConfigError::InvalidValue {
+            variable,
+            reason: "exceeds the supported maximum",
+        });
+    }
+    Ok(value)
+}
+
+fn bounded_non_negative_u64(
+    value: u64,
+    variable: &'static str,
+    maximum: u64,
+) -> Result<u64, ConfigError> {
+    if value > maximum {
+        Err(ConfigError::InvalidValue {
+            variable,
+            reason: "exceeds the supported maximum",
+        })
+    } else {
+        Ok(value)
+    }
+}
+
+fn bounded_positive_u32(
+    value: u32,
+    variable: &'static str,
+    maximum: u32,
+) -> Result<u32, ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::InvalidValue {
+            variable,
+            reason: "must be greater than zero",
+        });
+    }
+    if value > maximum {
+        return Err(ConfigError::InvalidValue {
+            variable,
+            reason: "exceeds the supported maximum",
+        });
+    }
+    Ok(value)
+}
+
+fn parse_bool(value: &str, variable: &'static str) -> Result<bool, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(ConfigError::InvalidValue {
+            variable,
+            reason: "expected true or false",
+        }),
     }
 }
 
@@ -525,6 +996,8 @@ fn bounded_delay(value: Option<f64>, variable: &'static str) -> Result<Option<f6
 
 #[cfg(test)]
 mod tests {
+    use secrecy::ExposeSecret;
+
     use super::*;
 
     fn valid_environment() -> Vec<(String, String)> {
@@ -551,16 +1024,22 @@ mod tests {
         variable: &str,
         value: &str,
     ) -> Vec<(String, String)> {
-        environment
+        let mut replaced = false;
+        let mut environment = environment
             .into_iter()
             .map(|(key, current)| {
                 if key == variable {
+                    replaced = true;
                     (key, value.to_owned())
                 } else {
                     (key, current)
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if !replaced {
+            environment.push((variable.to_owned(), value.to_owned()));
+        }
+        environment
     }
 
     #[test]
@@ -568,6 +1047,10 @@ mod tests {
         let config = AppConfig::from_env_iter(valid_environment()).unwrap();
 
         assert_eq!(config.browser_engine, BrowserEngine::Chromium);
+        assert!(config.roles.contains(AppRole::Api));
+        assert!(config.roles.contains(AppRole::Scheduler));
+        assert!(config.roles.contains(AppRole::Worker));
+        assert_eq!(config.worker_concurrency, 1);
         assert_eq!(config.database_pool_min_connections, 2);
         assert_eq!(config.database_pool_max_connections, 12);
         assert_eq!(config.http_bind, "0.0.0.0");
@@ -575,7 +1058,18 @@ mod tests {
         assert_eq!(config.timezone, chrono_tz::Asia::Shanghai);
         assert_eq!(config.job_lease, Duration::from_secs(120));
         assert_eq!(config.job_heartbeat, Duration::from_secs(60));
+        assert_eq!(config.account_lease, Duration::from_secs(600));
+        assert_eq!(config.account_heartbeat, Duration::from_secs(60));
+        assert_eq!(config.source_failure_cooldown, Duration::from_secs(300));
         assert_eq!(config.rss_cache_ttl, Duration::from_secs(1_800));
+        assert_eq!(config.rss_stale_while_revalidate, Duration::from_secs(60));
+        assert_eq!(config.rss_cache_miss_wait, Duration::from_secs(5));
+        assert_eq!(config.feed_build_lease, Duration::from_secs(600));
+        assert_eq!(config.feed_build_heartbeat, Duration::from_secs(60));
+        assert!(matches!(config.asset_archive, AssetArchiveConfig::Disabled));
+        assert!(!config.admin_enabled);
+        assert!(config.admin_password.is_none());
+        assert!(config.session_signing_key.is_none());
         assert!(config.quiet_hours.unwrap().is_quiet_at(
             "2026-08-27T15:00:00Z"
                 .parse::<chrono::DateTime<chrono::Utc>>()
@@ -706,15 +1200,303 @@ mod tests {
     #[test]
     fn rejects_empty_local_archive_paths() {
         let mut environment = valid_environment();
-        environment.push(("ARCHIVE_LOCAL_PATH".to_owned(), " ".to_owned()));
+        environment.push(("ASSET_ARCHIVE_BACKEND".to_owned(), "local".to_owned()));
+        environment.push(("ASSET_ARCHIVE_LOCAL_PATH".to_owned(), " ".to_owned()));
 
         assert!(matches!(
             AppConfig::from_env_iter(environment),
             Err(ConfigError::InvalidValue {
-                variable: "ARCHIVE_LOCAL_PATH",
+                variable: "ASSET_ARCHIVE_LOCAL_PATH",
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parses_selected_roles_and_worker_concurrency() {
+        let mut environment = valid_environment();
+        environment.extend([
+            ("APP_ROLES".to_owned(), " api,worker ".to_owned()),
+            ("WORKER_CONCURRENCY".to_owned(), "12".to_owned()),
+        ]);
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        assert!(config.roles.contains(AppRole::Api));
+        assert!(!config.roles.contains(AppRole::Scheduler));
+        assert!(config.roles.contains(AppRole::Worker));
+        assert_eq!(config.worker_concurrency, 12);
+    }
+
+    #[test]
+    fn rejects_empty_unknown_and_mixed_all_roles() {
+        for value in ["", "unknown", "all,worker", "api,"] {
+            let environment = replace_environment(valid_environment(), "APP_ROLES", value);
+            let result = AppConfig::from_env_iter(environment);
+            assert!(matches!(
+                result,
+                Err(ConfigError::InvalidValue {
+                    variable: "APP_ROLES",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_zero_and_oversized_worker_concurrency() {
+        for value in ["0", "1025"] {
+            let environment = replace_environment(valid_environment(), "WORKER_CONCURRENCY", value);
+            assert!(matches!(
+                AppConfig::from_env_iter(environment),
+                Err(ConfigError::InvalidValue {
+                    variable: "WORKER_CONCURRENCY",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn validates_account_and_feed_build_lease_ordering() {
+        let environment = [
+            ("ACCOUNT_LEASE_SECONDS", "60"),
+            ("ACCOUNT_HEARTBEAT_SECONDS", "60"),
+        ]
+        .into_iter()
+        .fold(valid_environment(), |environment, (key, value)| {
+            replace_environment(environment, key, value)
+        });
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "ACCOUNT_LEASE_SECONDS",
+                ..
+            })
+        ));
+
+        let environment = [
+            ("FEED_BUILD_LEASE_SECONDS", "59"),
+            ("FEED_BUILD_HEARTBEAT_SECONDS", "60"),
+        ]
+        .into_iter()
+        .fold(valid_environment(), |environment, (key, value)| {
+            replace_environment(environment, key, value)
+        });
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "FEED_BUILD_LEASE_SECONDS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn accepts_zero_cooldown_but_rejects_oversized_cache_waits() {
+        let environment = [
+            ("SOURCE_FAILURE_COOLDOWN_SECONDS", "0"),
+            ("RSS_STALE_WHILE_REVALIDATE_SECONDS", "86400"),
+            ("RSS_CACHE_MISS_WAIT_MS", "60000"),
+        ]
+        .into_iter()
+        .fold(valid_environment(), |environment, (key, value)| {
+            replace_environment(environment, key, value)
+        });
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        assert_eq!(config.source_failure_cooldown, Duration::ZERO);
+        assert_eq!(
+            config.rss_stale_while_revalidate,
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(config.rss_cache_miss_wait, Duration::from_secs(60));
+
+        for (key, value) in [
+            ("RSS_CACHE_MISS_WAIT_MS", "0"),
+            ("RSS_CACHE_MISS_WAIT_MS", "60001"),
+            ("RSS_STALE_WHILE_REVALIDATE_SECONDS", "86401"),
+            ("SOURCE_FAILURE_COOLDOWN_SECONDS", "604801"),
+        ] {
+            let environment = replace_environment(valid_environment(), key, value);
+            assert!(matches!(
+                AppConfig::from_env_iter(environment),
+                Err(ConfigError::InvalidValue { variable, .. }) if variable == key
+            ));
+        }
+    }
+
+    #[test]
+    fn requires_complete_admin_credentials_only_when_enabled() {
+        let environment = replace_environment(valid_environment(), "ADMIN_ENABLED", "true");
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "ADMIN_PASSWORD"
+            })
+        ));
+
+        let mut environment = replace_environment(valid_environment(), "ADMIN_ENABLED", "true");
+        environment.push(("ADMIN_PASSWORD".to_owned(), "admin-password".to_owned()));
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "SESSION_SIGNING_KEY"
+            })
+        ));
+
+        let mut environment = replace_environment(valid_environment(), "ADMIN_ENABLED", "true");
+        environment.extend([
+            ("ADMIN_PASSWORD".to_owned(), "admin-password".to_owned()),
+            ("SESSION_SIGNING_KEY".to_owned(), "session-key".to_owned()),
+        ]);
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        assert!(config.admin_enabled);
+        assert_eq!(
+            config.admin_password.unwrap().expose_secret(),
+            "admin-password"
+        );
+        assert_eq!(
+            config.session_signing_key.unwrap().expose_secret(),
+            "session-key"
+        );
+    }
+
+    #[test]
+    fn rejects_shared_session_secret_and_invalid_admin_switch() {
+        let mut environment = replace_environment(valid_environment(), "ADMIN_ENABLED", "yes");
+        environment.extend([
+            ("ADMIN_PASSWORD".to_owned(), "admin-password".to_owned()),
+            ("SESSION_SIGNING_KEY".to_owned(), "session-key".to_owned()),
+        ]);
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "ADMIN_ENABLED",
+                ..
+            })
+        ));
+
+        let mut environment = replace_environment(valid_environment(), "ADMIN_ENABLED", "true");
+        environment.extend([
+            ("ADMIN_PASSWORD".to_owned(), "same-secret".to_owned()),
+            ("SESSION_SIGNING_KEY".to_owned(), "same-secret".to_owned()),
+        ]);
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "SESSION_SIGNING_KEY",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_local_and_s3_asset_modes_and_validates_selected_settings() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "local");
+        environment.push((
+            "ASSET_ARCHIVE_LOCAL_PATH".to_owned(),
+            " /var/lib/wechrss/assets ".to_owned(),
+        ));
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        assert!(matches!(
+            config.asset_archive,
+            AssetArchiveConfig::Local { ref path } if path == "/var/lib/wechrss/assets"
+        ));
+
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "s3");
+        environment.extend([
+            (
+                "ASSET_ARCHIVE_S3_ENDPOINT".to_owned(),
+                "https://objects.example.test".to_owned(),
+            ),
+            ("ASSET_ARCHIVE_S3_BUCKET".to_owned(), "wechrss".to_owned()),
+            ("ASSET_ARCHIVE_S3_REGION".to_owned(), "us-east-1".to_owned()),
+            (
+                "ASSET_ARCHIVE_S3_ACCESS_KEY".to_owned(),
+                "access".to_owned(),
+            ),
+            (
+                "ASSET_ARCHIVE_S3_SECRET_KEY".to_owned(),
+                "secret".to_owned(),
+            ),
+        ]);
+        assert!(matches!(
+            AppConfig::from_env_iter(environment).unwrap().asset_archive,
+            AssetArchiveConfig::S3 { .. }
+        ));
+
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "s3");
+        environment.extend([
+            (
+                "ASSET_ARCHIVE_S3_ENDPOINT".to_owned(),
+                "https://user:password@objects.example.test".to_owned(),
+            ),
+            ("ASSET_ARCHIVE_S3_BUCKET".to_owned(), "wechrss".to_owned()),
+            ("ASSET_ARCHIVE_S3_REGION".to_owned(), "us-east-1".to_owned()),
+            (
+                "ASSET_ARCHIVE_S3_ACCESS_KEY".to_owned(),
+                "access".to_owned(),
+            ),
+            (
+                "ASSET_ARCHIVE_S3_SECRET_KEY".to_owned(),
+                "secret".to_owned(),
+            ),
+        ]);
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "ASSET_ARCHIVE_S3_ENDPOINT",
+                ..
+            })
+        ));
+
+        let environment = replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "s3");
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "ASSET_ARCHIVE_S3_ENDPOINT"
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_legacy_and_unknown_owned_environment_names_but_ignores_runtime_variables() {
+        let environment = [
+            ("ARCHIVE_BACKEND".to_owned(), "local".to_owned()),
+            (
+                "HTTP_PROXY".to_owned(),
+                "http://proxy.example.test".to_owned(),
+            ),
+        ]
+        .into_iter()
+        .fold(valid_environment(), |mut environment, value| {
+            environment.push(value);
+            environment
+        });
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "ARCHIVE_BACKEND",
+                ..
+            })
+        ));
+
+        let mut environment = valid_environment();
+        environment.push(("APP_ROEL".to_owned(), "worker".to_owned()));
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::UnknownVariable { variable }) if variable == "APP_ROEL"
+        ));
+
+        let mut environment = valid_environment();
+        environment.push(("PATH".to_owned(), "/usr/bin".to_owned()));
+        environment.push((
+            "HTTP_PROXY".to_owned(),
+            "http://proxy.example.test".to_owned(),
+        ));
+        assert!(AppConfig::from_env_iter(environment).is_ok());
     }
 
     #[test]

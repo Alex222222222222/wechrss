@@ -2,9 +2,9 @@
 
 > **Implementation status:** the Rust binary is currently a no-op. These are
 > target deployment constraints plus development-database instructions, not a
-> runnable application manifest. Environment variables described as planned are
-> not parsed until the corresponding `TODO(design)` in `src/config.rs` is
-> implemented and tested.
+> runnable application manifest. The environment-only configuration loader
+> validates the documented settings, but the no-op binary does not yet compose
+> runtime roles from them.
 
 A Rust process with the `worker` role and its browser sidecar must use the same
 IANA timezone for quiet-hours decisions and browser-visible local time. `TZ` is
@@ -40,10 +40,9 @@ environment source instead of maintaining separate values for the application
 and sidecar. Secrets such as database URLs and encryption keys belong in a
 Kubernetes Secret.
 
-The target configuration will use `APP_ROLES=all` for a small combined
-deployment or a validated subset of `api,scheduler,worker` when scaling
-components independently. `APP_ROLES` is not parsed by the current `AppConfig`.
-Once implemented, browser-session capacity and worker replica count must be
+The configuration uses `APP_ROLES=all` for a small combined deployment or a
+validated subset of `api,scheduler,worker` when scaling components
+independently. Browser-session capacity and worker replica count must be
 intentional; increasing API replicas for RSS traffic must not automatically
 increase upstream fetch concurrency.
 
