@@ -46,7 +46,7 @@ The current and target contracts must not be confused:
 | Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | Runtime composition must consume the parsed role and policy values before deployment relies on them |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
 | Acquisition/web/RSS | A validated public WeChat article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, and pure RSS renderer | Authenticated protocol adapter, application handlers, and feed-token routing remain future work |
-| Archive | Conservative HTML allowlist sanitizer with safe URL filtering and external-image reporting | ArchiveService orchestration, asset persistence, and URL rewriting remain future work |
+| Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, and external-image reporting through ArchiveService | Asset persistence and URL rewriting remain future work |
 
 Environment variables in this document are parsed into `AppConfig`, but the
 binary is still a no-op and does not construct role-specific runtime
@@ -644,14 +644,18 @@ transaction owner.
 ### Archive
 
 Sanitization is required and is implemented as a pure allowlist boundary in
-`src/archive/sanitizer.rs`. It parses HTML5 fragments, removes active content,
-event handlers, unsafe URLs, and unknown attributes, promotes approved WeChat
-lazy-image attributes to `src`, and reports deduplicated external HTTP(S) image
-URLs in first-seen order. Asset persistence, checksum-based deduplication, and
-URL rewriting are optional in version one. When enabled, the `AssetStore`
-abstraction supports a local persistent volume first and S3-compatible storage
-later. Without it, approved external asset URLs remain in sanitized HTML and
-the application does not need binary asset storage or media delivery.
+`src/archive/sanitizer.rs`. `ArchiveService` in
+`src/application/archive_service.rs` applies that policy, hashes the normalized
+HTML with lowercase SHA-256, and returns the same deduplicated external image
+URLs in first-seen order. Empty sanitized output has no content hash, allowing
+partial list observations to remain distinct from archived article content.
+Asset persistence, checksum-based deduplication, and URL rewriting are
+optional in version one. When enabled, the `AssetStore` abstraction supports a
+local persistent volume first and S3-compatible storage later. Without it,
+approved external asset URLs remain in sanitized HTML and the application does
+not need binary asset storage or media delivery. Any future asset downloader
+must apply SSRF-safe network policy and bounded idempotent writes; the current
+`ArchiveService` never performs network I/O.
 
 ### RSS
 
@@ -982,8 +986,8 @@ selection.
 The remaining tree intentionally contains no route handlers, source
 configuration/feed-token orchestration, scheduler loops, credential
 persistence, or business implementation. Credential persistence and
-ArchiveService orchestration remain documentation-only; the pure archive
-sanitizer is executable. Acquisition now contains executable capability/session
+asset persistence and URL rewriting remain documentation-only; the pure archive
+sanitizer and ArchiveService are executable. Acquisition now contains executable capability/session
 ports, local capacity/lease ownership, public WebDriver navigation, common
 article extraction, bounded public-page pacing/scroll execution, and expected
 browser-timezone validation; authenticated protocol work, authenticated pacing

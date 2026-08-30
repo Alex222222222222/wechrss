@@ -26,6 +26,7 @@ use url::Url;
 const SAFE_ELEMENTS: &[&str] = &[
     "a",
     "abbr",
+    "article",
     "b",
     "blockquote",
     "br",
