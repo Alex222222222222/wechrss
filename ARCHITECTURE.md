@@ -958,9 +958,10 @@ than add more empty module shells. Work proceeds in this order:
    lease repositories are also executable. No source or feed application
    service may bypass these boundaries with convenience transactions.
 3. Make `FeedService` executable over the persisted cache (cache-first
-   delivery and deduplicated rebuild enqueueing are implemented), then extend
-   the executable `FeedRebuildService` with worker outcome coupling and add the
-   remaining source/archive queries.
+   delivery and deduplicated rebuild enqueueing are implemented). The worker
+   now supports committing its fenced outcome through `UnitOfWork`; extend the
+   executable `FeedRebuildService` with a business-coupled worker finalization
+   contract and add the remaining source/archive queries.
 4. Build role-aware runtime composition and integrate the scheduler/worker
    loops, heartbeat cancellation, and degraded browser health behavior.
 5. Complete the acquisition slice with fresh-profile creation and browser
@@ -993,8 +994,12 @@ job and account-lease decisions use statement-local `clock_timestamp()`. The
 job persistence boundary also exposes the independently usable `JobQueue` and
 `ExpiredJobRecovery` ports plus the command-shaped `JobOutcomeTransaction`
 adapter. `UnitOfWork::job_outcomes()` hides the transaction implementation and
-keeps outcome application inside the shared commit boundary; the older
-all-in-one job traits remain only as a migration bridge. The
+keeps outcome application inside the shared commit boundary; `Worker` can now
+use `UnitOfWorkFactory` directly as its outcome factory, so the worker's
+fenced job completion is committed by that shared boundary. This is still an
+outcome-only adapter: synchronization handlers must add their article/source/
+sync-run/cache writes before the one commit. The older all-in-one job traits
+remain only as a migration bridge. The
 pacing and configuration modules have no network, browser, database, scheduler,
 or sleeping side effects. `UnitOfWorkFactory` and its transaction-scoped job
 view are implemented in `src/persistence/unit_of_work.rs`; the account-lease
@@ -1054,7 +1059,8 @@ protocol work, authenticated pacing hooks, and browser health remain future work
 and the initial-job slice described above. `JobService` implements queue
 lifecycle and transaction-scoped outcome binding; `Worker::run_once` implements
 one-pass claim, lease heartbeat, handler dispatch, and fenced outcome commit,
-while `Worker::run_until_shutdown` adds bounded idle polling, transient-error
+including the shared `UnitOfWorkFactory` outcome path. `Worker::run_until_shutdown`
+adds bounded idle polling, transient-error
 backoff, and graceful shutdown between passes. Article and sync-run persistence
 and `FeedService` implement the database/cache boundaries described above.
 Synchronization-specific handlers remain future work.

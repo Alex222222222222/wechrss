@@ -27,17 +27,20 @@
 //!
 //! PostgreSQL/high-availability behavior: claim, heartbeat, and fencing are
 //! delegated to [`JobService`], so replicas still coordinate through
-//! PostgreSQL `SKIP LOCKED` and lease tokens. This first worker boundary
-//! commits only the job outcome through the queue transaction. A future
-//! synchronization-specific worker must add a two-phase handler boundary so
-//! acquisition stays outside the transaction while article, source, sync,
-//! cache, and job writes commit together in `UnitOfWork`. If a heartbeat fails,
-//! the handler future is cancelled and no stale outcome is attempted.
+//! PostgreSQL `SKIP LOCKED` and lease tokens. The worker can commit an outcome
+//! through either the compatibility queue transaction or the shared
+//! [`UnitOfWork`] boundary. A future synchronization-specific handler must add
+//! a two-phase handler contract so acquisition stays outside the transaction
+//! while article, source, sync, cache, and job writes commit together in that
+//! same unit of work. If a heartbeat fails, the handler future is cancelled and
+//! no stale outcome is attempted.
 //!
 //! RSS-cache interaction: this module does not render, read, or publish feeds.
-//! Feed rebuild and source-sync handlers remain future work until the worker
-//! has a two-phase `UnitOfWork` persistence contract; queue-only completion
-//! must not be used to publish business data separately from the job outcome.
+//! Feed rebuild and source-sync handlers remain future work until a handler can
+//! stage business writes in the same [`UnitOfWork`] that receives the job
+//! outcome. The shared outcome adapter establishes that transaction boundary
+//! for outcome-only passes; queue-only completion must not be used to publish
+//! business data separately from the job outcome.
 
 use std::{sync::Arc, time::Duration as StdDuration};
 
@@ -52,6 +55,7 @@ use crate::{
         ExpiredJobRecovery, JobLease, JobOutcomeTransaction, JobQueue, JobRepository,
         JobRepositoryError, JobRepositoryTransaction,
     },
+    persistence::unit_of_work::{UnitOfWork, UnitOfWorkError, UnitOfWorkFactory},
 };
 
 /// The durable result selected by a claimed job handler.
@@ -230,6 +234,9 @@ pub enum WorkerPersistenceError {
     /// The compatibility job repository rejected the transaction operation.
     #[error(transparent)]
     JobRepository(#[from] JobRepositoryError),
+    /// The shared cross-repository transaction could not begin or commit.
+    #[error(transparent)]
+    UnitOfWork(#[from] UnitOfWorkError),
 }
 
 /// Result of one call to [`Worker::run_once`].
@@ -278,6 +285,14 @@ where
     }
 }
 
+impl WorkerOutcomeTransaction for UnitOfWork<'_> {
+    async fn commit(self) -> Result<(), WorkerPersistenceError> {
+        UnitOfWork::commit(self)
+            .await
+            .map_err(WorkerPersistenceError::from)
+    }
+}
+
 impl<R> WorkerOutcomeFactory for R
 where
     R: JobRepository,
@@ -289,6 +304,19 @@ where
 
     async fn begin(&self) -> Result<Self::Transaction<'_>, WorkerPersistenceError> {
         JobRepository::begin(self)
+            .await
+            .map_err(WorkerPersistenceError::from)
+    }
+}
+
+impl WorkerOutcomeFactory for UnitOfWorkFactory {
+    type Transaction<'a>
+        = UnitOfWork<'a>
+    where
+        Self: 'a;
+
+    async fn begin(&self) -> Result<Self::Transaction<'_>, WorkerPersistenceError> {
+        UnitOfWorkFactory::begin(self)
             .await
             .map_err(WorkerPersistenceError::from)
     }

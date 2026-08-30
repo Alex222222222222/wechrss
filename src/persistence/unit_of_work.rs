@@ -172,6 +172,12 @@ impl JobOutcomeTransaction for JobOutcomeView<'_, '_> {
     }
 }
 
+impl JobOutcomeTransaction for UnitOfWork<'_> {
+    async fn apply_outcome(&mut self, outcome: JobOutcome) -> Result<Job, JobRepositoryError> {
+        self.job_outcomes().apply_outcome(outcome).await
+    }
+}
+
 impl<'a> UnitOfWork<'a> {
     /// Borrows the job repository view without exposing an independent commit.
     pub fn jobs(&mut self) -> &mut PostgresJobTransaction<'a> {
