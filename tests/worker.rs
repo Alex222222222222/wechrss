@@ -21,7 +21,8 @@ use wechrss::{
     },
     domain::job::{JobStatus, JobType, NewJob},
     persistence::repositories::job_repository::{
-        EnqueueResult, JobLease, JobQueue, MemoryJobRepository,
+        EnqueueResult, JobLease, JobQueue, JobRepository, JobRepositoryTransaction,
+        MemoryJobRepository,
     },
 };
 
@@ -56,7 +57,7 @@ struct RecordingHandler {
 }
 
 impl JobHandler for RecordingHandler {
-    async fn execute(&self, lease: &JobLease) -> JobExecution {
+    async fn execute(&self, lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
         self.seen.lock().await.push(lease.job.job_type());
         self.outcome.clone()
     }
@@ -68,7 +69,7 @@ struct ShutdownHandler {
 }
 
 impl JobHandler for ShutdownHandler {
-    async fn execute(&self, _lease: &JobLease) -> JobExecution {
+    async fn execute(&self, _lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
         self.shutdown
             .send(true)
             .expect("worker loop receiver should still be alive");
@@ -84,7 +85,7 @@ struct ShutdownAfterCallsHandler {
 }
 
 impl JobHandler for ShutdownAfterCallsHandler {
-    async fn execute(&self, _lease: &JobLease) -> JobExecution {
+    async fn execute(&self, _lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         if call >= self.stop_after {
             self.shutdown
@@ -101,8 +102,37 @@ struct CloseSenderHandler {
     calls: Arc<AtomicUsize>,
 }
 
+#[derive(Clone)]
+struct CommittingHandler {
+    repository: MemoryJobRepository,
+}
+
+impl JobHandler for CommittingHandler {
+    async fn execute(&self, lease: &JobLease, now: DateTime<Utc>) -> JobExecution {
+        let mut transaction = self
+            .repository
+            .begin()
+            .await
+            .expect("handler transaction should begin");
+        transaction
+            .succeed(
+                lease.job.id(),
+                lease.job.lease_owner().expect("claimed job has an owner"),
+                lease.token,
+                now,
+            )
+            .await
+            .expect("handler should complete the claimed job");
+        transaction
+            .commit()
+            .await
+            .expect("handler transaction should commit");
+        JobExecution::Committed
+    }
+}
+
 impl JobHandler for CloseSenderHandler {
-    async fn execute(&self, _lease: &JobLease) -> JobExecution {
+    async fn execute(&self, _lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
         self.calls.fetch_add(1, Ordering::Relaxed);
         drop(self.shutdown.lock().await.take());
         JobExecution::Succeeded
@@ -194,6 +224,79 @@ async fn retry_outcome_increments_failure_count_without_running_a_second_job() {
     assert_eq!(
         worker.run_once(at(2)).await.expect("worker should wait"),
         WorkerRun::Idle
+    );
+}
+
+#[tokio::test]
+async fn deferred_outcome_preserves_failure_budget_until_resume() {
+    let repository = MemoryJobRepository::new();
+    repository
+        .enqueue(job("deferred", JobType::SourceSync))
+        .await
+        .expect("job should enqueue");
+    let worker = build_worker(
+        repository.clone(),
+        RecordingHandler {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            outcome: JobExecution::Deferred { resume_at: at(20) },
+        },
+        vec![JobType::SourceSync],
+    );
+
+    let WorkerRun::Completed { job, outcome } = worker
+        .run_once(at(1))
+        .await
+        .expect("worker should defer the claimed job")
+    else {
+        panic!("queued job should not be idle")
+    };
+
+    assert_eq!(outcome, JobExecution::Deferred { resume_at: at(20) });
+    assert_eq!(job.status(), JobStatus::Deferred);
+    assert_eq!(job.claim_count(), 1);
+    assert_eq!(job.failure_count(), 0);
+    assert_eq!(job.run_after(), at(20));
+}
+
+#[tokio::test]
+async fn committed_handler_result_is_read_without_a_second_outcome_transition() {
+    let repository = MemoryJobRepository::new();
+    let inserted = repository
+        .enqueue(job("committed", JobType::FeedRebuild))
+        .await
+        .expect("job should enqueue");
+    let job_id = match inserted {
+        EnqueueResult::Inserted(job) => job.id(),
+        EnqueueResult::AlreadyActive { job_id } => job_id,
+    };
+    let worker = Worker::new(
+        JobService::new(
+            repository.clone(),
+            JobServiceConfig::new("integration-worker", Duration::seconds(1), 2)
+                .expect("job configuration should be valid"),
+        ),
+        repository.clone(),
+        CommittingHandler {
+            repository: repository.clone(),
+        },
+        worker_config(vec![JobType::FeedRebuild]),
+    )
+    .expect("worker configuration should be valid");
+
+    let WorkerRun::Completed { job, outcome } = worker
+        .run_once(at(1))
+        .await
+        .expect("worker should accept the atomically committed result")
+    else {
+        panic!("queued job should not be idle")
+    };
+
+    assert_eq!(job.id(), job_id);
+    assert_eq!(outcome, JobExecution::Committed);
+    assert_eq!(job.status(), JobStatus::Succeeded);
+    assert_eq!(
+        repository.find(job_id).await.unwrap().unwrap().status(),
+        JobStatus::Succeeded
     );
 }
 

@@ -4,8 +4,10 @@
 //! runtime composition. [`Worker::run_once`] claims one allowed job, runs a
 //! handler while heartbeating its lease, then applies the handler's typed
 //! outcome through a caller-owned transaction and commits that transaction
-//! exactly once. [`Worker::run_until_shutdown`] repeats that pass with bounded
-//! idle polling and transient-error backoff.
+//! exactly once. Atomic business handlers may instead commit the job and their
+//! business data together and return [`JobExecution::Committed`].
+//! [`Worker::run_until_shutdown`] repeats that pass with bounded idle polling
+//! and transient-error backoff.
 //!
 //! Responsibilities:
 //!
@@ -36,11 +38,11 @@
 //! no stale outcome is attempted.
 //!
 //! RSS-cache interaction: this module does not render, read, or publish feeds.
-//! Feed rebuild and source-sync handlers remain future work until a handler can
-//! stage business writes in the same [`UnitOfWork`] that receives the job
-//! outcome. The shared outcome adapter establishes that transaction boundary
-//! for outcome-only passes; queue-only completion must not be used to publish
-//! business data separately from the job outcome.
+//! The feed-rebuild handler uses the committed-outcome path so cache
+//! publication and job completion remain one transaction. Synchronization
+//! handlers still need a two-phase contract to stage their article/source/
+//! sync-run writes in the same [`UnitOfWork`]. Queue-only completion must not
+//! be used to publish business data separately from the job outcome.
 
 use std::{sync::Arc, time::Duration as StdDuration};
 
@@ -63,6 +65,12 @@ use crate::{
 pub enum JobExecution {
     /// The handler completed and its queue outcome may be persisted.
     Succeeded,
+    /// The handler completed the job and its atomic business transaction.
+    ///
+    /// The worker does not apply another outcome for this variant. It reads
+    /// the committed job snapshot after the handler returns so a handler such
+    /// as feed rebuild can commit business data and job state together.
+    Committed,
     /// The handler reached a non-failure eligibility boundary.
     Deferred {
         /// Next instant at which the job may be claimed.
@@ -85,8 +93,12 @@ pub enum JobExecution {
 /// Handler capability used by one worker pass.
 #[allow(async_fn_in_trait)]
 pub trait JobHandler: Send + Sync {
-    /// Runs one claimed job. The handler must not commit job state itself.
-    async fn execute(&self, lease: &JobLease) -> JobExecution;
+    /// Runs one claimed job at the supplied compatibility/test timestamp.
+    ///
+    /// Most handlers return an outcome for the worker to commit. A handler
+    /// returning [`JobExecution::Committed`] may own the shared transaction
+    /// itself when business data and job completion must be atomic.
+    async fn execute(&self, lease: &JobLease, now: DateTime<Utc>) -> JobExecution;
 }
 
 /// Validated heartbeat and dispatch policy for one worker pass.
@@ -246,7 +258,7 @@ pub enum WorkerRun {
     Idle,
     /// One job completed its handler and durable outcome transaction.
     Completed {
-        /// Job snapshot returned by the fenced outcome update.
+        /// Job snapshot after the durable outcome transaction.
         job: Box<Job>,
         /// Outcome selected by the handler.
         outcome: JobExecution,
@@ -375,19 +387,32 @@ where
         };
 
         let outcome = self.execute_with_heartbeats(&lease, now).await?;
-        let mut transaction = self
-            .outcomes
-            .begin()
-            .await
-            .map_err(WorkerError::Transaction)?;
-        let completed = self
-            .apply_outcome(&mut transaction, &lease, outcome.clone(), now)
-            .await
-            .map_err(WorkerError::Job)?;
-        transaction
-            .commit()
-            .await
-            .map_err(WorkerError::Transaction)?;
+        let completed = if outcome == JobExecution::Committed {
+            self.jobs
+                .find(lease.job.id())
+                .await
+                .map_err(WorkerError::Job)?
+                .ok_or_else(|| {
+                    WorkerError::Job(JobServiceError::Repository(JobRepositoryError::NotFound {
+                        job_id: lease.job.id(),
+                    }))
+                })?
+        } else {
+            let mut transaction = self
+                .outcomes
+                .begin()
+                .await
+                .map_err(WorkerError::Transaction)?;
+            let completed = self
+                .apply_outcome(&mut transaction, &lease, outcome.clone(), now)
+                .await
+                .map_err(WorkerError::Job)?;
+            transaction
+                .commit()
+                .await
+                .map_err(WorkerError::Transaction)?;
+            completed
+        };
         Ok(WorkerRun::Completed {
             job: Box::new(completed),
             outcome,
@@ -455,7 +480,7 @@ where
             self.config.heartbeat_every(),
         );
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let handler = self.handler.execute(lease);
+        let handler = self.handler.execute(lease, now);
         tokio::pin!(handler);
 
         loop {
@@ -487,6 +512,7 @@ where
     {
         match outcome {
             JobExecution::Succeeded => self.jobs.succeed(transaction, lease, now).await,
+            JobExecution::Committed => unreachable!("committed outcomes bypass apply_outcome"),
             JobExecution::Deferred { resume_at } => {
                 self.jobs.defer(transaction, lease, now, resume_at).await
             }
@@ -546,7 +572,7 @@ mod tests {
     }
 
     impl JobHandler for FixedHandler {
-        async fn execute(&self, _lease: &JobLease) -> JobExecution {
+        async fn execute(&self, _lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
             self.calls.fetch_add(1, Ordering::Relaxed);
             sleep(self.delay).await;
             self.outcome.clone()

@@ -180,6 +180,11 @@ where
             .await?)
     }
 
+    /// Reads one job snapshot through the queue's read port.
+    pub async fn find(&self, job_id: Uuid) -> Result<Option<Job>, JobServiceError> {
+        Ok(self.queue.find(job_id).await?)
+    }
+
     /// Heartbeats a lease using this service's owner and the lease's token.
     pub async fn heartbeat(
         &self,

@@ -2,9 +2,14 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 use wechrss::{
-    application::feed_rebuild_service::{
-        FeedRebuildConfig, FeedRebuildDependencies, FeedRebuildError, FeedRebuildOutcome,
-        FeedRebuildService,
+    application::{
+        feed_rebuild_handler::{FeedRebuildJobHandler, FeedRebuildJobHandlerConfig},
+        feed_rebuild_service::{
+            FeedRebuildConfig, FeedRebuildDependencies, FeedRebuildError, FeedRebuildOutcome,
+            FeedRebuildService,
+        },
+        job_service::{JobService, JobServiceConfig},
+        worker::{JobExecution, Worker, WorkerConfig, WorkerRun},
     },
     domain::{
         article::NewArticle,
@@ -144,6 +149,135 @@ async fn rebuild_for_claimed_job_completes_cache_and_job_in_one_unit_of_work(poo
         .await
         .expect("cache read should succeed")
         .is_some());
+}
+
+#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+async fn feed_rebuild_handler_completes_cache_and_job_without_double_completion(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_id).await;
+    insert_article(
+        &pool,
+        &factory,
+        source_id,
+        "handler-review",
+        "Handler article",
+        100,
+    )
+    .await;
+
+    let jobs = PostgresJobRepository::new(pool.clone());
+    let job_id = match jobs
+        .enqueue(NewJob {
+            job_type: JobType::FeedRebuild,
+            source_id: Some(source_id.as_uuid()),
+            priority: 1,
+            run_after: timestamp(0),
+            max_attempts: 3,
+            payload: serde_json::json!({"source_id": source_id.as_uuid()}),
+            dedupe_key: format!("feed-rebuild-handler:{source_id}"),
+            now: timestamp(0),
+        })
+        .await
+        .expect("feed rebuild job should enqueue")
+    {
+        EnqueueResult::Inserted(job) => job.id(),
+        EnqueueResult::AlreadyActive { .. } => panic!("feed rebuild job should be unique"),
+    };
+
+    let service = rebuild_service(&pool, &factory, "builder-a");
+    let handler = FeedRebuildJobHandler::new(
+        service,
+        FeedRebuildJobHandlerConfig::new(Duration::minutes(1))
+            .expect("handler configuration should be valid"),
+    );
+    let worker = Worker::new(
+        JobService::new(
+            jobs.clone(),
+            JobServiceConfig::new("worker-a", Duration::minutes(5), 10)
+                .expect("job service configuration should be valid"),
+        ),
+        factory,
+        handler,
+        WorkerConfig::new(
+            vec![JobType::FeedRebuild],
+            std::time::Duration::from_secs(1),
+        )
+        .expect("worker configuration should be valid"),
+    )
+    .expect("worker should be valid");
+
+    let WorkerRun::Completed { job, outcome } = worker
+        .run_once(timestamp(1))
+        .await
+        .expect("feed rebuild worker should complete")
+    else {
+        panic!("feed rebuild job should be claimed")
+    };
+    assert_eq!(job.id(), job_id);
+    assert_eq!(outcome, JobExecution::Committed);
+    assert_eq!(job.status(), wechrss::domain::job::JobStatus::Succeeded);
+    let cache = PostgresFeedCacheRepository::new(pool)
+        .get(source_id)
+        .await
+        .expect("cache read should succeed")
+        .expect("handler should publish cache");
+    assert!(String::from_utf8_lossy(cache.cache().xml_bytes()).contains("Handler article"));
+}
+
+#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+async fn feed_rebuild_handler_permanently_fails_when_source_is_missing(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let jobs = PostgresJobRepository::new(pool.clone());
+    jobs.enqueue(NewJob {
+        job_type: JobType::FeedRebuild,
+        source_id: Some(source_id.as_uuid()),
+        priority: 1,
+        run_after: timestamp(0),
+        max_attempts: 3,
+        payload: serde_json::json!({"source_id": source_id.as_uuid()}),
+        dedupe_key: format!("feed-rebuild-missing:{source_id}"),
+        now: timestamp(0),
+    })
+    .await
+    .expect("feed rebuild job should enqueue");
+
+    let handler = FeedRebuildJobHandler::new(
+        rebuild_service(&pool, &factory, "builder-a"),
+        FeedRebuildJobHandlerConfig::default(),
+    );
+    let worker = Worker::new(
+        JobService::new(
+            jobs.clone(),
+            JobServiceConfig::new("worker-a", Duration::minutes(5), 10)
+                .expect("job service configuration should be valid"),
+        ),
+        factory,
+        handler,
+        WorkerConfig::new(
+            vec![JobType::FeedRebuild],
+            std::time::Duration::from_secs(1),
+        )
+        .expect("worker configuration should be valid"),
+    )
+    .expect("worker should be valid");
+
+    let WorkerRun::Completed { job, outcome } = worker
+        .run_once(timestamp(1))
+        .await
+        .expect("missing source should be a handled permanent failure")
+    else {
+        panic!("missing source job should be claimed")
+    };
+    assert_eq!(job.status(), wechrss::domain::job::JobStatus::Failed);
+    assert_eq!(job.failure_count(), 0);
+    assert_eq!(
+        outcome,
+        JobExecution::Failed {
+            error: "feed rebuild job data is invalid".to_owned()
+        }
+    );
 }
 
 #[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]

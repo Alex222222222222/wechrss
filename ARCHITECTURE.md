@@ -30,7 +30,8 @@ token resolution with the cache-first feed service.
 ## Implementation status and contract policy
 
 This document describes the target version-one architecture, not the behavior
-of a deployable server. The binary is currently a no-op. The executable
+of a deployable server. The binary still does not start the process supervisor;
+the executable role boundary is the side-effect-free `RuntimePlan`. The
 foundations are typed environment parsing for the target configuration set,
 pure pacing/quiet-hours policy, PostgreSQL pool/migration helpers, the job and
 feed-cache domain/repository slices, their shared transaction boundary, the
@@ -44,16 +45,18 @@ The current and target contracts must not be confused:
 
 | Area | Executable now | Target contract and implementation gate |
 | --- | --- | --- |
-| Runtime | No server, routes, role composition, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
+| Runtime | Side-effect-free `RuntimePlan` consumes `AppConfig`, selects only configured API/scheduler/worker roles, derives loop/lease policies, and conservatively dispatches only executable feed-rebuild jobs | Process supervisor still needs to construct PostgreSQL/browser/API adapters and spawn the planned loops |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, and shutdown-aware heartbeat/outcome execution | Synchronization-specific dispatch and removal of compatibility `now` parameters remain future work |
-| Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | Runtime composition must consume the parsed role and policy values before deployment relies on them |
+| Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | The process supervisor must consume the parsed role and policy values before deployment relies on them |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
-| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, current/legacy WeRead article-list response parsing, database-only feed rebuild orchestration, and pure RSS renderer | Authenticated protocol transport, application handlers, and feed-token routing remain future work |
+| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, current/legacy WeRead article-list response parsing, database-only feed rebuild orchestration plus its atomic worker handler, and pure RSS renderer | Authenticated protocol transport, source-sync/application HTTP handlers, and feed-token routing remain future work |
 | Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, and external-image reporting through ArchiveService | Asset persistence and URL rewriting remain future work |
 
-Environment variables in this document are parsed into `AppConfig`, but the
-binary is still a no-op and does not construct role-specific runtime
-components. The loader has an explicit allowlist for application-owned names
+Environment variables in this document are parsed into `AppConfig`, and
+`application::runtime::RuntimePlan` is the side-effect-free boundary that
+derives role-specific component plans. It does not open connections, start
+listeners, or spawn tasks. The process supervisor must consume the plan before
+constructing those side effects. The loader has an explicit allowlist for application-owned names
 and rejects unknown names within those prefixes so misspellings cannot be
 silently ignored, while ordinary container variables such as `PATH` remain
 permitted.
@@ -964,8 +967,9 @@ than add more empty module shells. Work proceeds in this order:
    delivery and deduplicated rebuild enqueueing are implemented). The worker
    supports committing its fenced outcome through `UnitOfWork`, and
    `FeedRebuildService::rebuild_for_job` now couples successful feed-cache
-   finalization to that outcome. Add the remaining source/archive queries and
-   map pre-publication rebuild failures to explicit worker outcomes.
+   finalization to that outcome. Add the remaining source/archive queries; the
+   `FeedRebuildJobHandler` already maps pre-publication rebuild failures to
+   explicit worker outcomes.
 4. Build role-aware runtime composition and integrate the scheduler/worker
    loops, heartbeat cancellation, and degraded browser health behavior.
 5. Complete the acquisition slice with fresh-profile creation and browser
@@ -1041,8 +1045,9 @@ implemented by `FeedTokenService`. `FeedRebuildService` reads normalized source
 and article rows, renders outside a transaction, and publishes through the
 revision/fence-aware feed-cache transaction. Its `rebuild_for_job` path also
 completes a claimed `feed_rebuild` job in that same final unit of work on
-successful finalization; pre-publication failures remain for the worker to
-classify. Neither service is HTTP-wired.
+successful finalization; `FeedRebuildJobHandler` maps active builders and
+pre-publication failures to safe worker outcomes without double-completing a
+successful job. Neither service is HTTP-wired.
 
 The one-pass scheduler wrapper in `src/application/scheduler.rs` now forwards
 the configured quiet-hours policy to the atomic source-scheduling operation.
@@ -1053,7 +1058,7 @@ role selection and metrics. It must call this boundary rather than reimplement
 source selection.
 
 The remaining tree intentionally contains no route handlers, source
-HTTP feed-token orchestration, role composition, credential
+HTTP feed-token orchestration, credential
 persistence, or synchronization business implementation. Credential persistence,
 binary asset persistence, and URL rewriting remain documentation-only; the pure
 archive sanitizer and `ArchiveService` are executable. Acquisition now
