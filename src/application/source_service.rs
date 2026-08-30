@@ -12,8 +12,9 @@
 //! Feed-visible changes increment the revision and invalidate/rebuild the cache
 //! in a shared persistence `UnitOfWork`. Operator actions explicitly clear
 //! `authentication_required` or `risk_controlled`; merely reaching another due
-//! timestamp must not clear those states. Feed-token lifecycle, deletion, and
-//! feed-cache invalidation are still future service operations.
+//! timestamp must not clear those states. Feed-token lifecycle is owned by its
+//! separate application service; deletion and feed-cache invalidation are still
+//! future service operations.
 //!
 //! Non-responsibilities: direct SQL, browser selectors, article fetching, or
 //! rendering RSS bytes. PostgreSQL concurrency and duplicate-source handling

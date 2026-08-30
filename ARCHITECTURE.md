@@ -6,9 +6,10 @@ incremental: it defines boundaries and ownership, with the domain/configuration
 policies and the first PostgreSQL job/cache-persistence slices implemented
 while authenticated protocol work and HTTP behavior remain unimplemented. The
 pure RSS renderer, normalized article persistence, cache-first feed delivery
-decision service, archive sanitizer, and unauthenticated public article browser
-path are executable, but they are not yet wired to an HTTP route. The public
-feed-token lifecycle is executable, but the web route still needs to compose
+decision service, archive sanitizer, unauthenticated public article browser
+path, and database-only feed rebuild orchestration are executable, but they are
+not yet wired to an HTTP route. The public feed-token lifecycle is executable,
+but the web route still needs to compose
 token resolution with the cache-first feed service.
 
 ## Goals
@@ -47,7 +48,7 @@ The current and target contracts must not be confused:
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, and shutdown-aware heartbeat/outcome execution | Synchronization-specific dispatch and removal of compatibility `now` parameters remain future work |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | Runtime composition must consume the parsed role and policy values before deployment relies on them |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
-| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, and pure RSS renderer | Authenticated protocol adapter, application handlers, and feed-token routing remain future work |
+| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, database-only feed rebuild orchestration, and pure RSS renderer | Authenticated protocol adapter, application handlers, and feed-token routing remain future work |
 | Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, and external-image reporting through ArchiveService | Asset persistence and URL rewriting remain future work |
 
 Environment variables in this document are parsed into `AppConfig`, but the
@@ -508,8 +509,9 @@ article persistence, the cache read, and the final revision/fence
 compare-and-swap publication. Callers must still provide the source revision
 and normalized rendered candidate through application ports. The pure renderer
 is implemented in `src/rss/renderer.rs`; the cache-first feed service is
-implemented in `src/application/feed_service.rs`. Public feed-token lifecycle
-is implemented in `src/domain/feed_token.rs`,
+implemented in `src/application/feed_service.rs`; database-only feed rebuild is
+implemented in `src/application/feed_rebuild_service.rs`. Public feed-token
+lifecycle is implemented in `src/domain/feed_token.rs`,
 `src/persistence/repositories/feed_token_repository.rs`, and
 `src/application/feed_token_service.rs`; HTTP route composition remains future
 work.
@@ -538,10 +540,13 @@ Single-flight cache generation uses a durable `feed_build_leases` row keyed by
 connection while XML is rendered. Acquisition is a short transaction that
 inserts or takes over an expired row and returns `owner`, a fresh fencing token,
 and `lease_until`, all based on PostgreSQL server time. The owner commits that
-transaction, reads a revisioned RSS snapshot, renders outside any transaction,
-and heartbeats the build lease if necessary. A short final `UnitOfWork` verifies
-the build token and source revision, replaces the cache, and releases the build
-lease atomically. Lease loss or revision conflict discards the candidate.
+transaction, reads a revisioned RSS snapshot, samples PostgreSQL time for the
+candidate timestamps, renders outside any transaction, and heartbeats the build
+lease if necessary. A short final `UnitOfWork` verifies the build token and
+source revision, replaces the cache, and releases the build lease atomically.
+Using database time for `generated_at` keeps same-revision cache ordering and
+freshness decisions independent of replica clock skew. Lease loss or revision
+conflict discards the candidate.
 
 ```text
 feed_build_leases:
@@ -587,8 +592,9 @@ claimed work and re-checks quiet hours between upstream operations.
 `ArchiveService` owns the content pipeline. `JobService` owns leases and
 transitions. `FeedService` owns conditional reads, fresh/stale/missing
 decisions, and deduplicated rebuild enqueueing over the persisted cache.
-Single-flight cache population and rebuild orchestration remain future
-extensions. Application services receive a `UnitOfWorkFactory` for
+Single-flight cache population is coordinated by the durable feed-build lease,
+and database-only rebuild orchestration is implemented by
+`FeedRebuildService`. Application services receive a `UnitOfWorkFactory` for
 atomic final writes; they do not compose independent repository transactions.
 `FeedTokenService` now owns opaque token issue/rotate, strict request parsing,
 hash-only repository access, and idempotent revocation. `SourceService` now
@@ -952,8 +958,9 @@ than add more empty module shells. Work proceeds in this order:
    lease repositories are also executable. No source or feed application
    service may bypass these boundaries with convenience transactions.
 3. Make `FeedService` executable over the persisted cache (cache-first
-   delivery and deduplicated rebuild enqueueing are implemented), then add the
-   remaining source/archive queries and database-only rebuild orchestration.
+   delivery and deduplicated rebuild enqueueing are implemented), then extend
+   the executable `FeedRebuildService` with worker outcome coupling and add the
+   remaining source/archive queries.
 4. Build role-aware runtime composition and integrate the scheduler/worker
    loops, heartbeat cancellation, and degraded browser health behavior.
 5. Complete the acquisition slice with fresh-profile creation and browser
@@ -1021,7 +1028,9 @@ candidates. The cache-first `FeedService` in
 rows, honors conditional ETags, and enqueues deduplicated rebuild jobs through
 the custom `jobs` table adapter. It is not yet wired to the database-only
 rebuild/publish workflow or an HTTP route; feed-token resolution itself is
-implemented by `FeedTokenService`.
+implemented by `FeedTokenService`. `FeedRebuildService` reads normalized source
+and article rows, renders outside a transaction, and publishes through the
+revision/fence-aware feed-cache transaction. Neither service is HTTP-wired.
 
 The one-pass scheduler wrapper in `src/application/scheduler.rs` now forwards
 the configured quiet-hours policy to the atomic source-scheduling operation.

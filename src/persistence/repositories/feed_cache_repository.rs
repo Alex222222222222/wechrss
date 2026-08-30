@@ -50,6 +50,9 @@ pub enum FeedBuildLeaseError {
     /// A lease must be positive and representable by the repository.
     #[error("feed-build lease duration must be positive and fit in milliseconds")]
     InvalidLeaseDuration,
+    /// The source disappeared before a lease could be created.
+    #[error("source {source_id} was not found for feed-build lease")]
+    SourceNotFound { source_id: SourceId },
     /// The current owner or fencing token no longer controls the lease.
     #[error("feed-build lease for {source_id} is no longer owned by this claim")]
     LeaseLost { source_id: SourceId },
@@ -154,7 +157,7 @@ impl FeedBuildLeaseRepository for PostgresFeedBuildLeaseRepository {
         .bind(milliseconds)
         .fetch_optional(&self.pool)
         .await
-        .map_err(storage_error)?;
+        .map_err(|error| map_acquire_error(error, source_id))?;
 
         row.map(decode_lease).transpose()
     }
@@ -672,6 +675,15 @@ fn lease_milliseconds(lease_for: Duration) -> Result<i64, FeedBuildLeaseError> {
 
 fn storage_error(error: impl fmt::Display) -> FeedBuildLeaseError {
     FeedBuildLeaseError::Storage(error.to_string())
+}
+
+fn map_acquire_error(error: sqlx::Error, source_id: SourceId) -> FeedBuildLeaseError {
+    if let sqlx::Error::Database(database_error) = &error {
+        if database_error.code().as_deref() == Some("23503") {
+            return FeedBuildLeaseError::SourceNotFound { source_id };
+        }
+    }
+    storage_error(error)
 }
 
 #[derive(Debug)]

@@ -20,6 +20,8 @@
 //! - `source()` borrows the transaction-scoped source mutation view;
 //! - `articles()` borrows the transaction-scoped article mutation view;
 //! - `feed_cache()` borrows the transaction-scoped feed-cache publication view;
+//! - `database_now()` samples the PostgreSQL clock for persisted ordering
+//!   timestamps;
 //! - `commit(self)` is the only successful exit for a completed unit of work;
 //! - `rollback(self)` is available for explicit cleanup in tests or callers
 //!   that need to await rollback; and
@@ -65,6 +67,7 @@
 
 use std::fmt;
 
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use thiserror::Error;
 
@@ -87,6 +90,9 @@ pub enum UnitOfWorkError {
     /// SQLx could not start, commit, or roll back the transaction.
     #[error("unit of work transaction error: {0}")]
     Transaction(#[source] sqlx::Error),
+    /// SQLx could not sample the authoritative PostgreSQL clock.
+    #[error("unit of work database clock error: {0}")]
+    DatabaseClock(#[source] sqlx::Error),
 }
 
 /// Factory for short-lived, shared persistence transactions.
@@ -116,6 +122,18 @@ impl UnitOfWorkFactory {
             .await
             .map_err(UnitOfWorkError::Transaction)?;
         Ok(UnitOfWork { jobs })
+    }
+
+    /// Samples PostgreSQL's wall clock without opening a long-lived transaction.
+    ///
+    /// Application services use this for persisted timestamps that participate
+    /// in cross-replica ordering. The query intentionally uses
+    /// `clock_timestamp()` rather than a process-local clock.
+    pub async fn database_now(&self) -> Result<DateTime<Utc>, UnitOfWorkError> {
+        sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(UnitOfWorkError::DatabaseClock)
     }
 }
 

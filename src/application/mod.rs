@@ -14,6 +14,7 @@
 
 pub mod archive_service;
 pub mod auth_service;
+pub mod feed_rebuild_service;
 pub mod feed_service;
 pub mod feed_token_service;
 pub mod job_service;

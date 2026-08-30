@@ -27,8 +27,8 @@
 //! Expected interfaces: the web layer supplies a source id and an optional
 //! `If-None-Match` value; a [`FeedCacheRepository`] performs one fast read; and
 //! a [`FeedRebuildQueue`] maps a source to the canonical active-job dedupe key.
-//! A future feed-token repository can be placed in front of this service
-//! without changing its cache or queue contracts.
+//! `FeedTokenService` can be placed in front of this service without changing
+//! its cache or queue contracts.
 //!
 //! Data flow: a fresh cache is returned immediately, optionally as 304 when
 //! its ETag matches. A stale cache is returned immediately and asks the queue
@@ -52,9 +52,9 @@
 //! PGMQ is intentionally not required for v1; it is documented as a possible
 //! future transport optimization while the `jobs` row remains authoritative.
 //!
-//! TODO(design): add feed-token/source lookup and a database-only rebuild
-//! orchestration path over the normalized article query and fenced cache
-//! publication view.
+//! The database-only rebuild orchestration lives in
+//! [`super::feed_rebuild_service::FeedRebuildService`], keeping rendering and
+//! publication off this latency-sensitive request path.
 
 use std::fmt;
 
