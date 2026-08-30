@@ -42,7 +42,7 @@ The current and target contracts must not be confused:
 | Area | Executable now | Target contract and implementation gate |
 | --- | --- | --- |
 | Runtime | No server, routes, scheduler, worker, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
-| Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, and PostgreSQL-clocked SQLx job operations | Remove caller `now` parameters only in a later queue-port contract release |
+| Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, and the worker-facing `JobService` facade | Worker polling/dispatch loop and removal of compatibility `now` parameters remain future work |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | Runtime composition must consume the parsed role and policy values before deployment relies on them |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
 | Acquisition/web/RSS | A validated public WeChat article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, and pure RSS renderer | Authenticated protocol adapter, application handlers, and feed-token routing remain future work |
@@ -966,11 +966,13 @@ values and their PostgreSQL repositories/transaction views are implemented in
 they provide idempotent article upserts, feed-visible change detection,
 source-scoped RSS ordering, typed sync outcomes, bounded counters, and safe
 failure summaries. The sync-run repository's transaction-scoped `UnitOfWork`
-view is also included in that implementation. Remaining source-service
-orchestration, credential, archive, and other repository views remain future
-work. The pure
-RSS renderer in `src/rss/renderer.rs` is executable and
-produces revision-tagged cache candidates. The cache-first `FeedService` in
+view is also included in that implementation. `SourceService` and
+`JobService` provide source lifecycle and worker queue orchestration, while
+`ArchiveService` provides pure content normalization and hashing. Credential
+persistence, binary asset persistence, URL rewriting, and other repository
+views remain future work. The pure RSS renderer in
+`src/rss/renderer.rs` is executable and produces revision-tagged cache
+candidates. The cache-first `FeedService` in
 `src/application/feed_service.rs` is also executable: it serves fresh or stale
 rows, honors conditional ETags, and enqueues deduplicated rebuild jobs through
 the custom `jobs` table adapter. It is not yet wired to feed-token lookup, the
@@ -985,15 +987,17 @@ selection.
 
 The remaining tree intentionally contains no route handlers, source
 configuration/feed-token orchestration, scheduler loops, credential
-persistence, or business implementation. Credential persistence and
-asset persistence and URL rewriting remain documentation-only; the pure archive
-sanitizer and ArchiveService are executable. Acquisition now contains executable capability/session
-ports, local capacity/lease ownership, public WebDriver navigation, common
-article extraction, bounded public-page pacing/scroll execution, and expected
-browser-timezone validation; authenticated protocol work, authenticated pacing
-hooks, and browser health remain future work. `SourceService` implements source
-create/read, operator enable/gate changes, and the initial-job slice described
-above, while article and sync-run persistence and `FeedService` implement only
-the database/cache boundaries described above.
+persistence, or synchronization business implementation. Credential persistence,
+binary asset persistence, and URL rewriting remain documentation-only; the pure
+archive sanitizer and `ArchiveService` are executable. Acquisition now
+contains executable capability/session ports, local capacity/lease ownership,
+public WebDriver navigation, common article extraction, bounded public-page
+pacing/scroll execution, and expected browser-timezone validation; authenticated
+protocol work, authenticated pacing hooks, and browser health remain future work.
+`SourceService` implements source create/read, operator enable/gate changes,
+and the initial-job slice described above. `JobService` implements queue
+lifecycle and transaction-scoped outcome binding, while article and sync-run
+persistence and `FeedService` implement the database/cache boundaries described
+above. Worker polling and synchronization dispatch remain future work.
 `TODO(design)` markers identify existing code and migrations that must change
 before the remaining contracts are implemented.
