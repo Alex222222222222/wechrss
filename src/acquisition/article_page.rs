@@ -53,8 +53,12 @@ pub struct ExtractedArticlePage {
     pub author: Option<String>,
     /// Optional summary or digest.
     pub summary: Option<String>,
-    /// Publication time normalized to UTC.
-    pub published_at: DateTime<Utc>,
+    /// Publication time normalized to UTC, when the page exposes one.
+    ///
+    /// Some valid WeChat article renderings omit the publication timestamp.
+    /// The synchronization layer may then use the timestamp from the
+    /// authenticated list response as a fallback.
+    pub published_at: Option<DateTime<Utc>>,
     /// Sanitization input; it is not safe to publish without archive processing.
     pub content_html: String,
     /// Optional cover URL. Binary downloading is intentionally outside this port.
@@ -223,10 +227,9 @@ fn parse_article_html(
         ));
     }
 
-    let published_text = first_text(&document, &["#publish_time"]).ok_or_else(|| {
-        ArticlePageError::InvalidExtraction("article publication time is missing".into())
-    })?;
-    let published_at = parse_publication_time(&published_text, timezone)?;
+    let published_at = first_text(&document, &["#publish_time"])
+        .map(|value| parse_publication_time(&value, timezone))
+        .transpose()?;
 
     Ok(ExtractedArticlePage {
         canonical_url,
@@ -370,7 +373,7 @@ mod tests {
                 title: "title".to_owned(),
                 author: None,
                 summary: None,
-                published_at: Utc::now(),
+                published_at: Some(Utc::now()),
                 content_html: "<p>body</p>".to_owned(),
                 cover_url: None,
             })
@@ -489,7 +492,12 @@ mod tests {
             page.cover_url.as_deref(),
             Some("https://mmbiz.qpic.cn/example.jpg")
         );
-        assert_eq!(page.published_at.to_rfc3339(), "2026-08-29T02:20:00+00:00");
+        assert_eq!(
+            page.published_at
+                .expect("publication time should be present")
+                .to_rfc3339(),
+            "2026-08-29T02:20:00+00:00"
+        );
         assert!(page.content_html.contains("<strong>world</strong>"));
     }
 
@@ -581,6 +589,18 @@ mod tests {
     }
 
     #[test]
+    fn allows_a_valid_article_without_a_publication_time_for_list_fallback() {
+        let html = r#"
+            <h1 class="rich_media_title">Title</h1>
+            <div id="js_content"><p>Body</p></div>
+        "#;
+
+        let page = parse_article_html(html, article_url(), chrono_tz::Asia::Shanghai)
+            .expect("publication time may be supplied by the list response");
+        assert_eq!(page.published_at, None);
+    }
+
+    #[test]
     fn accepts_date_only_publication_time_at_timezone_midnight() {
         let html = r#"
             <h1 class="rich_media_title">Title</h1>
@@ -588,7 +608,12 @@ mod tests {
             <div id="js_content"><p>Body</p></div>
         "#;
         let page = parse_article_html(html, article_url(), chrono_tz::Asia::Shanghai).unwrap();
-        assert_eq!(page.published_at.to_rfc3339(), "2026-08-28T16:00:00+00:00");
+        assert_eq!(
+            page.published_at
+                .expect("publication time should be present")
+                .to_rfc3339(),
+            "2026-08-28T16:00:00+00:00"
+        );
     }
 
     #[test]

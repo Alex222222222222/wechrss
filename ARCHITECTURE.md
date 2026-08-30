@@ -1071,6 +1071,14 @@ including the shared `UnitOfWorkFactory` outcome path. `Worker::run_until_shutdo
 adds bounded idle polling, transient-error
 backoff, and graceful shutdown between passes. Article and sync-run persistence
 and `FeedService` implement the database/cache boundaries described above.
-Synchronization-specific handlers remain future work.
+`SyncService` implements the pure acquisition-result merge, archive
+normalization, and typed failure classification needed by a future
+source-sync handler; transport, account-session ownership, and final
+transactional writes remain future work. Synchronization-specific handlers
+remain future work. A valid public page may omit its publication timestamp;
+the service prefers the page value, then the authenticated list value, and
+rejects the observation only when both are absent. Malformed WeRead article
+identity or URL data is a permanent data failure; `blocked` is reserved for
+verification pages and unsafe navigation results.
 `TODO(design)` markers identify existing code and migrations that must change
 before the remaining contracts are implemented.

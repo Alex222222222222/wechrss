@@ -55,7 +55,7 @@ impl ArticlePageFetcher for PublicFetcher {
             title: "Public article".to_owned(),
             author: None,
             summary: None,
-            published_at: Utc::now(),
+            published_at: Some(Utc::now()),
             content_html: "<p>content</p>".to_owned(),
             cover_url: None,
         })
