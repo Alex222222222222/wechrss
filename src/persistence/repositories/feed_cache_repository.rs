@@ -289,7 +289,7 @@ pub enum FeedCacheRepositoryError {
 }
 
 /// Fast, transaction-independent reads used by the RSS endpoint.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait FeedCacheRepository: Send + Sync {
     /// Reads the current cached bytes and metadata for one source.
     async fn get(
@@ -320,6 +320,7 @@ impl PostgresFeedCacheRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl FeedCacheRepository for PostgresFeedCacheRepository {
     async fn get(
         &self,

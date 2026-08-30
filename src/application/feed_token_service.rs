@@ -23,7 +23,8 @@
 //! callers must not persist or log it.
 //!
 //! TODO(implementation): compose this service into the protected source
-//! administration API and the tokenized `/feeds/{feed_token}.xml` route.
+//! administration API. The public tokenized `/feeds/{feed_token}.xml` route is
+//! implemented by [`crate::web::api`].
 
 use thiserror::Error;
 
@@ -118,6 +119,7 @@ mod tests {
         replace_calls: usize,
     }
 
+    #[async_trait::async_trait]
     impl FeedTokenRepository for FakeRepository {
         async fn find_source(
             &self,
@@ -209,6 +211,7 @@ mod tests {
         #[derive(Clone)]
         struct FailingRepository;
 
+        #[async_trait::async_trait]
         impl FeedTokenRepository for FailingRepository {
             async fn find_source(
                 &self,

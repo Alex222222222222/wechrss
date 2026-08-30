@@ -49,7 +49,7 @@ pub enum FeedTokenRepositoryError {
 }
 
 /// Storage port for active public feed-token capabilities.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait FeedTokenRepository: Send + Sync {
     /// Resolves an active digest to its source, if one exists.
     async fn find_source(
@@ -90,6 +90,7 @@ impl PostgresFeedTokenRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl FeedTokenRepository for PostgresFeedTokenRepository {
     async fn find_source(
         &self,

@@ -228,7 +228,7 @@ pub enum FeedRebuildQueueError {
 }
 
 /// Minimal queue port needed by cache-first feed delivery.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait FeedRebuildQueue: Send + Sync {
     /// Enqueues one source rebuild under its active dedupe key.
     async fn enqueue_rebuild(
@@ -304,6 +304,7 @@ impl PostgresFeedRebuildQueue {
     }
 }
 
+#[async_trait::async_trait]
 impl FeedRebuildQueue for PostgresFeedRebuildQueue {
     async fn enqueue_rebuild(
         &self,
@@ -489,6 +490,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl FeedCacheRepository for TestCache {
         async fn get(
             &self,
@@ -527,6 +529,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl FeedRebuildQueue for TestQueue {
         async fn enqueue_rebuild(
             &self,

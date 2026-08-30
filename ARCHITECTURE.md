@@ -4,13 +4,13 @@ This document describes the planned Rust implementation of the existing
 `wechrss-main` Python service. The current Rust tree remains intentionally
 incremental: it defines boundaries and ownership, with the domain/configuration
 policies and the first PostgreSQL job/cache-persistence slices implemented
-while authenticated protocol work and HTTP behavior remain unimplemented. The
-pure RSS renderer, normalized article persistence, cache-first feed delivery
-decision service, archive sanitizer, unauthenticated public article browser
-path, and database-only feed rebuild orchestration are executable, but they are
-not yet wired to an HTTP route. The public feed-token lifecycle is executable,
-but the web route still needs to compose
-token resolution with the cache-first feed service.
+while authenticated protocol work and most HTTP behavior remain unimplemented.
+The pure RSS renderer, normalized article persistence, cache-first feed
+delivery decision service, archive sanitizer, unauthenticated public article
+browser path, and database-only feed rebuild orchestration are executable.
+The public feed-token lifecycle and its tokenized feed route are executable;
+administrative and health routes still need to compose their application
+services.
 
 ## Goals
 
@@ -49,7 +49,7 @@ The current and target contracts must not be confused:
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, and shutdown-aware heartbeat/outcome execution | Synchronization-specific dispatch and removal of compatibility `now` parameters remain future work |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | The process supervisor must consume the parsed role and policy values before deployment relies on them |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
-| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, current/legacy WeRead article-list response parsing, database-only feed rebuild orchestration plus its atomic worker handler, and pure RSS renderer | Authenticated protocol transport, source-sync/application HTTP handlers, and feed-token routing remain future work |
+| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, current/legacy WeRead article-list response parsing, database-only feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, and public tokenized feed route | Authenticated protocol transport, source-sync/application HTTP handlers, administrative routes, and health/readiness wiring remain future work |
 | Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, and external-image reporting through ArchiveService | Asset persistence and URL rewriting remain future work |
 
 Environment variables in this document are parsed into `AppConfig`, and
@@ -516,8 +516,9 @@ implemented in `src/application/feed_service.rs`; database-only feed rebuild is
 implemented in `src/application/feed_rebuild_service.rs`. Public feed-token
 lifecycle is implemented in `src/domain/feed_token.rs`,
 `src/persistence/repositories/feed_token_repository.rs`, and
-`src/application/feed_token_service.rs`; HTTP route composition remains future
-work.
+`src/application/feed_token_service.rs`; the public route composition is
+implemented in `src/web/api.rs`, while administrative route composition remains
+future work.
 
 Feed tokens are 32 random bytes encoded as unpadded base64url. PostgreSQL
 stores only the SHA-256 digest in `feed_tokens`, with one current row per
@@ -563,12 +564,14 @@ for the lease owner's result and otherwise returns a typed temporary-unavailable
 response with `Retry-After`. Expired build leases are safely takeable by another
 replica.
 
-The feed endpoint returns `ETag`, `Last-Modified`, and
-`Cache-Control`. Fresh responses use the remaining lifetime rather than always
-resetting the full TTL. Stale responses use `max-age=0` and an explicit bounded
-`stale-while-revalidate` directive, while still honoring `If-None-Match`. The
-database cache is an application cache, not a replacement for HTTP conditional
-requests.
+The feed endpoint returns `ETag`, `Last-Modified`, and `Cache-Control`. The
+initial route uses `max-age=0, must-revalidate` for fresh responses because the
+cache-read port currently exposes freshness as a boolean rather than the exact
+database-clocked remaining lifetime. Stale responses use `max-age=0` and an
+explicit bounded `stale-while-revalidate` directive, while still honoring
+`If-None-Match`. The cache-read contract should expose the remaining lifetime
+before a later version advertises a positive `max-age`; the database cache is
+an application cache, not a replacement for HTTP conditional requests.
 
 ## Module boundaries
 
@@ -1039,15 +1042,16 @@ views remain future work. The pure RSS renderer in
 candidates. The cache-first `FeedService` in
 `src/application/feed_service.rs` is also executable: it serves fresh or stale
 rows, honors conditional ETags, and enqueues deduplicated rebuild jobs through
-the custom `jobs` table adapter. It is not yet wired to the database-only
-rebuild/publish workflow or an HTTP route; feed-token resolution itself is
-implemented by `FeedTokenService`. `FeedRebuildService` reads normalized source
+the custom `jobs` table adapter. It is wired to the public tokenized feed route
+in `src/web/api.rs`; feed-token resolution itself is implemented by
+`FeedTokenService`. `FeedRebuildService` reads normalized source
 and article rows, renders outside a transaction, and publishes through the
 revision/fence-aware feed-cache transaction. Its `rebuild_for_job` path also
 completes a claimed `feed_rebuild` job in that same final unit of work on
 successful finalization; `FeedRebuildJobHandler` maps active builders and
 pre-publication failures to safe worker outcomes without double-completing a
-successful job. Neither service is HTTP-wired.
+successful job. `FeedService` is HTTP-wired by the public tokenized feed route;
+the rebuild service remains an internal worker dependency.
 
 The one-pass scheduler wrapper in `src/application/scheduler.rs` now forwards
 the configured quiet-hours policy to the atomic source-scheduling operation.
@@ -1057,8 +1061,8 @@ transient-error backoff around this boundary; runtime composition still owns
 role selection and metrics. It must call this boundary rather than reimplement
 source selection.
 
-The remaining tree intentionally contains no route handlers, source
-HTTP feed-token orchestration, credential
+The remaining tree intentionally contains no administrative route handlers,
+source HTTP orchestration, credential
 persistence, or synchronization business implementation. Credential persistence,
 binary asset persistence, and URL rewriting remain documentation-only; the pure
 archive sanitizer and `ArchiveService` are executable. Acquisition now
