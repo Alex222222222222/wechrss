@@ -34,7 +34,7 @@ pure pacing/quiet-hours policy, PostgreSQL pool/migration helpers, the job and
 feed-cache domain/repository slices, their shared transaction boundary, the
 stable account identity plus distributed account-lease slice, the per-source
 feed-build lease slice, atomic due-source scheduling persistence, and the
-unauthenticated Thirtyfour public-page navigation/extraction, bounded
+unauthenticated Thirtyfour public-page identity/navigation/extraction, bounded
 pacing/scroll, and expected browser-timezone validation slice.
 
 The current and target contracts must not be confused:
@@ -45,7 +45,7 @@ The current and target contracts must not be confused:
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, and shutdown-aware heartbeat/outcome execution | Synchronization-specific dispatch and removal of compatibility `now` parameters remain future work |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | Runtime composition must consume the parsed role and policy values before deployment relies on them |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
-| Acquisition/web/RSS | A validated public WeChat article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, and pure RSS renderer | Authenticated protocol adapter, application handlers, and feed-token routing remain future work |
+| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, and pure RSS renderer | Authenticated protocol adapter, application handlers, and feed-token routing remain future work |
 | Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, and external-image reporting through ArchiveService | Asset persistence and URL rewriting remain future work |
 
 Environment variables in this document are parsed into `AppConfig`, but the
@@ -103,8 +103,11 @@ reused for public article extraction.
 ### Add a source
 
 1. The API receives an article URL or normalized `book_id`.
-2. The identity acquisition module opens the URL in a browser session.
-3. It extracts `biz`, decodes the numeric `bid`, and derives
+2. If the URL already carries `__biz`, identity acquisition resolves it
+   without network access; otherwise it opens the URL in a clean public browser
+   session and captures the validated final URL and page source.
+3. It extracts `biz` from the final URL or narrow page-source fallbacks,
+   decodes the numeric `bid`, and derives
    `MP_WXS_<bid>`.
 4. The source repository stores the source and creates its initial schedule.
 5. A deduplicated `source_sync` job becomes eligible for execution.
@@ -584,6 +587,11 @@ The concrete capability contract is:
   domain-side value object is implemented in `src/domain/source.rs`; the
   acquisition ports accept it directly, and the public WebDriver adapter
   revalidates the browser-observed URL before extraction.
+- `WebDriverIdentityResolver` consumes only a `PublicBrowserSession`. It
+  resolves long URLs locally, then uses the validated final URL and rendered
+  source fallbacks (`biz`, `msg_link`, canonical metadata, and embedded public
+  links) for short URLs. It emits `MP_WXS_<bid>` plus optional title/account
+  metadata; malformed IDs and structural verification pages are typed errors.
 - `PublicBrowserSession` is a non-cloneable fresh WebDriver session with no
   imported profile, cookies, local storage, credential handle, or account-lease
   guard. It is destroyed after the public operation.
@@ -610,7 +618,8 @@ has no account or credential state; an
 authenticated request capability is created only after a durable account
 heartbeat. A failed heartbeat permanently cancels the capability. The public
 adapter creates a Thirtyfour session, applies the configured browser profile,
-navigates to the verified URL, rejects an unsafe final URL, executes bounded
+navigates to the verified URL, rejects an unsafe final URL, resolves short
+links through narrow page-source fallbacks, executes bounded
 navigation/action/settling waits and downward scrolls, and parses common
 rendered WeChat metadata/body selectors. Browser health remains behind a TODO;
 when `expected_timezone` is configured, session creation validates the
@@ -916,7 +925,8 @@ than add more empty module shells. Work proceeds in this order:
 5. Complete the acquisition slice with fresh-profile creation and browser
    health checks behind the now-executable verified-URL, Thirtyfour,
    browser-capability, public pacing/scroll, and expected-timezone ports. Public
-   navigation, redirect rejection, common article extraction, and bounded
+   identity resolution, navigation, redirect rejection, common article
+   extraction, and bounded
    public-page pacing/scroll execution are already executable. Authenticated
    protocol pacing hooks remain part of the WeRead adapter work.
 6. Implement synchronization, RSS publication, and HTTP/UI boundaries, followed
@@ -991,9 +1001,10 @@ configuration/feed-token orchestration, role composition, credential
 persistence, or synchronization business implementation. Credential persistence,
 binary asset persistence, and URL rewriting remain documentation-only; the pure
 archive sanitizer and `ArchiveService` are executable. Acquisition now
-contains executable capability/session ports, local capacity/lease ownership,
-public WebDriver navigation, common article extraction, bounded public-page
-pacing/scroll execution, and expected browser-timezone validation; authenticated
+contains executable identity resolution, capability/session ports, local
+capacity/lease ownership, public WebDriver navigation, common article
+extraction, bounded public-page pacing/scroll execution, and expected
+browser-timezone validation; authenticated
 protocol work, authenticated pacing hooks, and browser health remain future work.
 `SourceService` implements source create/read, operator enable/gate changes,
 and the initial-job slice described above. `JobService` implements queue

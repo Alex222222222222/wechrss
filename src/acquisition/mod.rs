@@ -16,12 +16,12 @@
 //! Authenticated and public browser sessions are separate capabilities. Public
 //! sessions use clean ephemeral profiles and accept only verified WeChat URLs.
 //!
-//! The capability ports, process-local browser capacity boundary, concrete
-//! public Thirtyfour navigation, common article extraction, bounded public
-//! page pacing/scroll execution, and optional browser-visible timezone
-//! validation are executable. Fresh-profile lifecycle details, authenticated
-//! protocol work, authenticated pacing hooks, and browser sidecar health
-//! checks remain TODOs in the child modules.
+//! The capability ports, process-local browser capacity boundary, public
+//! Thirtyfour navigation, identity resolution, common article extraction,
+//! bounded public page pacing/scroll execution, and optional browser-visible
+//! timezone validation are executable. Authenticated protocol work,
+//! authenticated pacing hooks, and browser sidecar health checks remain TODOs
+//! in the child modules.
 
 pub mod article_page;
 pub mod browser_pool;
