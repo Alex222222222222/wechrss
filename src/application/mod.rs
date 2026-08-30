@@ -18,3 +18,4 @@ pub mod job_service;
 pub mod scheduler;
 pub mod source_service;
 pub mod sync_service;
+pub mod worker;

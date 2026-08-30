@@ -1,0 +1,516 @@
+//! One-pass durable job execution.
+//!
+//! This module is the executable unit underneath a future Tokio worker loop.
+//! [`Worker::run_once`] claims one allowed job, runs a handler while
+//! heartbeating its lease, then applies the handler's typed outcome through a
+//! caller-owned transaction and commits that transaction exactly once.
+//!
+//! Responsibilities:
+//!
+//! - define the small handler and outcome contracts used by worker dispatch;
+//! - keep a claimed lease alive while a handler is pending;
+//! - stop polling the handler when a heartbeat loses ownership;
+//! - bind success, deferral, retry, and permanent failure to the current
+//!   fencing token; and
+//! - make idle passes and transaction failures observable to the future loop.
+//!
+//! Non-responsibilities: polling repeatedly, deciding retry backoff, selecting
+//! browser selectors, fetching WeChat content, rendering RSS, or serving HTTP.
+//! A handler must perform acquisition outside its outcome transaction and
+//! return a [`JobExecution`] that already contains the chosen retry/defer
+//! time. A future loop owns process shutdown, concurrency limits, metrics, and
+//! repeatedly invoking this one-pass operation.
+//!
+//! PostgreSQL/high-availability behavior: claim, heartbeat, and fencing are
+//! delegated to [`JobService`], so replicas still coordinate through
+//! PostgreSQL `SKIP LOCKED` and lease tokens. This first worker boundary
+//! commits only the job outcome through the queue transaction. A future
+//! synchronization-specific worker must add a two-phase handler boundary so
+//! acquisition stays outside the transaction while article, source, sync,
+//! cache, and job writes commit together in `UnitOfWork`. If a heartbeat fails,
+//! the handler future is cancelled and no stale outcome is attempted.
+//!
+//! RSS-cache interaction: this module does not render, read, or publish feeds.
+//! Feed rebuild and source-sync handlers remain future work until the worker
+//! has a two-phase `UnitOfWork` persistence contract; queue-only completion
+//! must not be used to publish business data separately from the job outcome.
+
+use std::{sync::Arc, time::Duration as StdDuration};
+
+use chrono::{DateTime, Utc};
+use thiserror::Error;
+use tokio::time::{self, Instant, MissedTickBehavior};
+
+use crate::{
+    application::job_service::{JobService, JobServiceError},
+    domain::job::{Job, JobType},
+    persistence::repositories::job_repository::{
+        ExpiredJobRecovery, JobLease, JobOutcomeTransaction, JobQueue, JobRepository,
+        JobRepositoryError, JobRepositoryTransaction,
+    },
+};
+
+/// The durable result selected by a claimed job handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobExecution {
+    /// The handler completed and its queue outcome may be persisted.
+    Succeeded,
+    /// The handler reached a non-failure eligibility boundary.
+    Deferred {
+        /// Next instant at which the job may be claimed.
+        resume_at: DateTime<Utc>,
+    },
+    /// The handler encountered a retryable failure.
+    Retry {
+        /// Earliest instant at which another worker may retry the job.
+        retry_at: DateTime<Utc>,
+        /// Bounded, secret-free diagnostic summary.
+        error: String,
+    },
+    /// The handler reached a terminal failure condition.
+    Failed {
+        /// Bounded, secret-free diagnostic summary.
+        error: String,
+    },
+}
+
+/// Handler capability used by one worker pass.
+#[allow(async_fn_in_trait)]
+pub trait JobHandler: Send + Sync {
+    /// Runs one claimed job. The handler must not commit job state itself.
+    async fn execute(&self, lease: &JobLease) -> JobExecution;
+}
+
+/// Validated heartbeat and dispatch policy for one worker pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerConfig {
+    allowed_job_types: Vec<JobType>,
+    heartbeat_every: StdDuration,
+}
+
+impl WorkerConfig {
+    /// Creates a worker policy. An empty allowed-kind list is rejected so a
+    /// configured worker cannot appear healthy while it can never claim work.
+    pub fn new(
+        allowed_job_types: impl Into<Vec<JobType>>,
+        heartbeat_every: StdDuration,
+    ) -> Result<Self, WorkerConfigError> {
+        let allowed_job_types = allowed_job_types.into();
+        if allowed_job_types.is_empty() {
+            return Err(WorkerConfigError::NoAllowedJobTypes);
+        }
+        if heartbeat_every.is_zero() {
+            return Err(WorkerConfigError::InvalidHeartbeat);
+        }
+        Ok(Self {
+            allowed_job_types,
+            heartbeat_every,
+        })
+    }
+
+    /// Returns the job kinds this worker may claim.
+    pub fn allowed_job_types(&self) -> &[JobType] {
+        &self.allowed_job_types
+    }
+
+    /// Returns the interval between lease heartbeats.
+    pub const fn heartbeat_every(&self) -> StdDuration {
+        self.heartbeat_every
+    }
+
+    fn validate_for_lease(&self, lease_for: chrono::Duration) -> Result<(), WorkerConfigError> {
+        let lease_for = lease_for
+            .to_std()
+            .map_err(|_| WorkerConfigError::InvalidLease)?;
+        if self.heartbeat_every >= lease_for {
+            return Err(WorkerConfigError::HeartbeatNotShorterThanLease);
+        }
+        Ok(())
+    }
+}
+
+/// Invalid worker runtime policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum WorkerConfigError {
+    /// A worker with no allowed kinds can never make progress.
+    #[error("worker must allow at least one job type")]
+    NoAllowedJobTypes,
+    /// The heartbeat interval must be positive.
+    #[error("worker heartbeat interval must be positive")]
+    InvalidHeartbeat,
+    /// The configured lease could not be converted to a standard duration.
+    #[error("worker lease duration is invalid")]
+    InvalidLease,
+    /// A heartbeat at or after expiry cannot protect the lease.
+    #[error("worker heartbeat interval must be shorter than the job lease")]
+    HeartbeatNotShorterThanLease,
+}
+
+/// Errors raised by one worker pass.
+#[derive(Debug, Error)]
+pub enum WorkerError {
+    /// Claiming or applying an outcome through the job service failed.
+    #[error("worker job operation failed: {0}")]
+    Job(#[source] JobServiceError),
+    /// A lease heartbeat failed; the handler has been cancelled.
+    #[error("worker lease heartbeat failed: {0}")]
+    Heartbeat(#[source] JobServiceError),
+    /// The outcome transaction could not begin or commit.
+    #[error("worker outcome transaction failed: {0}")]
+    Transaction(#[source] WorkerPersistenceError),
+}
+
+/// Persistence failures while opening or committing an outcome transaction.
+#[derive(Debug, Error)]
+pub enum WorkerPersistenceError {
+    /// The compatibility job repository rejected the transaction operation.
+    #[error(transparent)]
+    JobRepository(#[from] JobRepositoryError),
+}
+
+/// Result of one call to [`Worker::run_once`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkerRun {
+    /// No job matched the configured allowed kinds at the requested instant.
+    Idle,
+    /// One job completed its handler and durable outcome transaction.
+    Completed {
+        /// Job snapshot returned by the fenced outcome update.
+        job: Box<Job>,
+        /// Outcome selected by the handler.
+        outcome: JobExecution,
+    },
+}
+
+/// Transaction that can apply and commit one worker outcome.
+#[allow(async_fn_in_trait)]
+pub trait WorkerOutcomeTransaction: JobOutcomeTransaction {
+    /// Commits all changes made through this outcome transaction.
+    async fn commit(self) -> Result<(), WorkerPersistenceError>
+    where
+        Self: Sized;
+}
+
+/// Factory for transaction-scoped worker outcomes.
+#[allow(async_fn_in_trait)]
+pub trait WorkerOutcomeFactory: Send + Sync {
+    /// Transaction type borrowed from this factory's persistence backend.
+    type Transaction<'a>: WorkerOutcomeTransaction + 'a
+    where
+        Self: 'a;
+
+    /// Begins a transaction without committing it.
+    async fn begin(&self) -> Result<Self::Transaction<'_>, WorkerPersistenceError>;
+}
+
+impl<T> WorkerOutcomeTransaction for T
+where
+    T: JobRepositoryTransaction,
+{
+    async fn commit(self) -> Result<(), WorkerPersistenceError> {
+        JobRepositoryTransaction::commit(self)
+            .await
+            .map_err(WorkerPersistenceError::from)
+    }
+}
+
+impl<R> WorkerOutcomeFactory for R
+where
+    R: JobRepository,
+{
+    type Transaction<'a>
+        = R::Transaction<'a>
+    where
+        R: 'a;
+
+    async fn begin(&self) -> Result<Self::Transaction<'_>, WorkerPersistenceError> {
+        JobRepository::begin(self)
+            .await
+            .map_err(WorkerPersistenceError::from)
+    }
+}
+
+/// Executes one claimed job against the supplied handler.
+pub struct Worker<Q, F, H> {
+    jobs: Arc<JobService<Q>>,
+    outcomes: F,
+    handler: H,
+    config: WorkerConfig,
+}
+
+impl<Q, F, H> Worker<Q, F, H> {
+    /// Creates a one-pass worker over a queue, outcome factory, and handler.
+    pub fn new(
+        jobs: JobService<Q>,
+        outcomes: F,
+        handler: H,
+        config: WorkerConfig,
+    ) -> Result<Self, WorkerConfigError> {
+        config.validate_for_lease(jobs.config().lease_for())?;
+        Ok(Self {
+            jobs: Arc::new(jobs),
+            outcomes,
+            handler,
+            config,
+        })
+    }
+
+    /// Returns the dispatch and heartbeat policy.
+    pub const fn config(&self) -> &WorkerConfig {
+        &self.config
+    }
+}
+
+impl<Q, F, H> Worker<Q, F, H>
+where
+    Q: JobQueue + ExpiredJobRecovery,
+    F: WorkerOutcomeFactory,
+    H: JobHandler,
+{
+    /// Claims and executes at most one job.
+    ///
+    /// `now` is the compatibility/test clock accepted by the queue port. The
+    /// PostgreSQL adapter makes lease decisions with its own statement-local
+    /// clock; the in-memory adapter uses this value deterministically.
+    pub async fn run_once(&self, now: DateTime<Utc>) -> Result<WorkerRun, WorkerError> {
+        let Some(lease) = self
+            .jobs
+            .claim_next(now, self.config.allowed_job_types())
+            .await
+            .map_err(WorkerError::Job)?
+        else {
+            return Ok(WorkerRun::Idle);
+        };
+
+        let outcome = self.execute_with_heartbeats(&lease, now).await?;
+        let mut transaction = self
+            .outcomes
+            .begin()
+            .await
+            .map_err(WorkerError::Transaction)?;
+        let completed = self
+            .apply_outcome(&mut transaction, &lease, outcome.clone(), now)
+            .await
+            .map_err(WorkerError::Job)?;
+        transaction
+            .commit()
+            .await
+            .map_err(WorkerError::Transaction)?;
+        Ok(WorkerRun::Completed {
+            job: Box::new(completed),
+            outcome,
+        })
+    }
+
+    async fn execute_with_heartbeats(
+        &self,
+        lease: &JobLease,
+        now: DateTime<Utc>,
+    ) -> Result<JobExecution, WorkerError> {
+        let mut ticker = time::interval_at(
+            Instant::now() + self.config.heartbeat_every(),
+            self.config.heartbeat_every(),
+        );
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let handler = self.handler.execute(lease);
+        tokio::pin!(handler);
+
+        loop {
+            tokio::select! {
+                outcome = &mut handler => return Ok(outcome),
+                _ = ticker.tick() => {
+                    let heartbeat = self.jobs.heartbeat(lease, now);
+                    tokio::pin!(heartbeat);
+                    tokio::select! {
+                        outcome = &mut handler => return Ok(outcome),
+                        result = &mut heartbeat => {
+                            result.map_err(WorkerError::Heartbeat)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn apply_outcome<T>(
+        &self,
+        transaction: &mut T,
+        lease: &JobLease,
+        outcome: JobExecution,
+        now: DateTime<Utc>,
+    ) -> Result<Job, JobServiceError>
+    where
+        T: WorkerOutcomeTransaction,
+    {
+        match outcome {
+            JobExecution::Succeeded => self.jobs.succeed(transaction, lease, now).await,
+            JobExecution::Deferred { resume_at } => {
+                self.jobs.defer(transaction, lease, now, resume_at).await
+            }
+            JobExecution::Retry { retry_at, error } => {
+                self.jobs
+                    .retry(transaction, lease, now, retry_at, error)
+                    .await
+            }
+            JobExecution::Failed { error } => self.jobs.fail(transaction, lease, now, error).await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use chrono::TimeZone;
+    use serde_json::json;
+    use tokio::time::sleep;
+
+    use super::*;
+    use crate::{
+        domain::job::{JobStatus, NewJob},
+        persistence::repositories::job_repository::{EnqueueResult, MemoryJobRepository},
+    };
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(seconds, 0)
+            .single()
+            .expect("test timestamp should be valid")
+    }
+
+    fn new_job(key: &str) -> NewJob {
+        NewJob {
+            job_type: JobType::SourceSync,
+            source_id: None,
+            priority: 1,
+            run_after: at(0),
+            max_attempts: 2,
+            payload: json!({"key": key}),
+            dedupe_key: key.to_owned(),
+            now: at(0),
+        }
+    }
+
+    fn config() -> WorkerConfig {
+        WorkerConfig::new(vec![JobType::SourceSync], StdDuration::from_millis(5))
+            .expect("worker configuration should be valid")
+    }
+
+    #[derive(Clone)]
+    struct FixedHandler {
+        calls: Arc<AtomicUsize>,
+        outcome: JobExecution,
+        delay: StdDuration,
+    }
+
+    impl JobHandler for FixedHandler {
+        async fn execute(&self, _lease: &JobLease) -> JobExecution {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            sleep(self.delay).await;
+            self.outcome.clone()
+        }
+    }
+
+    #[test]
+    fn rejects_empty_kinds_zero_heartbeat_and_heartbeat_at_lease() {
+        assert_eq!(
+            WorkerConfig::new(Vec::new(), StdDuration::from_secs(1)),
+            Err(WorkerConfigError::NoAllowedJobTypes)
+        );
+        assert_eq!(
+            WorkerConfig::new(vec![JobType::SourceSync], StdDuration::ZERO),
+            Err(WorkerConfigError::InvalidHeartbeat)
+        );
+        let repository = MemoryJobRepository::new();
+        let jobs = JobService::new(
+            repository.clone(),
+            crate::application::job_service::JobServiceConfig::new(
+                "worker",
+                chrono::Duration::seconds(2),
+                1,
+            )
+            .unwrap(),
+        );
+        let worker_config =
+            WorkerConfig::new(vec![JobType::SourceSync], StdDuration::from_secs(2)).unwrap();
+        assert!(matches!(
+            Worker::new(
+                jobs,
+                repository,
+                FixedHandler {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    outcome: JobExecution::Succeeded,
+                    delay: StdDuration::ZERO,
+                },
+                worker_config,
+            ),
+            Err(WorkerConfigError::HeartbeatNotShorterThanLease)
+        ));
+    }
+
+    #[tokio::test]
+    async fn idle_pass_does_not_invoke_the_handler() {
+        let repository = MemoryJobRepository::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker = Worker::new(
+            JobService::new(
+                repository.clone(),
+                crate::application::job_service::JobServiceConfig::new(
+                    "worker",
+                    chrono::Duration::seconds(1),
+                    1,
+                )
+                .unwrap(),
+            ),
+            repository,
+            FixedHandler {
+                calls: calls.clone(),
+                outcome: JobExecution::Succeeded,
+                delay: StdDuration::ZERO,
+            },
+            config(),
+        )
+        .unwrap();
+
+        assert_eq!(worker.run_once(at(1)).await.unwrap(), WorkerRun::Idle);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn handler_outcome_is_committed_after_heartbeats() {
+        let repository = MemoryJobRepository::new();
+        let inserted = repository.enqueue(new_job("worker-success")).await.unwrap();
+        assert!(matches!(inserted, EnqueueResult::Inserted(_)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker = Worker::new(
+            JobService::new(
+                repository.clone(),
+                crate::application::job_service::JobServiceConfig::new(
+                    "worker",
+                    chrono::Duration::seconds(1),
+                    1,
+                )
+                .unwrap(),
+            ),
+            repository.clone(),
+            FixedHandler {
+                calls: calls.clone(),
+                outcome: JobExecution::Succeeded,
+                delay: StdDuration::from_millis(15),
+            },
+            config(),
+        )
+        .unwrap();
+
+        let result = worker.run_once(at(1)).await.unwrap();
+        let WorkerRun::Completed { job, outcome } = result else {
+            panic!("a queued job should be completed")
+        };
+        assert_eq!(outcome, JobExecution::Succeeded);
+        assert_eq!(job.status(), JobStatus::Succeeded);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            repository.find(job.id()).await.unwrap().unwrap().status(),
+            JobStatus::Succeeded
+        );
+    }
+}
