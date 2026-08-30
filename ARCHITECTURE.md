@@ -6,8 +6,9 @@ incremental: it defines boundaries and ownership, with the domain/configuration
 policies and the first PostgreSQL job/cache-persistence slices implemented
 while authenticated protocol work and HTTP behavior remain unimplemented. The
 pure RSS renderer, normalized article persistence, cache-first feed delivery
-decision service, and unauthenticated public article browser path are
-executable, but they are not yet wired to a feed-token lookup or HTTP route.
+decision service, archive sanitizer, and unauthenticated public article browser
+path are executable, but they are not yet wired to a feed-token lookup or HTTP
+route.
 
 ## Goals
 
@@ -45,6 +46,7 @@ The current and target contracts must not be confused:
 | Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | Runtime composition must consume the parsed role and policy values before deployment relies on them |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
 | Acquisition/web/RSS | A validated public WeChat article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, and pure RSS renderer | Authenticated protocol adapter, application handlers, and feed-token routing remain future work |
+| Archive | Conservative HTML allowlist sanitizer with safe URL filtering and external-image reporting | ArchiveService orchestration, asset persistence, and URL rewriting remain future work |
 
 Environment variables in this document are parsed into `AppConfig`, but the
 binary is still a no-op and does not construct role-specific runtime
@@ -641,10 +643,14 @@ transaction owner.
 
 ### Archive
 
-Sanitization is required. Asset persistence, checksum-based deduplication, and
+Sanitization is required and is implemented as a pure allowlist boundary in
+`src/archive/sanitizer.rs`. It parses HTML5 fragments, removes active content,
+event handlers, unsafe URLs, and unknown attributes, promotes approved WeChat
+lazy-image attributes to `src`, and reports deduplicated external HTTP(S) image
+URLs in first-seen order. Asset persistence, checksum-based deduplication, and
 URL rewriting are optional in version one. When enabled, the `AssetStore`
 abstraction supports a local persistent volume first and S3-compatible storage
-later. Without it, the sanitizer retains only approved external asset URLs and
+later. Without it, approved external asset URLs remain in sanitized HTML and
 the application does not need binary asset storage or media delivery.
 
 ### RSS
@@ -675,7 +681,8 @@ reserved for the remaining modules.
   migrations (`postgres`, `runtime-tokio-rustls`, and `migrate` features).
 - Thirtyfour for WebDriver browser sessions, including typed capabilities,
   explicit waits, and request/page-load timeout configuration.
-- Serde, URL, Base64, and HTML parsing libraries for normalized data.
+- Serde, URL, Base64, `scraper`, and `ego-tree` for normalized data and safe
+  traversal of parsed article fragments.
 - The `rss` crate for RSS 2.0 serialization, stable GUIDs, namespaces, and
   `content:encoded` output; the renderer hashes the resulting bytes for ETags.
 - Tracing for structured diagnostics.
@@ -974,8 +981,9 @@ selection.
 
 The remaining tree intentionally contains no route handlers, source
 configuration/feed-token orchestration, scheduler loops, credential
-persistence, or business implementation. Credential and archive modules remain
-documentation-only. Acquisition now contains executable capability/session
+persistence, or business implementation. Credential persistence and
+ArchiveService orchestration remain documentation-only; the pure archive
+sanitizer is executable. Acquisition now contains executable capability/session
 ports, local capacity/lease ownership, public WebDriver navigation, common
 article extraction, bounded public-page pacing/scroll execution, and expected
 browser-timezone validation; authenticated protocol work, authenticated pacing

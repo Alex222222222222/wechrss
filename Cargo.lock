@@ -3183,6 +3183,7 @@ dependencies = [
  "base64",
  "chrono",
  "chrono-tz",
+ "ego-tree",
  "envy",
  "rand 0.9.5",
  "rand_distr",

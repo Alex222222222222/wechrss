@@ -12,6 +12,7 @@ axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
+ego-tree = "0.10"
 envy = "0.4"
 thirtyfour = { version = "0.37", default-features = false, features = ["rustls"] }
 rand = "0.9"
