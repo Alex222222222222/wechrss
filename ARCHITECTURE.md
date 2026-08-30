@@ -48,7 +48,7 @@ The current and target contracts must not be confused:
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, and shutdown-aware heartbeat/outcome execution | Synchronization-specific dispatch and removal of compatibility `now` parameters remain future work |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | Runtime composition must consume the parsed role and policy values before deployment relies on them |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
-| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, database-only feed rebuild orchestration, and pure RSS renderer | Authenticated protocol adapter, application handlers, and feed-token routing remain future work |
+| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, current/legacy WeRead article-list response parsing, database-only feed rebuild orchestration, and pure RSS renderer | Authenticated protocol transport, application handlers, and feed-token routing remain future work |
 | Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, and external-image reporting through ArchiveService | Asset persistence and URL rewriting remain future work |
 
 Environment variables in this document are parsed into `AppConfig`, but the
@@ -647,7 +647,10 @@ The concrete capability contract is:
   lifetime explicit and releases local browser capacity when the fetch future
   completes or is cancelled. `WeReadAdapter` accepts only the authenticated
   request capability returned by `prepare_request`; neither API accepts a
-  generic session.
+  generic session. The pure `parse_article_list_payload` parser accepts current
+  and legacy response envelopes, classifies authentication/risk-control
+  business errors, and emits only verified public article URLs. Transport, QR
+  exchange, refresh, and request pacing remain outside this parser.
 
 The executable acquisition boundary currently includes `BrowserPool`, a
 Tokio-semaphore process-local capacity limit, the storage-neutral
@@ -1056,9 +1059,10 @@ binary asset persistence, and URL rewriting remain documentation-only; the pure
 archive sanitizer and `ArchiveService` are executable. Acquisition now
 contains executable identity resolution, capability/session ports, local
 capacity/lease ownership, public WebDriver navigation, common article
-extraction, bounded public-page pacing/scroll execution, and expected
-browser-timezone validation; authenticated
-protocol work, authenticated pacing hooks, and browser health remain future work.
+extraction, bounded public-page pacing/scroll execution, expected
+browser-timezone validation, and pure current/legacy WeRead article-list
+response parsing; authenticated transport, authenticated pacing hooks, and
+browser health remain future work.
 `SourceService` implements source create/read, operator enable/gate changes,
 and the initial-job slice described above. `JobService` implements queue
 lifecycle and transaction-scoped outcome binding; `Worker::run_once` implements
