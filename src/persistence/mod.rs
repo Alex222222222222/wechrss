@@ -25,8 +25,10 @@
 //! source-scoped feed reads are implemented in
 //! [`repositories::article_repository`]. Synchronization-run start/finish and
 //! source history reads are implemented in
-//! [`repositories::sync_run_repository`]. Source-service lifecycle
-//! orchestration, credential, and archive repository SQL remain future work.
+//! [`repositories::sync_run_repository`]. Hash-only public feed-token storage
+//! and active-source resolution are implemented in
+//! [`repositories::feed_token_repository`]. Credential and archive repository
+//! SQL remain future work.
 //! The job repository exports separate `JobQueue`, `JobEnqueueTransaction`,
 //! `JobOutcomeTransaction`, and `ExpiredJobRecovery` ports;
 //! `UnitOfWork::job_enqueue` and `UnitOfWork::job_outcomes` are the narrow

@@ -18,6 +18,8 @@ The initial schema provides:
   acquisition; the credential/account table and foreign key are deferred until
   that repository contract is implemented;
 - revision-aware `feed_cache` rows with a source foreign key;
+- hash-only `feed_tokens` rows with one rotatable/revocable public capability
+  per source;
 - fenced `account_leases` for authenticated-account serialization;
 - fenced `feed_build_leases` for per-source cache-build single-flight;
 - normalized `articles` keyed by `(source_id, review_id)`, including sanitized
@@ -31,9 +33,9 @@ has been published, later changes must use a new forward migration and must not
 edit `0001_jobs.sql`.
 
 Later forward migrations are added only as their executable repository contract
-is implemented. They will:
+is implemented. They may:
 
-- add feed-token metadata and any later source lifecycle fields;
+- add later source lifecycle fields;
 - add credential and archive tables; and
 - extend the feed-cache rows only if the final RSS contract needs fields beyond
   the current XML/ETag/revision payload.

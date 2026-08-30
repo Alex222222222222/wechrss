@@ -7,8 +7,9 @@ policies and the first PostgreSQL job/cache-persistence slices implemented
 while authenticated protocol work and HTTP behavior remain unimplemented. The
 pure RSS renderer, normalized article persistence, cache-first feed delivery
 decision service, archive sanitizer, and unauthenticated public article browser
-path are executable, but they are not yet wired to a feed-token lookup or HTTP
-route.
+path are executable, but they are not yet wired to an HTTP route. The public
+feed-token lifecycle is executable, but the web route still needs to compose
+token resolution with the cache-first feed service.
 
 ## Goals
 
@@ -34,8 +35,9 @@ pure pacing/quiet-hours policy, PostgreSQL pool/migration helpers, the job and
 feed-cache domain/repository slices, their shared transaction boundary, the
 stable account identity plus distributed account-lease slice, the per-source
 feed-build lease slice, atomic due-source scheduling persistence, and the
-unauthenticated Thirtyfour public-page identity/navigation/extraction, bounded
-pacing/scroll, and expected browser-timezone validation slice.
+hash-only public feed-token lifecycle, the unauthenticated Thirtyfour
+public-page identity/navigation/extraction, bounded pacing/scroll, and expected
+browser-timezone validation slice.
 
 The current and target contracts must not be confused:
 
@@ -44,7 +46,7 @@ The current and target contracts must not be confused:
 | Runtime | No server, routes, role composition, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, and shutdown-aware heartbeat/outcome execution | Synchronization-specific dispatch and removal of compatibility `now` parameters remain future work |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | Runtime composition must consume the parsed role and policy values before deployment relies on them |
-| Persistence | Job/source-scheduling/article/sync-run/feed-cache tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
+| Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
 | Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, and pure RSS renderer | Authenticated protocol adapter, application handlers, and feed-token routing remain future work |
 | Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, and external-image reporting through ArchiveService | Asset persistence and URL rewriting remain future work |
 
@@ -409,6 +411,23 @@ export DATABASE_URL='postgresql://wechrss:wechrss-dev-only@127.0.0.1:5432/wechrs
 cargo test --locked --test postgres_job_repository -- --nocapture
 ```
 
+For faster local execution, install `cargo-nextest` and run the integration
+test targets with bounded parallelism:
+
+```sh
+cargo install cargo-nextest --locked
+cargo nextest run --locked --tests -j 16
+```
+
+SQLx integration tests use `#[sqlx::test]`, so each test receives an isolated
+temporary database and can run concurrently without sharing application data.
+The documented `-j 16` setting is suitable for the trusted development
+PostgreSQL service used by this project, but should be tuned for other
+environments: every test may create a database and apply the complete
+migration set, so connection, CPU, and I/O capacity still limit useful
+parallelism. The ignored real-browser test remains a separately controlled
+WebDriver test and is not part of the normal nextest run.
+
 `0001_jobs.sql` is part of the embedded migration history and remains immutable
 after publication. It contains the corrected `deferred`, `claim_count`, and
 `failure_count` model, with active indexes that include `deferred`. No release
@@ -489,8 +508,21 @@ article persistence, the cache read, and the final revision/fence
 compare-and-swap publication. Callers must still provide the source revision
 and normalized rendered candidate through application ports. The pure renderer
 is implemented in `src/rss/renderer.rs`; the cache-first feed service is
-implemented in `src/application/feed_service.rs`, while feed-token lookup and
-the HTTP route remain future work.
+implemented in `src/application/feed_service.rs`. Public feed-token lifecycle
+is implemented in `src/domain/feed_token.rs`,
+`src/persistence/repositories/feed_token_repository.rs`, and
+`src/application/feed_token_service.rs`; HTTP route composition remains future
+work.
+
+Feed tokens are 32 random bytes encoded as unpadded base64url. PostgreSQL
+stores only the SHA-256 digest in `feed_tokens`, with one current row per
+source. Issuing a token returns the raw value only to the administrative
+caller; rotation replaces the digest and immediately invalidates the old
+value, while revocation is idempotent. Invalid, unknown, and revoked values
+must map to the same public HTTP response so token existence is not disclosed.
+Token lifecycle does not change `sources.feed_revision` or `feed_cache`; after
+resolution, the feed route passes the source id to `FeedService` and serves
+the existing cached XML.
 
 Cache replacement uses compare-and-swap semantics. A renderer records the
 source revision of its database snapshot, and the repository stores the result
@@ -555,10 +587,12 @@ claimed work and re-checks quiet hours between upstream operations.
 `ArchiveService` owns the content pipeline. `JobService` owns leases and
 transitions. `FeedService` owns conditional reads, fresh/stale/missing
 decisions, and deduplicated rebuild enqueueing over the persisted cache.
-Feed-token lookup, single-flight cache population, and rebuild orchestration
-remain future extensions. Application services receive a `UnitOfWorkFactory` for
+Single-flight cache population and rebuild orchestration remain future
+extensions. Application services receive a `UnitOfWorkFactory` for
 atomic final writes; they do not compose independent repository transactions.
-`SourceService` now uses a narrow transaction-scoped enqueue view to create an
+`FeedTokenService` now owns opaque token issue/rotate, strict request parsing,
+hash-only repository access, and idempotent revocation. `SourceService` now
+uses a narrow transaction-scoped enqueue view to create an
 eligible source and its initial `source_sync` job atomically.
 
 ### Acquisition
@@ -985,8 +1019,9 @@ views remain future work. The pure RSS renderer in
 candidates. The cache-first `FeedService` in
 `src/application/feed_service.rs` is also executable: it serves fresh or stale
 rows, honors conditional ETags, and enqueues deduplicated rebuild jobs through
-the custom `jobs` table adapter. It is not yet wired to feed-token lookup, the
-database-only rebuild/publish workflow, or an HTTP route.
+the custom `jobs` table adapter. It is not yet wired to the database-only
+rebuild/publish workflow or an HTTP route; feed-token resolution itself is
+implemented by `FeedTokenService`.
 
 The one-pass scheduler wrapper in `src/application/scheduler.rs` now forwards
 the configured quiet-hours policy to the atomic source-scheduling operation.
@@ -997,7 +1032,7 @@ role selection and metrics. It must call this boundary rather than reimplement
 source selection.
 
 The remaining tree intentionally contains no route handlers, source
-configuration/feed-token orchestration, role composition, credential
+HTTP feed-token orchestration, role composition, credential
 persistence, or synchronization business implementation. Credential persistence,
 binary asset persistence, and URL rewriting remain documentation-only; the pure
 archive sanitizer and `ArchiveService` are executable. Acquisition now

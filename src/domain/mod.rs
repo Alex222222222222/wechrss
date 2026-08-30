@@ -6,12 +6,15 @@
 //!
 //! The domain owns invariants such as stable `review_id` article identity,
 //! explicit job state transitions, bounded retry semantics, and risk-control
-//! states that require operator attention. It does not perform I/O or mutate
-//! the RSS cache itself.
+//! states that require operator attention. Opaque public feed tokens are
+//! generated and strictly parsed here, but their digests are persisted by the
+//! persistence layer. The domain does not perform I/O or mutate the RSS cache
+//! itself.
 
 pub mod article;
 pub mod credentials;
 pub mod feed;
+pub mod feed_token;
 pub mod job;
 pub mod pacing;
 pub mod source;

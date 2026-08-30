@@ -261,6 +261,24 @@ CREATE TABLE IF NOT EXISTS feed_cache (
 CREATE INDEX IF NOT EXISTS feed_cache_expiry_idx
     ON feed_cache (expires_at ASC, source_id ASC);
 
+-- One current opaque public-feed capability per source. Only the SHA-256
+-- digest is stored; the raw base64url token is returned once by the
+-- application when it is issued or rotated.
+CREATE TABLE IF NOT EXISTS feed_tokens (
+    source_id UUID PRIMARY KEY REFERENCES sources (id) ON DELETE CASCADE,
+    token_hash BYTEA NOT NULL CHECK (octet_length(token_hash) = 32),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    rotated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    revoked_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS feed_tokens_hash_idx
+    ON feed_tokens (token_hash);
+
+CREATE INDEX IF NOT EXISTS feed_tokens_active_hash_idx
+    ON feed_tokens (token_hash)
+    WHERE revoked_at IS NULL;
+
 -- A lease row is the cross-replica mutex for one authenticated WeRead account.
 -- Credential material is intentionally stored by a separate future account
 -- table and never belongs in this coordination table.
