@@ -41,7 +41,7 @@ The current and target contracts must not be confused:
 
 | Area | Executable now | Target contract and implementation gate |
 | --- | --- | --- |
-| Runtime | No server, routes, scheduler, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
+| Runtime | No server, routes, role composition, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, and shutdown-aware heartbeat/outcome execution | Synchronization-specific dispatch and removal of compatibility `now` parameters remain future work |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | Runtime composition must consume the parsed role and policy values before deployment relies on them |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
@@ -911,8 +911,8 @@ than add more empty module shells. Work proceeds in this order:
 3. Make `FeedService` executable over the persisted cache (cache-first
    delivery and deduplicated rebuild enqueueing are implemented), then add the
    remaining source/archive queries and database-only rebuild orchestration.
-4. Build role-aware runtime composition, scheduler/worker loops, heartbeat
-   cancellation, and degraded browser health behavior.
+4. Build role-aware runtime composition and integrate the scheduler/worker
+   loops, heartbeat cancellation, and degraded browser health behavior.
 5. Complete the acquisition slice with fresh-profile creation and browser
    health checks behind the now-executable verified-URL, Thirtyfour,
    browser-capability, public pacing/scroll, and expected-timezone ports. Public
@@ -981,12 +981,13 @@ database-only rebuild/publish workflow, or an HTTP route.
 The one-pass scheduler wrapper in `src/application/scheduler.rs` now forwards
 the configured quiet-hours policy to the atomic source-scheduling operation.
 That repository samples PostgreSQL time and applies the policy inside its
-transaction. A future runtime loop still owns polling, shutdown, retry
-backoff, and metrics; it must call this boundary rather than reimplement source
-selection.
+transaction. `Scheduler::run_until_shutdown` owns polling, shutdown, and
+transient-error backoff around this boundary; runtime composition still owns
+role selection and metrics. It must call this boundary rather than reimplement
+source selection.
 
 The remaining tree intentionally contains no route handlers, source
-configuration/feed-token orchestration, scheduler loops, credential
+configuration/feed-token orchestration, role composition, credential
 persistence, or synchronization business implementation. Credential persistence,
 binary asset persistence, and URL rewriting remain documentation-only; the pure
 archive sanitizer and `ArchiveService` are executable. Acquisition now

@@ -7,10 +7,10 @@
 //! batch. It does not read source rows first, insert jobs separately, or run
 //! synchronization itself.
 //!
-//! The one-pass API is intentionally separate from a future Tokio polling loop.
-//! That keeps the policy and orchestration testable, lets deployment choose its
-//! shutdown and backoff behavior, and prevents a loop from accidentally
-//! bypassing the repository's `FOR UPDATE SKIP LOCKED` transaction.
+//! [`Scheduler::run_until_shutdown`] supplies the Tokio polling boundary around
+//! the one-pass operation. It keeps deployment-specific shutdown and timing
+//! policy outside the repository while ensuring every pass still uses the
+//! repository's `FOR UPDATE SKIP LOCKED` transaction.
 //!
 //! Quiet hours are evaluated against the database-authoritative instant and the
 //! configured IANA timezone inside the scheduling transaction. A quiet pass
@@ -21,17 +21,19 @@
 //! High availability: every replica may invoke `run_once` concurrently. The
 //! scheduler has no process-local coordination state, so disjoint source
 //! batches and duplicate suppression come from the database transaction and
-//! indexes. A repository failure is returned to the future loop for metrics and
-//! retry handling; it is never converted into a false successful scheduling
-//! pass.
+//! indexes. A repository failure is returned to the polling loop for metrics
+//! and retry handling; it is never converted into a false successful
+//! scheduling pass.
 //!
-//! Non-responsibilities: worker claims, browser work, retry backoff, sleeping,
-//! RSS rendering, and HTTP responses. Feed-cache maintenance jobs may use the
-//! same queue independently because this wrapper only schedules source-sync
-//! work.
+//! Non-responsibilities: worker claims, browser work, RSS rendering, and HTTP
+//! responses. Feed-cache maintenance jobs may use the same queue independently
+//! because this wrapper only schedules source-sync work.
+
+use std::time::Duration as StdDuration;
 
 use chrono::Duration;
 use thiserror::Error;
+use tokio::time;
 
 use crate::{
     domain::pacing::QuietHours,
@@ -101,6 +103,66 @@ pub enum SchedulerConfigError {
     InvalidReservation,
 }
 
+/// Validated polling policy for the shutdown-aware scheduler loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedulerLoopConfig {
+    poll_interval: StdDuration,
+    error_backoff: StdDuration,
+}
+
+impl SchedulerLoopConfig {
+    /// Creates a loop policy with positive polling and error waits.
+    pub fn new(
+        poll_interval: StdDuration,
+        error_backoff: StdDuration,
+    ) -> Result<Self, SchedulerLoopConfigError> {
+        if poll_interval.is_zero() {
+            return Err(SchedulerLoopConfigError::InvalidPollInterval);
+        }
+        if error_backoff.is_zero() {
+            return Err(SchedulerLoopConfigError::InvalidErrorBackoff);
+        }
+        Ok(Self {
+            poll_interval,
+            error_backoff,
+        })
+    }
+
+    /// Returns the delay between successful or quiet scheduling passes.
+    pub const fn poll_interval(self) -> StdDuration {
+        self.poll_interval
+    }
+
+    /// Returns the delay after a transient repository error.
+    pub const fn error_backoff(self) -> StdDuration {
+        self.error_backoff
+    }
+}
+
+/// Invalid scheduler-loop timing policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SchedulerLoopConfigError {
+    /// The scheduler must not poll in a tight loop.
+    #[error("scheduler poll interval must be positive")]
+    InvalidPollInterval,
+    /// Repeated repository errors must be rate limited.
+    #[error("scheduler error backoff must be positive")]
+    InvalidErrorBackoff,
+}
+
+/// Counters returned when a scheduler loop observes shutdown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SchedulerLoopStats {
+    /// Number of scheduling passes, including quiet and failed passes.
+    pub passes: u64,
+    /// Number of source-sync jobs inserted across all passes.
+    pub enqueued_sources: usize,
+    /// Number of passes skipped because quiet hours were active.
+    pub quiet_passes: u64,
+    /// Number of repository failures retried by the loop.
+    pub errors: u64,
+}
+
 /// Result of one scheduler pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchedulerRun {
@@ -161,6 +223,52 @@ where
         match result {
             SchedulerPass::SkippedQuietHours => Ok(SchedulerRun::SkippedQuietHours),
             SchedulerPass::Enqueued(sources) => Ok(SchedulerRun::Enqueued { sources }),
+        }
+    }
+
+    /// Polls the scheduler until the shutdown watch becomes true or is dropped.
+    ///
+    /// Every completed pass waits for the configured poll interval so a
+    /// scheduler replica cannot hot-loop against PostgreSQL. Repository errors
+    /// use a separate backoff and are retried; shutdown is checked before each
+    /// pass and while waiting. A pass already inside the repository operation
+    /// is allowed to finish before the loop returns.
+    pub async fn run_until_shutdown(
+        &self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        loop_config: SchedulerLoopConfig,
+    ) -> SchedulerLoopStats {
+        let mut stats = SchedulerLoopStats::default();
+        loop {
+            if shutdown.has_changed().is_err() || *shutdown.borrow() {
+                return stats;
+            }
+
+            stats.passes += 1;
+            let wait = match self.run_once().await {
+                Ok(SchedulerRun::SkippedQuietHours) => {
+                    stats.quiet_passes += 1;
+                    loop_config.poll_interval()
+                }
+                Ok(SchedulerRun::Enqueued { sources }) => {
+                    stats.enqueued_sources = stats.enqueued_sources.saturating_add(sources.len());
+                    loop_config.poll_interval()
+                }
+                Err(error) => {
+                    stats.errors += 1;
+                    tracing::warn!(error = %error, "scheduler pass failed; retrying");
+                    loop_config.error_backoff()
+                }
+            };
+
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return stats;
+                    }
+                }
+                _ = time::sleep(wait) => {}
+            }
         }
     }
 }
@@ -252,6 +360,18 @@ mod tests {
             SchedulerConfig::new(1, Duration::zero()),
             Err(SchedulerConfigError::InvalidReservation)
         ));
+    }
+
+    #[test]
+    fn rejects_zero_scheduler_loop_waits() {
+        assert_eq!(
+            SchedulerLoopConfig::new(StdDuration::ZERO, StdDuration::from_secs(1)),
+            Err(SchedulerLoopConfigError::InvalidPollInterval)
+        );
+        assert_eq!(
+            SchedulerLoopConfig::new(StdDuration::from_secs(1), StdDuration::ZERO),
+            Err(SchedulerLoopConfigError::InvalidErrorBackoff)
+        );
     }
 
     #[tokio::test]
