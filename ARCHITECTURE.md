@@ -959,9 +959,10 @@ than add more empty module shells. Work proceeds in this order:
    service may bypass these boundaries with convenience transactions.
 3. Make `FeedService` executable over the persisted cache (cache-first
    delivery and deduplicated rebuild enqueueing are implemented). The worker
-   now supports committing its fenced outcome through `UnitOfWork`; extend the
-   executable `FeedRebuildService` with a business-coupled worker finalization
-   contract and add the remaining source/archive queries.
+   supports committing its fenced outcome through `UnitOfWork`, and
+   `FeedRebuildService::rebuild_for_job` now couples successful feed-cache
+   finalization to that outcome. Add the remaining source/archive queries and
+   map pre-publication rebuild failures to explicit worker outcomes.
 4. Build role-aware runtime composition and integrate the scheduler/worker
    loops, heartbeat cancellation, and degraded browser health behavior.
 5. Complete the acquisition slice with fresh-profile creation and browser
@@ -1035,7 +1036,10 @@ the custom `jobs` table adapter. It is not yet wired to the database-only
 rebuild/publish workflow or an HTTP route; feed-token resolution itself is
 implemented by `FeedTokenService`. `FeedRebuildService` reads normalized source
 and article rows, renders outside a transaction, and publishes through the
-revision/fence-aware feed-cache transaction. Neither service is HTTP-wired.
+revision/fence-aware feed-cache transaction. Its `rebuild_for_job` path also
+completes a claimed `feed_rebuild` job in that same final unit of work on
+successful finalization; pre-publication failures remain for the worker to
+classify. Neither service is HTTP-wired.
 
 The one-pass scheduler wrapper in `src/application/scheduler.rs` now forwards
 the configured quiet-hours policy to the atomic source-scheduling operation.

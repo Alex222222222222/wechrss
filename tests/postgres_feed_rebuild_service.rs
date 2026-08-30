@@ -8,6 +8,7 @@ use wechrss::{
     },
     domain::{
         article::NewArticle,
+        job::{JobType, NewJob},
         source::{NewSource, SchedulingGate, SourceId, VerifiedWechatArticleUrl},
     },
     persistence::{
@@ -19,6 +20,7 @@ use wechrss::{
                 FeedBuildLeaseRepository, FeedCacheRepository, PostgresFeedBuildLeaseRepository,
                 PostgresFeedCacheRepository,
             },
+            job_repository::{EnqueueResult, JobQueue, PostgresJobRepository},
             source_repository::{PostgresSourceRepository, SourceTransactionRepository},
         },
         unit_of_work::UnitOfWorkFactory,
@@ -82,6 +84,66 @@ async fn rebuild_renders_normalized_articles_and_releases_the_build_lease(pool: 
             .await
             .expect("lease count should be queryable");
     assert_eq!(lease_count, 0);
+}
+
+#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+async fn rebuild_for_claimed_job_completes_cache_and_job_in_one_unit_of_work(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_id).await;
+    let jobs = PostgresJobRepository::new(pool.clone());
+    let job_id = match jobs
+        .enqueue(NewJob {
+            job_type: JobType::FeedRebuild,
+            source_id: Some(source_id.as_uuid()),
+            priority: 1,
+            run_after: timestamp(0),
+            max_attempts: 3,
+            payload: serde_json::json!({"source_id": source_id.as_uuid()}),
+            dedupe_key: format!("feed-rebuild:{source_id}"),
+            now: timestamp(0),
+        })
+        .await
+        .expect("feed rebuild job should enqueue")
+    {
+        EnqueueResult::Inserted(job) => job.id(),
+        EnqueueResult::AlreadyActive { .. } => panic!("test job should be unique"),
+    };
+    let lease = jobs
+        .claim_next(
+            "worker-a",
+            timestamp(1),
+            Duration::minutes(5),
+            &[JobType::FeedRebuild],
+        )
+        .await
+        .expect("feed rebuild job should claim")
+        .expect("feed rebuild job should be due");
+
+    let service = rebuild_service(&pool, &factory, "builder-a");
+    assert_eq!(
+        service
+            .rebuild_for_job(&lease)
+            .await
+            .expect("feed rebuild should complete its claimed job"),
+        FeedRebuildOutcome::Published {
+            feed_revision: wechrss::domain::source::FeedRevision::zero()
+        }
+    );
+
+    let job = jobs
+        .find(job_id)
+        .await
+        .expect("job lookup should succeed")
+        .expect("completed job should remain");
+    assert_eq!(job.status(), wechrss::domain::job::JobStatus::Succeeded);
+    assert_eq!(job.claim_count(), 1);
+    assert_eq!(job.failure_count(), 0);
+    assert!(PostgresFeedCacheRepository::new(pool)
+        .get(source_id)
+        .await
+        .expect("cache read should succeed")
+        .is_some());
 }
 
 #[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]

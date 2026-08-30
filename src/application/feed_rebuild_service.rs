@@ -12,14 +12,18 @@
 //! - read one source and its bounded, deterministic article list;
 //! - map persisted articles into the pure [`crate::rss::renderer::RssRenderer`];
 //! - publish the candidate only when the source revision and lease fence still
-//!   match; and
-//! - commit the cache publication and lease release as one `UnitOfWork`.
+//!   match;
+//! - optionally apply a claimed `feed_rebuild` job's fenced success outcome in
+//!   that same transaction; and
+//! - commit the cache publication, lease release, and optional job outcome as
+//!   one `UnitOfWork`.
 //!
 //! Non-responsibilities: browser or WeChat access, article synchronization,
-//! feed-token lookup, HTTP response construction, cache reads, or job outcome
-//! transitions. A `feed_rebuild` job handler should call this service after it
-//! has claimed the job, then use the worker's shared outcome boundary for job
-//! completion when synchronization-specific job coupling is available.
+//! feed-token lookup, HTTP response construction, or cache reads. A
+//! `feed_rebuild` job handler may pass its claimed lease to
+//! [`Self::rebuild_for_job`] so successful publication and job completion share
+//! one transaction. Pre-publication failures and the `AlreadyActive` result
+//! still leave job-outcome selection to the worker/application boundary.
 //!
 //! Data flow is deliberately short and explicit: acquire lease -> read source
 //! and articles -> render outside a database transaction -> begin the shared
@@ -61,6 +65,7 @@ use crate::{
     domain::{
         article::Article,
         feed::FeedCacheCandidate,
+        job::{JobType, LeaseToken},
         source::{FeedBuildLease, FeedBuildLeaseToken, FeedRevision, SourceId},
     },
     persistence::{
@@ -70,6 +75,7 @@ use crate::{
                 FeedBuildLeaseError, FeedBuildLeaseRepository, FeedCachePublishResult,
                 FeedCacheRepositoryError, FeedCacheTransactionRepository,
             },
+            job_repository::{JobLease, JobOutcome, JobOutcomeTransaction, JobRepositoryError},
         },
         unit_of_work::{UnitOfWork, UnitOfWorkError, UnitOfWorkFactory},
     },
@@ -207,6 +213,24 @@ pub enum FeedRebuildError {
     /// The requested source identifier cannot identify a source.
     #[error("source id must not be nil")]
     InvalidSourceId,
+    /// The claimed job is not a feed-rebuild job.
+    #[error("job {job_id} is not a feed_rebuild job")]
+    JobTypeMismatch {
+        /// Unexpected job identifier.
+        job_id: uuid::Uuid,
+    },
+    /// The claimed feed-rebuild job has no source relationship.
+    #[error("feed_rebuild job {job_id} has no source")]
+    JobMissingSource {
+        /// Invalid job identifier.
+        job_id: uuid::Uuid,
+    },
+    /// The claimed job does not contain an active owner.
+    #[error("feed_rebuild job {job_id} has no lease owner")]
+    JobLeaseMissingOwner {
+        /// Invalid job identifier.
+        job_id: uuid::Uuid,
+    },
     /// The fixed durable lease owner is empty.
     #[error("feed rebuild owner must not be empty")]
     EmptyOwner,
@@ -228,6 +252,10 @@ pub enum FeedRebuildError {
     /// Candidate publication failed inside the shared transaction.
     #[error(transparent)]
     Cache(#[from] FeedCacheRepositoryError),
+    /// The claimed feed-rebuild job could not be completed in the shared
+    /// transaction.
+    #[error(transparent)]
+    Job(#[from] JobRepositoryError),
     /// The shared transaction could not begin or commit.
     #[error(transparent)]
     UnitOfWork(#[from] UnitOfWorkError),
@@ -238,8 +266,9 @@ pub enum FeedRebuildError {
 
 /// Transaction-scoped feed-cache publication capability.
 #[allow(async_fn_in_trait)]
-pub trait FeedRebuildUnitOfWork {
-    /// Publishes and releases the build lease as part of this transaction.
+pub trait FeedRebuildUnitOfWork: JobOutcomeTransaction {
+    /// Publishes/releases the build lease as part of this transaction. The
+    /// inherited outcome port can complete a claimed worker job before commit.
     async fn publish_feed(
         &mut self,
         candidate: FeedCacheCandidate,
@@ -340,6 +369,53 @@ where
         &self,
         source_id: SourceId,
     ) -> Result<FeedRebuildOutcome, FeedRebuildError> {
+        self.rebuild_inner(source_id, None).await
+    }
+
+    /// Rebuilds a feed and completes a claimed `feed_rebuild` job atomically.
+    ///
+    /// Rendering and all reads remain outside the final transaction. When
+    /// publication reaches the finalization boundary, the cache publication,
+    /// build-lease release, and fenced `succeeded` job outcome are committed by
+    /// the same [`FeedRebuildUnitOfWork`]. If the build lease is already held by
+    /// another builder, or a pre-publication operation fails, this method does
+    /// not choose a retry/deferral outcome for the job; the caller retains that
+    /// responsibility.
+    pub async fn rebuild_for_job(
+        &self,
+        lease: &JobLease,
+    ) -> Result<FeedRebuildOutcome, FeedRebuildError> {
+        let job_id = lease.job.id();
+        if lease.job.job_type() != JobType::FeedRebuild {
+            return Err(FeedRebuildError::JobTypeMismatch { job_id });
+        }
+        let source_id = lease
+            .job
+            .source_id()
+            .map(SourceId::from_uuid)
+            .ok_or(FeedRebuildError::JobMissingSource { job_id })?;
+        let owner = lease
+            .job
+            .lease_owner()
+            .ok_or(FeedRebuildError::JobLeaseMissingOwner { job_id })?
+            .to_owned();
+
+        self.rebuild_inner(
+            source_id,
+            Some(JobCompletion {
+                job_id,
+                owner,
+                token: lease.token,
+            }),
+        )
+        .await
+    }
+
+    async fn rebuild_inner(
+        &self,
+        source_id: SourceId,
+        completion: Option<JobCompletion>,
+    ) -> Result<FeedRebuildOutcome, FeedRebuildError> {
         if source_id.as_uuid().is_nil() {
             return Err(FeedRebuildError::InvalidSourceId);
         }
@@ -358,7 +434,7 @@ where
         };
 
         let token = lease.token();
-        let result = self.rebuild_with_lease(source_id, lease).await;
+        let result = self.rebuild_with_lease(source_id, lease, completion).await;
         if result.is_err() {
             self.release_after_failure(source_id, token, &result).await;
         }
@@ -369,6 +445,7 @@ where
         &self,
         source_id: SourceId,
         lease: FeedBuildLease,
+        completion: Option<JobCompletion>,
     ) -> Result<FeedRebuildOutcome, FeedRebuildError> {
         let source = self
             .sources
@@ -405,6 +482,16 @@ where
                 return Err(error.into());
             }
         };
+        if let Some(completion) = completion {
+            unit_of_work
+                .apply_outcome(JobOutcome::Succeeded {
+                    job_id: completion.job_id,
+                    owner: completion.owner,
+                    token: completion.token,
+                    now: generated_at,
+                })
+                .await?;
+        }
         unit_of_work.commit().await?;
         Ok(match publication {
             FeedCachePublishResult::Published(cache) => FeedRebuildOutcome::Published {
@@ -438,6 +525,12 @@ where
     }
 }
 
+struct JobCompletion {
+    job_id: uuid::Uuid,
+    owner: String,
+    token: LeaseToken,
+}
+
 fn render_article(article: Article) -> RenderArticle {
     RenderArticle {
         review_id: article.review_id().to_owned(),
@@ -463,9 +556,15 @@ mod tests {
         domain::{
             article::ArticleObservationVersion,
             feed::FeedCache,
+            job::{Job, JobType, LeaseToken, NewJob},
             source::{NewSource, SchedulingGate, Source},
         },
-        persistence::repositories::feed_cache_repository::MemoryFeedBuildLeaseRepository,
+        persistence::repositories::{
+            feed_cache_repository::MemoryFeedBuildLeaseRepository,
+            job_repository::{
+                JobLease, JobOutcome, JobQueue, JobRepositoryError, MemoryJobRepository,
+            },
+        },
     };
 
     #[derive(Clone)]
@@ -532,12 +631,14 @@ mod tests {
         commits: Arc<Mutex<usize>>,
         database_now: DateTime<Utc>,
         candidates: Arc<Mutex<Vec<FeedCacheCandidate>>>,
+        job_outcomes: Arc<Mutex<Vec<JobOutcome>>>,
     }
 
     struct FakeUnitOfWork {
         outcome: Arc<Mutex<Option<FeedCachePublishResult>>>,
         commits: Arc<Mutex<usize>>,
         candidates: Arc<Mutex<Vec<FeedCacheCandidate>>>,
+        job_outcomes: Arc<Mutex<Vec<JobOutcome>>>,
     }
 
     impl Default for FakeUnitOfWorkFactory {
@@ -547,6 +648,7 @@ mod tests {
                 commits: Arc::new(Mutex::new(0)),
                 database_now: timestamp(1_000),
                 candidates: Arc::new(Mutex::new(Vec::new())),
+                job_outcomes: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -559,11 +661,29 @@ mod tests {
                 outcome: Arc::clone(&self.outcome),
                 commits: Arc::clone(&self.commits),
                 candidates: Arc::clone(&self.candidates),
+                job_outcomes: Arc::clone(&self.job_outcomes),
             })
         }
 
         async fn database_now(&self) -> Result<DateTime<Utc>, UnitOfWorkError> {
             Ok(self.database_now)
+        }
+    }
+
+    impl JobOutcomeTransaction for FakeUnitOfWork {
+        async fn apply_outcome(&mut self, outcome: JobOutcome) -> Result<Job, JobRepositoryError> {
+            self.job_outcomes.lock().await.push(outcome);
+            Job::new(NewJob {
+                job_type: JobType::FeedRebuild,
+                source_id: Some(source_id().as_uuid()),
+                priority: 0,
+                run_after: timestamp(0),
+                max_attempts: 3,
+                payload: serde_json::json!({}),
+                dedupe_key: "fake-feed-rebuild".to_owned(),
+                now: timestamp(1_000),
+            })
+            .map_err(JobRepositoryError::Domain)
         }
     }
 
@@ -657,6 +777,121 @@ mod tests {
             }
         );
         assert_eq!(*unit_of_work.commits.lock().await, 1);
+    }
+
+    #[tokio::test]
+    async fn claimed_job_completion_shares_the_cache_publication_transaction() {
+        let leases = MemoryFeedBuildLeaseRepository::new(timestamp(0));
+        let unit_of_work = FakeUnitOfWorkFactory::default();
+        let jobs = MemoryJobRepository::new();
+        jobs.enqueue(NewJob {
+            job_type: JobType::FeedRebuild,
+            source_id: Some(source_id().as_uuid()),
+            priority: 1,
+            run_after: timestamp(0),
+            max_attempts: 3,
+            payload: serde_json::json!({"source_id": source_id().as_uuid()}),
+            dedupe_key: "feed-rebuild-job".to_owned(),
+            now: timestamp(0),
+        })
+        .await
+        .unwrap();
+        let lease = jobs
+            .claim_next(
+                "worker-a",
+                timestamp(1),
+                Duration::minutes(5),
+                &[JobType::FeedRebuild],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let service = service(
+            FakeSources {
+                source: Arc::new(Mutex::new(Some(source()))),
+            },
+            leases,
+            unit_of_work.clone(),
+            FeedRebuildConfig::default(),
+        );
+
+        assert_eq!(
+            service.rebuild_for_job(&lease).await.unwrap(),
+            FeedRebuildOutcome::Published {
+                feed_revision: FeedRevision::zero()
+            }
+        );
+        let outcomes = unit_of_work.job_outcomes.lock().await;
+        assert!(matches!(
+            outcomes.as_slice(),
+            [JobOutcome::Succeeded {
+                job_id,
+                owner,
+                token,
+                ..
+            }] if *job_id == lease.job.id()
+                && owner == "worker-a"
+                && *token == lease.token
+        ));
+        assert_eq!(*unit_of_work.commits.lock().await, 1);
+    }
+
+    #[tokio::test]
+    async fn claimed_job_completion_rejects_wrong_job_shape_before_acquiring_a_build_lease() {
+        let leases = MemoryFeedBuildLeaseRepository::new(timestamp(0));
+        let service = service(
+            FakeSources {
+                source: Arc::new(Mutex::new(Some(source()))),
+            },
+            leases.clone(),
+            FakeUnitOfWorkFactory::default(),
+            FeedRebuildConfig::default(),
+        );
+        let source_id = source_id();
+        let wrong_type = JobLease {
+            job: Job::new(NewJob {
+                job_type: JobType::SourceSync,
+                source_id: Some(source_id.as_uuid()),
+                priority: 1,
+                run_after: timestamp(0),
+                max_attempts: 3,
+                payload: serde_json::json!({}),
+                dedupe_key: "wrong-type".to_owned(),
+                now: timestamp(0),
+            })
+            .unwrap(),
+            token: LeaseToken::new(),
+        };
+        assert!(matches!(
+            service.rebuild_for_job(&wrong_type).await,
+            Err(FeedRebuildError::JobTypeMismatch { job_id })
+                if job_id == wrong_type.job.id()
+        ));
+
+        let missing_source = JobLease {
+            job: Job::new(NewJob {
+                job_type: JobType::FeedRebuild,
+                source_id: None,
+                priority: 1,
+                run_after: timestamp(0),
+                max_attempts: 3,
+                payload: serde_json::json!({}),
+                dedupe_key: "missing-source".to_owned(),
+                now: timestamp(0),
+            })
+            .unwrap(),
+            token: LeaseToken::new(),
+        };
+        assert!(matches!(
+            service.rebuild_for_job(&missing_source).await,
+            Err(FeedRebuildError::JobMissingSource { job_id })
+                if job_id == missing_source.job.id()
+        ));
+        assert!(leases
+            .acquire_build(source_id, "builder-b", Duration::minutes(1))
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
