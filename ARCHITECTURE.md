@@ -41,8 +41,8 @@ The current and target contracts must not be confused:
 
 | Area | Executable now | Target contract and implementation gate |
 | --- | --- | --- |
-| Runtime | No server, routes, scheduler, worker, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
-| Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, and one-pass heartbeat/outcome execution | Repeating worker polling/dispatch loop and removal of compatibility `now` parameters remain future work |
+| Runtime | No server, routes, scheduler, or browser adapter | Runtime composition starts only after configuration, corrected jobs, and `UnitOfWork` are executable |
+| Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, and shutdown-aware heartbeat/outcome execution | Synchronization-specific dispatch and removal of compatibility `now` parameters remain future work |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | Runtime composition must consume the parsed role and policy values before deployment relies on them |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
 | Acquisition/web/RSS | A validated public WeChat article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, and pure RSS renderer | Authenticated protocol adapter, application handlers, and feed-token routing remain future work |
@@ -998,8 +998,9 @@ protocol work, authenticated pacing hooks, and browser health remain future work
 and the initial-job slice described above. `JobService` implements queue
 lifecycle and transaction-scoped outcome binding; `Worker::run_once` implements
 one-pass claim, lease heartbeat, handler dispatch, and fenced outcome commit,
-while article and sync-run persistence and `FeedService` implement the
-database/cache boundaries described above. Repeating worker polling and
-synchronization-specific handlers remain future work.
+while `Worker::run_until_shutdown` adds bounded idle polling, transient-error
+backoff, and graceful shutdown between passes. Article and sync-run persistence
+and `FeedService` implement the database/cache boundaries described above.
+Synchronization-specific handlers remain future work.
 `TODO(design)` markers identify existing code and migrations that must change
 before the remaining contracts are implemented.

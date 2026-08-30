@@ -30,8 +30,11 @@
 //! Non-responsibilities: executing source synchronization, deciding browser
 //! selectors, calculating retry backoff, or committing business data. Job
 //! handlers still perform acquisition outside the transaction and pass their
-//! typed result to this facade. A future worker loop owns polling, shutdown,
-//! heartbeat task cancellation, metrics, and handler dispatch.
+//! typed result to this facade. [`crate::application::worker::Worker::run_once`]
+//! owns heartbeat task cancellation, while
+//! [`crate::application::worker::Worker::run_until_shutdown`] owns polling,
+//! shutdown, and handler dispatch. Runtime composition owns role selection,
+//! concurrency, and metrics.
 //!
 //! PostgreSQL/high-availability considerations: enqueue deduplication,
 //! SKIP LOCKED, lease expiry, and fencing are durable repository guarantees;

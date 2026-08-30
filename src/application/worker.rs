@@ -1,9 +1,11 @@
 //! One-pass durable job execution.
 //!
-//! This module is the executable unit underneath a future Tokio worker loop.
-//! [`Worker::run_once`] claims one allowed job, runs a handler while
-//! heartbeating its lease, then applies the handler's typed outcome through a
-//! caller-owned transaction and commits that transaction exactly once.
+//! This module is the executable worker unit underneath future role-specific
+//! runtime composition. [`Worker::run_once`] claims one allowed job, runs a
+//! handler while heartbeating its lease, then applies the handler's typed
+//! outcome through a caller-owned transaction and commits that transaction
+//! exactly once. [`Worker::run_until_shutdown`] repeats that pass with bounded
+//! idle polling and transient-error backoff.
 //!
 //! Responsibilities:
 //!
@@ -12,14 +14,16 @@
 //! - stop polling the handler when a heartbeat loses ownership;
 //! - bind success, deferral, retry, and permanent failure to the current
 //!   fencing token; and
-//! - make idle passes and transaction failures observable to the future loop.
+//! - make idle passes and transaction failures observable to the polling loop;
+//! - honor shutdown without abandoning a pass already holding a lease; and
+//! - avoid sleeping between successful jobs so a queued backlog drains quickly.
 //!
-//! Non-responsibilities: polling repeatedly, deciding retry backoff, selecting
-//! browser selectors, fetching WeChat content, rendering RSS, or serving HTTP.
-//! A handler must perform acquisition outside its outcome transaction and
-//! return a [`JobExecution`] that already contains the chosen retry/defer
-//! time. A future loop owns process shutdown, concurrency limits, metrics, and
-//! repeatedly invoking this one-pass operation.
+//! Non-responsibilities: deciding retry backoff, selecting browser selectors,
+//! fetching WeChat content, rendering RSS, or serving HTTP. The loop only
+//! supplies bounded polling and error waits; runtime composition still owns
+//! role selection, concurrency across multiple workers, and metrics. A handler
+//! must perform acquisition outside its outcome transaction and return a
+//! [`JobExecution`] that already contains the chosen retry/defer time.
 //!
 //! PostgreSQL/high-availability behavior: claim, heartbeat, and fencing are
 //! delegated to [`JobService`], so replicas still coordinate through
@@ -144,6 +148,66 @@ pub enum WorkerConfigError {
     /// A heartbeat at or after expiry cannot protect the lease.
     #[error("worker heartbeat interval must be shorter than the job lease")]
     HeartbeatNotShorterThanLease,
+}
+
+/// Validated polling policy for the shutdown-aware worker loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerLoopConfig {
+    idle_poll_interval: StdDuration,
+    error_backoff: StdDuration,
+}
+
+impl WorkerLoopConfig {
+    /// Creates a loop policy with positive idle and error waits.
+    pub fn new(
+        idle_poll_interval: StdDuration,
+        error_backoff: StdDuration,
+    ) -> Result<Self, WorkerLoopConfigError> {
+        if idle_poll_interval.is_zero() {
+            return Err(WorkerLoopConfigError::InvalidIdlePollInterval);
+        }
+        if error_backoff.is_zero() {
+            return Err(WorkerLoopConfigError::InvalidErrorBackoff);
+        }
+        Ok(Self {
+            idle_poll_interval,
+            error_backoff,
+        })
+    }
+
+    /// Returns the delay after an idle claim pass.
+    pub const fn idle_poll_interval(self) -> StdDuration {
+        self.idle_poll_interval
+    }
+
+    /// Returns the delay after a transient worker error.
+    pub const fn error_backoff(self) -> StdDuration {
+        self.error_backoff
+    }
+}
+
+/// Invalid worker-loop timing policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum WorkerLoopConfigError {
+    /// Idle loops must yield to avoid a database hot loop.
+    #[error("worker idle poll interval must be positive")]
+    InvalidIdlePollInterval,
+    /// Repeated queue/lease errors must be rate limited.
+    #[error("worker error backoff must be positive")]
+    InvalidErrorBackoff,
+}
+
+/// Counters returned when a worker loop observes shutdown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkerLoopStats {
+    /// Number of one-pass attempts, including idle and failed attempts.
+    pub passes: u64,
+    /// Number of jobs whose outcome transaction committed.
+    pub completed: u64,
+    /// Number of passes that found no claimable job.
+    pub idle: u64,
+    /// Number of transient queue, heartbeat, or transaction errors.
+    pub errors: u64,
 }
 
 /// Errors raised by one worker pass.
@@ -302,6 +366,57 @@ where
         })
     }
 
+    /// Polls one worker until the shutdown watch becomes true or is dropped.
+    ///
+    /// Successful passes immediately try the next job, while idle passes and
+    /// errors wait before polling again. Shutdown is checked between passes and
+    /// during waits; a pass that has already claimed a job is allowed to finish
+    /// its handler and fenced outcome transaction before returning. Errors are
+    /// counted and retried because an expired lease, temporary database outage,
+    /// or lost heartbeat should not terminate an otherwise healthy replica.
+    pub async fn run_until_shutdown(
+        &self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        loop_config: WorkerLoopConfig,
+    ) -> WorkerLoopStats {
+        let mut stats = WorkerLoopStats::default();
+        loop {
+            if shutdown.has_changed().is_err() || *shutdown.borrow() {
+                return stats;
+            }
+
+            stats.passes += 1;
+            let wait = match self.run_once(Utc::now()).await {
+                Ok(WorkerRun::Completed { .. }) => {
+                    stats.completed += 1;
+                    None
+                }
+                Ok(WorkerRun::Idle) => {
+                    stats.idle += 1;
+                    Some(loop_config.idle_poll_interval())
+                }
+                Err(error) => {
+                    stats.errors += 1;
+                    tracing::warn!(error = %error, "worker pass failed; retrying");
+                    Some(loop_config.error_backoff())
+                }
+            };
+
+            if let Some(wait) = wait {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return stats;
+                        }
+                    }
+                    _ = time::sleep(wait) => {}
+                }
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
     async fn execute_with_heartbeats(
         &self,
         lease: &JobLease,
@@ -445,6 +560,18 @@ mod tests {
             ),
             Err(WorkerConfigError::HeartbeatNotShorterThanLease)
         ));
+    }
+
+    #[test]
+    fn rejects_zero_worker_loop_waits() {
+        assert_eq!(
+            WorkerLoopConfig::new(StdDuration::ZERO, StdDuration::from_secs(1)),
+            Err(WorkerLoopConfigError::InvalidIdlePollInterval)
+        );
+        assert_eq!(
+            WorkerLoopConfig::new(StdDuration::from_secs(1), StdDuration::ZERO),
+            Err(WorkerLoopConfigError::InvalidErrorBackoff)
+        );
     }
 
     #[tokio::test]

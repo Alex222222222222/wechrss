@@ -1,17 +1,28 @@
-//! Integration-style tests for one-pass worker execution.
+//! Integration-style tests for worker execution and its polling boundary.
 
-use std::{sync::Arc, time::Duration as StdDuration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration as StdDuration,
+};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::json;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use wechrss::{
     application::{
         job_service::{JobService, JobServiceConfig},
-        worker::{JobExecution, JobHandler, Worker, WorkerConfig, WorkerRun},
+        worker::{
+            JobExecution, JobHandler, Worker, WorkerConfig, WorkerLoopConfig, WorkerLoopStats,
+            WorkerRun,
+        },
     },
     domain::job::{JobStatus, JobType, NewJob},
-    persistence::repositories::job_repository::{JobLease, JobQueue, MemoryJobRepository},
+    persistence::repositories::job_repository::{
+        EnqueueResult, JobLease, JobQueue, MemoryJobRepository,
+    },
 };
 
 fn at(seconds: i64) -> DateTime<Utc> {
@@ -48,6 +59,53 @@ impl JobHandler for RecordingHandler {
     async fn execute(&self, lease: &JobLease) -> JobExecution {
         self.seen.lock().await.push(lease.job.job_type());
         self.outcome.clone()
+    }
+}
+
+#[derive(Clone)]
+struct ShutdownHandler {
+    shutdown: watch::Sender<bool>,
+}
+
+impl JobHandler for ShutdownHandler {
+    async fn execute(&self, _lease: &JobLease) -> JobExecution {
+        self.shutdown
+            .send(true)
+            .expect("worker loop receiver should still be alive");
+        JobExecution::Succeeded
+    }
+}
+
+#[derive(Clone)]
+struct ShutdownAfterCallsHandler {
+    shutdown: watch::Sender<bool>,
+    calls: Arc<AtomicUsize>,
+    stop_after: usize,
+}
+
+impl JobHandler for ShutdownAfterCallsHandler {
+    async fn execute(&self, _lease: &JobLease) -> JobExecution {
+        let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if call >= self.stop_after {
+            self.shutdown
+                .send(true)
+                .expect("worker loop receiver should still be alive");
+        }
+        JobExecution::Succeeded
+    }
+}
+
+#[derive(Clone)]
+struct CloseSenderHandler {
+    shutdown: Arc<Mutex<Option<watch::Sender<bool>>>>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl JobHandler for CloseSenderHandler {
+    async fn execute(&self, _lease: &JobLease) -> JobExecution {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        drop(self.shutdown.lock().await.take());
+        JobExecution::Succeeded
     }
 }
 
@@ -136,5 +194,213 @@ async fn retry_outcome_increments_failure_count_without_running_a_second_job() {
     assert_eq!(
         worker.run_once(at(2)).await.expect("worker should wait"),
         WorkerRun::Idle
+    );
+}
+
+#[tokio::test]
+async fn worker_loop_with_pre_requested_shutdown_does_not_claim_work() {
+    let repository = MemoryJobRepository::new();
+    repository
+        .enqueue(job("pre-shutdown", JobType::SourceSync))
+        .await
+        .expect("job should enqueue");
+    let (shutdown_tx, shutdown_rx) = watch::channel(true);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let worker = build_worker(
+        repository.clone(),
+        RecordingHandler {
+            seen: seen.clone(),
+            outcome: JobExecution::Succeeded,
+        },
+        vec![JobType::SourceSync],
+    );
+
+    let stats = worker
+        .run_until_shutdown(
+            shutdown_rx,
+            WorkerLoopConfig::new(StdDuration::from_secs(1), StdDuration::from_secs(1))
+                .expect("worker loop configuration should be valid"),
+        )
+        .await;
+
+    assert_eq!(stats, WorkerLoopStats::default());
+    assert!(seen.lock().await.is_empty());
+    drop(shutdown_tx);
+    let lease = repository
+        .claim_next(
+            "test-reader",
+            at(1),
+            Duration::seconds(1),
+            &[JobType::SourceSync],
+        )
+        .await
+        .expect("queue read should succeed")
+        .expect("pre-shutdown job should remain queued");
+    assert_eq!(lease.job.status(), JobStatus::Running);
+}
+
+#[tokio::test]
+async fn worker_loop_finishes_claimed_job_before_shutdown() {
+    let repository = MemoryJobRepository::new();
+    let inserted = repository
+        .enqueue(job("shutdown", JobType::SourceSync))
+        .await
+        .expect("job should enqueue");
+    let job_id = match inserted {
+        EnqueueResult::Inserted(job) => job.id(),
+        EnqueueResult::AlreadyActive { job_id } => job_id,
+    };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let worker = Worker::new(
+        JobService::new(
+            repository.clone(),
+            JobServiceConfig::new("integration-loop", Duration::seconds(1), 2)
+                .expect("job service configuration should be valid"),
+        ),
+        repository.clone(),
+        ShutdownHandler {
+            shutdown: shutdown_tx,
+        },
+        worker_config(vec![JobType::SourceSync]),
+    )
+    .expect("worker configuration should match the job lease");
+
+    let stats = worker
+        .run_until_shutdown(
+            shutdown_rx,
+            WorkerLoopConfig::new(StdDuration::from_secs(1), StdDuration::from_secs(1))
+                .expect("worker loop configuration should be valid"),
+        )
+        .await;
+
+    assert_eq!(
+        stats,
+        WorkerLoopStats {
+            passes: 1,
+            completed: 1,
+            idle: 0,
+            errors: 0,
+        }
+    );
+    assert_eq!(
+        repository
+            .find(job_id)
+            .await
+            .expect("job lookup should succeed")
+            .expect("job should still exist")
+            .status(),
+        JobStatus::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn worker_loop_stops_when_shutdown_sender_closes_after_success() {
+    let repository = MemoryJobRepository::new();
+    repository
+        .enqueue(job("close-after-first", JobType::SourceSync))
+        .await
+        .expect("first job should enqueue");
+    repository
+        .enqueue(job("remain-queued", JobType::SourceSync))
+        .await
+        .expect("second job should enqueue");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let worker = Worker::new(
+        JobService::new(
+            repository.clone(),
+            JobServiceConfig::new("integration-close", Duration::seconds(1), 2)
+                .expect("job service configuration should be valid"),
+        ),
+        repository,
+        CloseSenderHandler {
+            shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
+            calls: calls.clone(),
+        },
+        worker_config(vec![JobType::SourceSync]),
+    )
+    .expect("worker configuration should match the job lease");
+
+    let stats = tokio::time::timeout(
+        StdDuration::from_secs(1),
+        worker.run_until_shutdown(
+            shutdown_rx,
+            WorkerLoopConfig::new(StdDuration::from_secs(1), StdDuration::from_secs(1))
+                .expect("worker loop configuration should be valid"),
+        ),
+    )
+    .await
+    .expect("closed shutdown channel should stop a successful worker loop");
+
+    assert_eq!(
+        stats,
+        WorkerLoopStats {
+            passes: 1,
+            completed: 1,
+            idle: 0,
+            errors: 0,
+        }
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn worker_loop_dispatches_successful_backlog_until_shutdown() {
+    let repository = MemoryJobRepository::new();
+    repository
+        .enqueue(job("backlog-one", JobType::SourceSync))
+        .await
+        .expect("first backlog job should enqueue");
+    repository
+        .enqueue(job("backlog-two", JobType::SourceSync))
+        .await
+        .expect("second backlog job should enqueue");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let worker = Worker::new(
+        JobService::new(
+            repository.clone(),
+            JobServiceConfig::new("integration-backlog", Duration::seconds(1), 2)
+                .expect("job service configuration should be valid"),
+        ),
+        repository.clone(),
+        ShutdownAfterCallsHandler {
+            shutdown: shutdown_tx,
+            calls: calls.clone(),
+            stop_after: 2,
+        },
+        worker_config(vec![JobType::SourceSync]),
+    )
+    .expect("worker configuration should match the job lease");
+
+    let stats = worker
+        .run_until_shutdown(
+            shutdown_rx,
+            WorkerLoopConfig::new(StdDuration::from_secs(1), StdDuration::from_secs(1))
+                .expect("worker loop configuration should be valid"),
+        )
+        .await;
+
+    assert_eq!(
+        stats,
+        WorkerLoopStats {
+            passes: 2,
+            completed: 2,
+            idle: 0,
+            errors: 0,
+        }
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        repository
+            .claim_next(
+                "verification-reader",
+                Utc::now(),
+                Duration::seconds(1),
+                &[JobType::SourceSync],
+            )
+            .await
+            .expect("queue read should succeed"),
+        None
     );
 }
