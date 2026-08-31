@@ -25,7 +25,7 @@
 //! ACCOUNT_LEASE_SECONDS / ACCOUNT_HEARTBEAT_SECONDS
 //! SOURCE_FAILURE_COOLDOWN_SECONDS
 //! RSS_CACHE_TTL_SECONDS / RSS_STALE_WHILE_REVALIDATE_SECONDS /
-//! RSS_CACHE_MISS_WAIT_MS
+//! RSS_CACHE_MISS_WAIT_MS / RSS_FEED_URL
 //! FEED_BUILD_LEASE_SECONDS / FEED_BUILD_HEARTBEAT_SECONDS
 //! PACING_* / SCROLL_*
 //! ASSET_ARCHIVE_BACKEND / ASSET_ARCHIVE_LOCAL_PATH /
@@ -114,6 +114,7 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "RSS_CACHE_TTL_SECONDS",
     "RSS_STALE_WHILE_REVALIDATE_SECONDS",
     "RSS_CACHE_MISS_WAIT_MS",
+    "RSS_FEED_URL",
     "FEED_BUILD_LEASE_SECONDS",
     "FEED_BUILD_HEARTBEAT_SECONDS",
     "PACING_REQUEST_MEAN_MS",
@@ -247,7 +248,7 @@ impl AppRoles {
 
 impl Default for AppRoles {
     fn default() -> Self {
-        Self::all()
+        Self(Self::API)
     }
 }
 
@@ -390,6 +391,10 @@ pub struct AppConfig {
     pub rss_stale_while_revalidate: Duration,
     /// Bounded wait associated with a cache miss before returning retry advice.
     pub rss_cache_miss_wait: Duration,
+    /// Optional canonical public URL written to generated RSS channel links.
+    /// A feed worker requires this value because no placeholder URL is safe to
+    /// publish.
+    pub rss_feed_url: Option<Url>,
     /// Duration for which one feed rebuild may hold its distributed lease.
     pub feed_build_lease: Duration,
     /// Maximum interval between feed-build lease heartbeats.
@@ -430,7 +435,7 @@ impl AppConfig {
     }
 
     fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
-        let roles = AppRoles::parse(raw.app_roles.as_deref().unwrap_or("all"))?;
+        let roles = AppRoles::parse(raw.app_roles.as_deref().unwrap_or("api"))?;
         let worker_concurrency = bounded_positive_u32(
             raw.worker_concurrency.unwrap_or(1),
             "WORKER_CONCURRENCY",
@@ -608,6 +613,7 @@ impl AppConfig {
             "RSS_CACHE_MISS_WAIT_MS",
             MAX_CACHE_MISS_WAIT_MS,
         )?;
+        let rss_feed_url = parse_optional_http_url(raw.rss_feed_url, "RSS_FEED_URL")?;
 
         let feed_build_lease_seconds = positive_u64(
             raw.feed_build_lease_seconds.unwrap_or(600),
@@ -728,6 +734,7 @@ impl AppConfig {
             rss_cache_ttl: Duration::from_secs(rss_cache_seconds),
             rss_stale_while_revalidate: Duration::from_secs(rss_stale_while_revalidate_seconds),
             rss_cache_miss_wait: Duration::from_millis(rss_cache_miss_wait_ms),
+            rss_feed_url,
             feed_build_lease: Duration::from_secs(feed_build_lease_seconds),
             feed_build_heartbeat: Duration::from_secs(feed_build_heartbeat_seconds),
             pacing,
@@ -772,6 +779,7 @@ struct RawConfig {
     rss_cache_ttl_seconds: Option<u64>,
     rss_stale_while_revalidate_seconds: Option<u64>,
     rss_cache_miss_wait_ms: Option<u64>,
+    rss_feed_url: Option<String>,
     feed_build_lease_seconds: Option<u64>,
     feed_build_heartbeat_seconds: Option<u64>,
     pacing_request_mean_ms: Option<f64>,
@@ -1029,6 +1037,33 @@ fn required_path(value: Option<String>, variable: &'static str) -> Result<String
     }
 }
 
+fn parse_optional_http_url(
+    value: Option<String>,
+    variable: &'static str,
+) -> Result<Option<Url>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let url = value
+        .trim()
+        .parse::<Url>()
+        .map_err(|_| ConfigError::InvalidValue {
+            variable,
+            reason: "expected a valid http or https URL",
+        })?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(ConfigError::InvalidValue {
+            variable,
+            reason: "expected a public URL with an http/https scheme and host",
+        });
+    }
+    Ok(Some(url))
+}
+
 fn parse_time(value: &str, variable: &'static str) -> Result<NaiveTime, ConfigError> {
     NaiveTime::parse_from_str(value.trim(), "%H:%M").map_err(|_| ConfigError::InvalidValue {
         variable,
@@ -1212,8 +1247,8 @@ mod tests {
         assert_eq!(config.browser_viewport_height, 2_000);
         assert!(config.browser_extra_args.is_empty());
         assert!(config.roles.contains(AppRole::Api));
-        assert!(config.roles.contains(AppRole::Scheduler));
-        assert!(config.roles.contains(AppRole::Worker));
+        assert!(!config.roles.contains(AppRole::Scheduler));
+        assert!(!config.roles.contains(AppRole::Worker));
         assert_eq!(config.worker_concurrency, 1);
         assert_eq!(config.database_pool_min_connections, 2);
         assert_eq!(config.database_pool_max_connections, 12);
@@ -1228,6 +1263,7 @@ mod tests {
         assert_eq!(config.rss_cache_ttl, Duration::from_secs(1_800));
         assert_eq!(config.rss_stale_while_revalidate, Duration::from_secs(60));
         assert_eq!(config.rss_cache_miss_wait, Duration::from_secs(5));
+        assert!(config.rss_feed_url.is_none());
         assert_eq!(config.feed_build_lease, Duration::from_secs(600));
         assert_eq!(config.feed_build_heartbeat, Duration::from_secs(60));
         assert!(matches!(config.asset_archive, AssetArchiveConfig::Disabled));
@@ -1389,6 +1425,41 @@ mod tests {
         assert!(!config.roles.contains(AppRole::Scheduler));
         assert!(config.roles.contains(AppRole::Worker));
         assert_eq!(config.worker_concurrency, 12);
+    }
+
+    #[test]
+    fn parses_and_validates_the_optional_public_feed_url() {
+        let environment = replace_environment(
+            valid_environment(),
+            "RSS_FEED_URL",
+            " https://feeds.example.test/wechrss.xml?source=public ",
+        );
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        assert_eq!(
+            config.rss_feed_url.as_ref().map(Url::as_str),
+            Some("https://feeds.example.test/wechrss.xml?source=public")
+        );
+    }
+
+    #[test]
+    fn rejects_non_public_http_feed_urls() {
+        for value in [
+            "",
+            "ftp://feeds.example.test/feed.xml",
+            "http://",
+            "https://user:password@feeds.example.test/feed.xml",
+        ] {
+            let environment = replace_environment(valid_environment(), "RSS_FEED_URL", value);
+            let result = AppConfig::from_env_iter(environment);
+            match result {
+                Err(ConfigError::InvalidValue {
+                    variable: "RSS_FEED_URL",
+                    ..
+                }) => {}
+                other => panic!("unexpected result for {value:?}: {other:?}"),
+            }
+        }
     }
 
     #[test]

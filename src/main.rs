@@ -1,15 +1,21 @@
-//! Binary entry point reserved for the future WechRss server.
+//! WechRss process entry point.
 //!
-//! The binary is intentionally non-functional in this architecture phase. It
-//! will eventually load configuration, construct PostgreSQL repositories and
-//! role-appropriate browser adapters, then start only the configured Axum,
-//! scheduler, worker, and recovery components. Those actions do not belong in
-//! the documentation-only skeleton.
+//! Startup loads environment configuration, connects to PostgreSQL, applies
+//! pending SQLx migrations, and supervises only the selected executable roles.
 
-fn main() {
-    // TODO(design): construct only configured APP_ROLES. API readiness must not
-    // depend on browser health; worker readiness and job claiming may.
-    // Implementation gate: do not start runtime composition until target
-    // configuration, corrected jobs, and UnitOfWork are executable and tested.
-    // Runtime construction will be added in a later implementation phase.
+use wechrss::{application::runtime_supervisor::RuntimeSupervisor, config::AppConfig};
+
+#[tokio::main]
+async fn main() {
+    let result = async {
+        let config = AppConfig::from_env()?;
+        let supervisor = RuntimeSupervisor::from_config(config).await?;
+        supervisor.run_until_signal().await
+    }
+    .await;
+
+    if let Err(error) = result {
+        eprintln!("wech-rss failed to start: {error}");
+        std::process::exit(1);
+    }
 }

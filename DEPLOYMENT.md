@@ -1,15 +1,17 @@
 # Browser Sidecar Deployment Notes
 
-> **Implementation status:** the Rust binary is currently a no-op. These are
-> target deployment constraints plus development-database instructions, not a
-> runnable application manifest. The environment-only configuration loader
-> validates the documented settings, but the no-op binary does not yet compose
-> runtime roles from them.
+> **Implementation status:** the Rust binary now loads environment-only
+> configuration, applies pending SQLx migrations, and composes the selected
+> API and database-only feed-rebuild worker roles. Scheduler startup is rejected
+> until source synchronization is executable. Authenticated source
+> synchronization, administrative routes, and browser health checks are still
+> not executable, so deployments must not enable those unfinished capabilities.
 
-A Rust process with the `worker` role and its browser sidecar must use the same
-IANA timezone for quiet-hours decisions and browser-visible local time. `TZ` is
-configuration, not a substitute for installing timezone data. API-only and
-scheduler-only processes do not require a browser sidecar.
+When browser-backed source synchronization is enabled, its worker and browser
+sidecar must use the same IANA timezone for quiet-hours decisions and
+browser-visible local time. `TZ` is configuration, not a substitute for
+installing timezone data. The current database-only feed-rebuild worker and
+API-only process do not require a browser sidecar.
 
 ## Docker image requirements
 
@@ -40,11 +42,13 @@ environment source instead of maintaining separate values for the application
 and sidecar. Secrets such as database URLs and encryption keys belong in a
 Kubernetes Secret.
 
-The configuration uses `APP_ROLES=all` for a small combined deployment or a
-validated subset of `api,scheduler,worker` when scaling components
-independently. Browser-session capacity and worker replica count must be
-intentional; increasing API replicas for RSS traffic must not automatically
-increase upstream fetch concurrency.
+The currently executable role sets are `APP_ROLES=api`, `worker`, or
+`api,worker`. `scheduler` and `all` fail startup until source synchronization
+is executable, because the current worker cannot consume source-sync jobs.
+`RSS_FEED_URL` must be set to the public HTTP(S) URL that generated RSS
+channels should advertise. Browser-session capacity and worker replica count
+must be intentional; increasing API replicas for RSS traffic must not
+automatically increase upstream fetch concurrency.
 
 ## Kubernetes
 

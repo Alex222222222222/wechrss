@@ -29,9 +29,9 @@ services.
 
 ## Implementation status and contract policy
 
-This document describes the target version-one architecture, not the behavior
-of a deployable server. The binary still does not start the process supervisor;
-the executable role boundary is the side-effect-free `RuntimePlan`. The
+This document describes the target version-one architecture and the behavior
+of the currently executable runtime. The binary now starts the process
+supervisor from the side-effect-free `RuntimePlan`; the
 foundations are typed environment parsing for the target configuration set,
 pure pacing/quiet-hours policy, PostgreSQL pool/migration helpers, the job and
 feed-cache domain/repository slices, their shared transaction boundary, the
@@ -45,9 +45,9 @@ The current and target contracts must not be confused:
 
 | Area | Executable now | Target contract and implementation gate |
 | --- | --- | --- |
-| Runtime | Side-effect-free `RuntimePlan` consumes `AppConfig`, selects only configured API/scheduler/worker roles, derives loop/lease policies, and conservatively dispatches only executable feed-rebuild jobs | Process supervisor still needs to construct PostgreSQL/browser/API adapters and spawn the planned loops |
+| Runtime | `RuntimeSupervisor` consumes the validated `RuntimePlan`, opens the shared PostgreSQL pool, applies SQLx migrations, binds the selected API, and supervises database-only feed-rebuild loops with graceful shutdown; worker dispatch remains limited to executable feed-rebuild jobs | Scheduler composition is fail-closed until a source-sync handler exists; authenticated/source-sync handlers, administrative routes, browser health, and readiness diagnostics remain future work |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, and shutdown-aware heartbeat/outcome execution | Synchronization-specific dispatch and removal of compatibility `now` parameters remain future work |
-| Configuration | Environment-only `AppConfig` with role, lease, cache, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint | The process supervisor must consume the parsed role and policy values before deployment relies on them |
+| Configuration | Environment-only `AppConfig` with role, lease, cache, public RSS URL, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint; the supervisor consumes the parsed role and policy values | Complete administrative configuration still needs an executable application boundary |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
 | Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, current/legacy WeRead article-list response parsing, database-only feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, and public tokenized feed route | Authenticated protocol transport, source-sync/application HTTP handlers, administrative routes, and health/readiness wiring remain future work |
 | Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, and external-image reporting through ArchiveService | Asset persistence and URL rewriting remain future work |
@@ -55,8 +55,8 @@ The current and target contracts must not be confused:
 Environment variables in this document are parsed into `AppConfig`, and
 `application::runtime::RuntimePlan` is the side-effect-free boundary that
 derives role-specific component plans. It does not open connections, start
-listeners, or spawn tasks. The process supervisor must consume the plan before
-constructing those side effects. The loader has an explicit allowlist for application-owned names
+listeners, or spawn tasks; `RuntimeSupervisor` consumes it before constructing
+those side effects. The loader has an explicit allowlist for application-owned names
 and rejects unknown names within those prefixes so misspellings cannot be
 silently ignored, while ordinary container variables such as `PATH` remain
 permitted.
@@ -72,10 +72,13 @@ startup errors; unrelated environment names are ignored.
 ## Runtime shape
 
 The first runtime is a modular monolith, but each process has an explicit role
-set: `api`, `scheduler`, `worker`, or `all`. `all` is convenient for a small
-Docker deployment; Kubernetes may scale API and worker processes independently
-so RSS traffic does not implicitly increase upstream-fetch concurrency. A
-browser sidecar is required only for a process with the worker role.
+set: `api`, `scheduler`, `worker`, or `all`. The currently executable supervisor
+accepts `api`, `worker`, and `api,worker`; it rejects `scheduler` and `all` until
+the source-sync handler exists, preventing the scheduler from creating work no
+worker can execute. Kubernetes may scale API and worker processes independently
+so RSS traffic does not implicitly increase upstream-fetch concurrency. The
+current feed-rebuild worker is database-only; a browser sidecar becomes
+required when browser-backed source synchronization is enabled.
 PostgreSQL is the coordination point, so multiple instances can run at the
 same time without executing the same active job.
 
@@ -777,7 +780,7 @@ JOB_MAX_ATTEMPTS
 ACCOUNT_LEASE_SECONDS / ACCOUNT_HEARTBEAT_SECONDS
 SOURCE_FAILURE_COOLDOWN_SECONDS
 RSS_CACHE_TTL_SECONDS / RSS_STALE_WHILE_REVALIDATE_SECONDS /
-RSS_CACHE_MISS_WAIT_MS
+RSS_CACHE_MISS_WAIT_MS / RSS_FEED_URL
 FEED_BUILD_LEASE_SECONDS / FEED_BUILD_HEARTBEAT_SECONDS
 PACING_* / SCROLL_*
 ASSET_ARCHIVE_BACKEND / ASSET_ARCHIVE_LOCAL_PATH /
@@ -788,10 +791,11 @@ ADMIN_ENABLED / ADMIN_PASSWORD / SESSION_SIGNING_KEY /
 CREDENTIAL_ENCRYPTION_KEY
 ```
 
-`APP_TIMEZONE` is an IANA timezone name and defaults to `UTC`. `APP_INSTANCE_ID`
-may be omitted for local use; the loader then generates a random per-process
-UUID so application replicas do not share job-lease ownership. `APP_ROLES`
-defaults to `all`, `WORKER_CONCURRENCY` defaults to `1`, and account/feed-build
+`APP_TIMEZONE` is an IANA timezone name and defaults to `UTC`. `APP_ROLES`
+defaults to `api`; worker startup additionally requires `RSS_FEED_URL`.
+`APP_INSTANCE_ID` may be omitted for local use; the loader then generates a
+random per-process UUID so application replicas do not share job-lease
+ownership. `WORKER_CONCURRENCY` defaults to `1`, and account/feed-build
 leases default to 600 seconds with 60-second heartbeats. The source failure
 cooldown defaults to 300 seconds, RSS stale-while-revalidate defaults to 60
 seconds, and a cache miss wait defaults to 5 seconds. Required secrets and
@@ -838,8 +842,11 @@ arguments. It intentionally does not inject that JavaScript or claim to hide
 continue to classify verification pages as a terminal upstream result.
 
 `APP_ROLES` is a validated set containing `api`, `scheduler`, and/or `worker`;
-`all` expands to all three. Worker concurrency is configured independently from
-API replica count. `ASSET_ARCHIVE_BACKEND` is the enum `disabled | local | s3`
+`all` expands to all three, but the current supervisor rejects `scheduler` and
+`all` until source synchronization is executable. Worker concurrency is
+configured independently from API replica count. `RSS_FEED_URL` is an optional
+validated public HTTP(S) URL for generated RSS channel links and is required
+when the worker role is enabled. `ASSET_ARCHIVE_BACKEND` is the enum `disabled | local | s3`
 and defaults to `disabled`; local paths or object-store credentials are
 validated only for the selected enabled backend.
 
@@ -973,8 +980,11 @@ than add more empty module shells. Work proceeds in this order:
    finalization to that outcome. Add the remaining source/archive queries; the
    `FeedRebuildJobHandler` already maps pre-publication rebuild failures to
    explicit worker outcomes.
-4. Build role-aware runtime composition and integrate the scheduler/worker
-   loops, heartbeat cancellation, and degraded browser health behavior.
+4. Build role-aware runtime composition and integrate the worker loop and
+   heartbeat cancellation. The current supervisor covers the API and
+   database-only feed-rebuild worker; scheduler startup remains gated until the
+   source-sync handler is executable, and degraded browser health behavior
+   remains gated on the future authenticated worker path.
 5. Complete the acquisition slice with fresh-profile creation and browser
    health checks behind the now-executable verified-URL, Thirtyfour,
    browser-capability, public pacing/scroll, and expected-timezone ports. Public
@@ -1059,7 +1069,9 @@ That repository samples PostgreSQL time and applies the policy inside its
 transaction. `Scheduler::run_until_shutdown` owns polling, shutdown, and
 transient-error backoff around this boundary; runtime composition still owns
 role selection and metrics. It must call this boundary rather than reimplement
-source selection.
+source selection. `RuntimeSupervisor` does not compose this role until the
+source-sync handler is executable, because the current worker dispatch only
+claims database-only `feed_rebuild` jobs.
 
 The remaining tree intentionally contains no administrative route handlers,
 source HTTP orchestration, credential
