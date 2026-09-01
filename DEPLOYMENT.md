@@ -47,6 +47,29 @@ environment source instead of maintaining separate values for the application
 and sidecar. Secrets such as database URLs and encryption keys belong in a
 Kubernetes Secret.
 
+## WechRss application image
+
+The release image is published to GHCR by `.github/workflows/container.yml`
+when a semantic-version tag such as `v0.1.0` is pushed. Pull the versioned
+image with:
+
+```sh
+docker pull ghcr.io/<owner>/<repository>:0.1.0
+```
+
+For a local build, run this from the repository root:
+
+```sh
+docker build --tag wechrss:local .
+```
+
+The image listens on port `8080` by default and runs as an unprivileged user.
+Provide `DATABASE_URL` and the other runtime settings through the deployment
+environment; do not put credentials in a Dockerfile, image layer, or committed
+configuration file. The image contains the application and timezone/CA data,
+but browser-backed source synchronization still requires the separately
+configured WebDriver sidecar described below.
+
 The public feeds, health endpoints, and optional admin panel share the API
 listener. Set its host and port with `HTTP_BIND` and `HTTP_PORT`:
 

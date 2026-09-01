@@ -42,8 +42,9 @@ application-service boundaries as other clients and does not expose credentials,
 session tokens, or browser controls. The panel is implemented when
 administration is explicitly enabled. The release target also
 includes a reproducible Docker image build and the deployment documentation
-needed to run the release image; those build artifacts are not yet in the
-current incremental tree.
+needed to run the release image. The checked-in Dockerfile and GitHub Actions
+workflow build every branch and publish a release image to GHCR for `v*.*.*`
+tags.
 
 The following items are intentionally deferred until after the first release:
 
@@ -75,28 +76,32 @@ These possible features are ordered approximately by user value and operational
 impact, not by implementation difficulty. The list is a planning guide rather
 than a commitment:
 
-1. **Build and publish the release Docker image.** Provide a reproducible,
-   minimal image with a documented runtime configuration and deployment
-   workflow. This is required for the first release.
-2. **Add browser health and worker readiness diagnostics.** Report WebDriver
+1. **Add browser health and worker readiness diagnostics.** Report WebDriver
    availability and timezone mismatches separately from API liveness and
    PostgreSQL readiness, and prevent browser jobs from being claimed while the
    browser sidecar is unhealthy.
-3. **Add QR-code login.** Implement the bounded, single-use login-attempt
+2. **Add QR-code login.** Implement the bounded, single-use login-attempt
    lifecycle and interactive confirmation flow so operators do not need to
    supply a pre-authenticated browser profile. This remains deferred after the
    first release.
-4. **Add missed-article repair/backfill jobs.** Queue and process articles
+3. **Add missed-article repair/backfill jobs.** Queue and process articles
    missed during synchronization with bounded retries and deduplication. This
    improves recovery after partial upstream failures but is not required for
    the first release.
-5. **Persist archived assets and rewrite feed URLs.** Store approved media in
+4. **Persist archived assets and rewrite feed URLs.** Store approved media in
    local or object storage so archived articles can remain useful when
    upstream assets change or disappear.
-6. **Evaluate PGMQ as a queue transport optimization.** The current custom
+5. **Evaluate PGMQ as a queue transport optimization.** The current custom
    `jobs` table remains the version-one transport; PGMQ can be evaluated later
    if queue throughput or operational overhead becomes a demonstrated
    bottleneck.
+
+The release image is built by `.github/workflows/container.yml`. Push a
+semantic-version tag such as `v0.1.0` to build and publish
+`ghcr.io/<owner>/<repository>:0.1.0` and `:latest`; branch and pull-request
+builds validate the Dockerfile without publishing. The image expects the same
+environment variables described in [DEPLOYMENT.md](DEPLOYMENT.md), including
+`DATABASE_URL`; no credentials are baked into the image.
 
 ## WeRead authentication
 

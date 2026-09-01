@@ -1,0 +1,7 @@
+.git
+.dev
+target
+mutants.out*
+Dockerfile*
+*.md
+tests
