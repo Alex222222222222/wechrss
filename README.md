@@ -98,7 +98,7 @@ than a commitment:
 
 The release image is built by `.github/workflows/container.yml`. Push a
 semantic-version tag such as `v0.1.0` to build and publish
-`ghcr.io/<owner>/<repository>:0.1.0` and `:latest`; branch and pull-request
+`ghcr.io/<owner>/<repository>:v0.1.0` and `:latest`; branch and pull-request
 builds validate the Dockerfile without publishing. The image expects the same
 environment variables described in [DEPLOYMENT.md](DEPLOYMENT.md), including
 `DATABASE_URL`; no credentials are baked into the image.

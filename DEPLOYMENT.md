@@ -54,7 +54,7 @@ when a semantic-version tag such as `v0.1.0` is pushed. Pull the versioned
 image with:
 
 ```sh
-docker pull ghcr.io/<owner>/<repository>:0.1.0
+docker pull ghcr.io/<owner>/<repository>:v0.1.0
 ```
 
 For a local build, run this from the repository root:
