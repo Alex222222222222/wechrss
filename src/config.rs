@@ -1312,6 +1312,7 @@ mod tests {
             ("APP_TIMEZONE", "Asia/Shanghai"),
             ("QUIET_HOURS_START", "23:00"),
             ("QUIET_HOURS_END", "07:00"),
+            ("HTTP_BIND", "127.0.0.1"),
             ("HTTP_PORT", "8088"),
             ("JOB_LEASE_SECONDS", "120"),
             ("RSS_CACHE_TTL_SECONDS", "1800"),
@@ -1366,7 +1367,7 @@ mod tests {
         assert_eq!(config.worker_concurrency, 1);
         assert_eq!(config.database_pool_min_connections, 2);
         assert_eq!(config.database_pool_max_connections, 12);
-        assert_eq!(config.http_bind, "0.0.0.0");
+        assert_eq!(config.http_bind, "127.0.0.1");
         assert_eq!(config.http_port, 8088);
         assert_eq!(config.timezone, chrono_tz::Asia::Shanghai);
         assert_eq!(config.job_lease, Duration::from_secs(120));
@@ -1390,6 +1391,19 @@ mod tests {
                 .parse::<chrono::DateTime<chrono::Utc>>()
                 .unwrap()
         ));
+    }
+
+    #[test]
+    fn defaults_http_listener_when_bind_and_port_are_absent() {
+        let environment = valid_environment()
+            .into_iter()
+            .filter(|(key, _)| key != "HTTP_BIND" && key != "HTTP_PORT")
+            .collect::<Vec<_>>();
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+
+        assert_eq!(config.http_bind, "0.0.0.0");
+        assert_eq!(config.http_port, 8080);
     }
 
     #[test]
@@ -1887,6 +1901,24 @@ mod tests {
             AppConfig::from_env_iter(environment),
             Err(ConfigError::InvalidValue {
                 variable: "BROWSER_ENGINE",
+                ..
+            })
+        ));
+
+        let environment = replace_environment(valid_environment(), "HTTP_PORT", "0");
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "HTTP_PORT",
+                ..
+            })
+        ));
+
+        let environment = replace_environment(valid_environment(), "HTTP_BIND", "   ");
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "HTTP_BIND",
                 ..
             })
         ));

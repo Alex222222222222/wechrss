@@ -42,6 +42,31 @@ fn role_selection_is_stable_and_does_not_construct_unselected_components() {
 }
 
 #[test]
+fn api_plan_uses_listener_host_and_port_from_environment() {
+    let config = AppConfig::from_env_iter([
+        (
+            "DATABASE_URL".to_owned(),
+            "postgres://user:pass@db/feed".to_owned(),
+        ),
+        (
+            "CREDENTIAL_ENCRYPTION_KEY".to_owned(),
+            "test-key".to_owned(),
+        ),
+        ("APP_ROLES".to_owned(), "api".to_owned()),
+        ("HTTP_BIND".to_owned(), "127.0.0.1".to_owned()),
+        ("HTTP_PORT".to_owned(), "18080".to_owned()),
+    ])
+    .unwrap();
+    let plan = RuntimePlan::from_config(&config).unwrap();
+    let RuntimeComponent::Api(api) = plan.component(AppRole::Api).unwrap() else {
+        panic!("API role should produce an API plan")
+    };
+
+    assert_eq!(api.bind(), "127.0.0.1");
+    assert_eq!(api.port(), 18_080);
+}
+
+#[test]
 fn worker_plan_uses_only_executable_jobs_and_preserves_concurrency() {
     let plan = RuntimePlan::from_config(&config("worker")).unwrap();
     let RuntimeComponent::Worker(worker) = plan.component(AppRole::Worker).unwrap() else {

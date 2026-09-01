@@ -73,6 +73,13 @@ pub trait SourceReader: Clone + Send + Sync {
     async fn find_by_book_id(&self, book_id: &str) -> Result<Option<Source>, SourceServiceError>;
 }
 
+/// Application-facing source listing port used by administrative clients.
+#[allow(async_fn_in_trait)]
+pub trait SourceLister: Clone + Send + Sync {
+    /// Lists sources in the repository's deterministic order.
+    async fn list(&self) -> Result<Vec<Source>, SourceServiceError>;
+}
+
 /// Application-facing transaction port for source lifecycle mutations.
 ///
 /// The port deliberately exposes no SQLx transaction or independent commit
@@ -126,6 +133,12 @@ impl SourceReader for PostgresSourceRepository {
 
     async fn find_by_book_id(&self, book_id: &str) -> Result<Option<Source>, SourceServiceError> {
         Ok(SourceRepository::find_by_book_id(self, book_id).await?)
+    }
+}
+
+impl SourceLister for PostgresSourceRepository {
+    async fn list(&self) -> Result<Vec<Source>, SourceServiceError> {
+        Ok(SourceRepository::list(self).await?)
     }
 }
 
@@ -252,6 +265,17 @@ where
         let source = unit_of_work.set_scheduling_gate(source_id, gate).await?;
         unit_of_work.commit().await?;
         Ok(source)
+    }
+}
+
+impl<S, U> SourceService<S, U>
+where
+    S: SourceLister,
+    U: SourceUnitOfWorkFactory,
+{
+    /// Lists all subscribed sources for the administrative panel.
+    pub async fn list(&self) -> Result<Vec<Source>, SourceServiceError> {
+        self.sources.list().await
     }
 }
 

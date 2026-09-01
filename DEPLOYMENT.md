@@ -5,8 +5,9 @@
 > scheduler, feed-rebuild, and authenticated source-sync worker roles. Encrypted
 > WeRead credential provisioning and lease-serialized non-interactive refresh
 > are available as an application service. A deployment-specific refresh
-> transport can be injected into the runtime worker; QR/login exchange,
-> administrative routes, and browser health checks remain unfinished. API
+> transport can be injected into the runtime worker; QR/login exchange and
+> browser health checks remain unfinished. The single-admin API and panel are
+> available when explicitly enabled. API
 > liveness/readiness endpoints are available. Source
 > synchronization still requires a pre-authenticated browser profile and
 > WeRead account ID.
@@ -45,6 +46,20 @@ override layer. In production, inject the timezone from one ConfigMap or
 environment source instead of maintaining separate values for the application
 and sidecar. Secrets such as database URLs and encryption keys belong in a
 Kubernetes Secret.
+
+The public feeds, health endpoints, and optional admin panel share the API
+listener. Set its host and port with `HTTP_BIND` and `HTTP_PORT`:
+
+```yaml
+environment:
+  HTTP_BIND: 0.0.0.0
+  HTTP_PORT: "8080"
+```
+
+`HTTP_BIND` defaults to `0.0.0.0`; `HTTP_PORT` defaults to `8080` and must be a
+non-zero port. There is no separate admin listener. For an IPv6 bind, provide
+the raw address (for example, `::1`); the application formats the socket
+address correctly before binding.
 
 The API role is executable by itself. The scheduler role and source-sync worker
 dispatch require the authenticated settings below; without them, a worker
@@ -167,8 +182,11 @@ availability part of its own readiness condition. Liveness is exposed at
 The first usable version includes a small authenticated admin panel for source
 management, synchronization status, feed-link copying, and safe error states.
 It has one administrator configured through `ADMIN_USERNAME` and
-`ADMIN_PASSWORD`; user management is out of scope. The panel is a release
-target and is not yet complete in the incremental tree.
+`ADMIN_PASSWORD`; user management is out of scope. Enable it with
+`ADMIN_ENABLED=true`, an independent `SESSION_SIGNING_KEY`, and expose it only
+through the deployment's TLS-protected ingress. `/admin/login` starts the
+non-interactive login flow; successful API login returns a CSRF token for
+state-changing requests.
 Interactive QR-code login is deferred until after the first release because it
 requires user interaction and a dedicated login-attempt lifecycle. A durable
 queue and handler for articles missed during synchronization is also deferred;

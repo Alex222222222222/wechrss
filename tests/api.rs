@@ -2,10 +2,13 @@
 
 use axum::{
     body::{to_bytes, Body},
+    extract::ConnectInfo,
     http::{header, Request, StatusCode},
+    Extension,
 };
 use chrono::{Duration, Utc};
 use chrono_tz::UTC;
+use secrecy::SecretString;
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -15,6 +18,7 @@ use wechrss::{
             FeedRebuildJobConfig, FeedService, FeedServiceConfig, PostgresFeedRebuildQueue,
         },
         feed_token_service::FeedTokenService,
+        source_service::SourceService,
     },
     domain::source::{FeedRevision, SourceId},
     persistence::{
@@ -25,12 +29,206 @@ use wechrss::{
             },
             feed_token_repository::PostgresFeedTokenRepository,
             job_repository::PostgresJobRepository,
+            source_repository::PostgresSourceRepository,
+            sync_run_repository::PostgresSyncRunRepository,
         },
         unit_of_work::UnitOfWorkFactory,
     },
     rss::renderer::{RenderArticle, RenderFeedInput, RssRenderer},
-    web::api::feed_router,
+    web::{admin::admin_router, api::feed_router, auth::AdminAuthenticator},
 };
+
+#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool) {
+    let app = admin_app(&pool);
+    let login = app
+        .clone()
+        .oneshot(json_request(
+            "/api/admin/login",
+            serde_json::json!({"username": "admin", "password": "wrong"}),
+        ))
+        .await
+        .expect("login request should complete");
+    assert_eq!(login.status(), StatusCode::UNAUTHORIZED);
+    assert!(!login.headers().contains_key(header::SET_COOKIE));
+
+    let page = app
+        .clone()
+        .oneshot(get_request("/admin", None))
+        .await
+        .expect("admin page request should complete");
+    assert_eq!(page.status(), StatusCode::SEE_OTHER);
+    assert_eq!(page.headers()[header::LOCATION], "/admin/login");
+
+    let login = app
+        .clone()
+        .oneshot(json_request(
+            "/api/admin/login",
+            serde_json::json!({"username": "admin", "password": "correct horse"}),
+        ))
+        .await
+        .expect("valid login request should complete");
+    assert_eq!(login.status(), StatusCode::OK);
+    let cookie = login.headers()[header::SET_COOKIE]
+        .to_str()
+        .expect("session cookie should be valid")
+        .split(';')
+        .next()
+        .expect("cookie should contain a value")
+        .to_owned();
+    let login_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(login.into_body(), usize::MAX)
+            .await
+            .expect("login body should be readable"),
+    )
+    .expect("login body should be JSON");
+    let csrf = login_body["csrf_token"]
+        .as_str()
+        .expect("CSRF should be returned");
+
+    let page = app
+        .clone()
+        .oneshot(admin_request("/admin", &cookie, None, None))
+        .await
+        .expect("authenticated admin page request should complete");
+    assert_eq!(page.status(), StatusCode::OK);
+    let page_body = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .expect("admin page body should be readable")
+            .to_vec(),
+    )
+    .expect("admin page should be UTF-8");
+    assert!(page_body.contains("WechRss admin"));
+    assert!(!page_body.contains("correct horse"));
+
+    let sources = app
+        .clone()
+        .oneshot(admin_request("/api/admin/sources", &cookie, None, None))
+        .await
+        .expect("source list request should complete");
+    assert_eq!(sources.status(), StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(sources.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap(),
+        serde_json::json!([])
+    );
+
+    let missing_csrf = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/sources",
+            &cookie,
+            None,
+            Some(serde_json::json!({
+                "book_id": "book-csrf", "display_name": "CSRF", "article_url": "https://mp.weixin.qq.com/s/csrf"
+            })),
+        ))
+        .await
+        .expect("mutation request should complete");
+    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+
+    let created = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/sources",
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({
+                "book_id": "book-admin", "display_name": "Admin source", "article_url": "https://mp.weixin.qq.com/s/admin"
+            })),
+        ))
+        .await
+        .expect("source creation request should complete");
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let source_id = created_body["id"].as_str().unwrap().to_owned();
+
+    let disabled = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/api/admin/sources/{source_id}/enabled"),
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({"enabled": false})),
+        ))
+        .await
+        .expect("source enable mutation should complete");
+    assert_eq!(disabled.status(), StatusCode::OK);
+    let gated = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/api/admin/sources/{source_id}/gate"),
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({"gate": "risk_controlled"})),
+        ))
+        .await
+        .expect("source gate mutation should complete");
+    assert_eq!(gated.status(), StatusCode::OK);
+
+    let feed_token = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/api/admin/sources/{source_id}/feed-token"),
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({})),
+        ))
+        .await
+        .expect("feed token request should complete");
+    assert_eq!(feed_token.status(), StatusCode::OK);
+    let feed_path = serde_json::from_slice::<serde_json::Value>(
+        &to_bytes(feed_token.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap()["feed_path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(feed_path.starts_with("/feeds/"));
+    assert!(feed_path.ends_with(".xml"));
+
+    let missing_feed_token = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/api/admin/sources/{}/feed-token", Uuid::from_u128(99_999)),
+            &cookie,
+            Some(csrf),
+            None,
+        ))
+        .await
+        .expect("missing source token request should complete");
+    assert_eq!(missing_feed_token.status(), StatusCode::NOT_FOUND);
+
+    let duplicate = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/sources",
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({
+                "book_id": "book-admin", "display_name": "Duplicate", "article_url": "https://mp.weixin.qq.com/s/duplicate"
+            })),
+        ))
+        .await
+        .expect("duplicate source request should complete");
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+    let invalid_history = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/api/admin/sources/{source_id}/sync-runs?limit=0"),
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("invalid history request should complete");
+    assert_eq!(invalid_history.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
 
 #[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
 async fn feed_route_serves_xml_and_honors_conditional_requests(pool: PgPool) {
@@ -263,6 +461,62 @@ fn get_request(path: &str, etag: Option<&str>) -> Request<Body> {
     request
         .body(Body::empty())
         .expect("request should be valid")
+}
+
+fn json_request(path: &str, value: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(value.to_string()))
+        .expect("JSON request should be valid")
+}
+
+fn admin_request(
+    path: &str,
+    cookie: &str,
+    csrf: Option<&str>,
+    body: Option<serde_json::Value>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(if body.is_some() { "POST" } else { "GET" })
+        .uri(path)
+        .header(header::COOKIE, cookie);
+    if let Some(csrf) = csrf {
+        builder = builder.header("x-csrf-token", csrf);
+    }
+    if let Some(body) = body {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+        builder
+            .body(Body::from(body.to_string()))
+            .expect("admin JSON request should be valid")
+    } else {
+        builder
+            .body(Body::empty())
+            .expect("admin request should be valid")
+    }
+}
+
+fn admin_app(pool: &PgPool) -> axum::Router {
+    let auth = AdminAuthenticator::new(
+        "admin".to_owned(),
+        SecretString::new("correct horse".to_owned().into_boxed_str()),
+        SecretString::new("independent signing key".to_owned().into_boxed_str()),
+    )
+    .expect("test admin auth should be valid");
+    admin_router(
+        auth,
+        SourceService::new(
+            PostgresSourceRepository::new(pool.clone()),
+            UnitOfWorkFactory::new(pool.clone()),
+        ),
+        FeedTokenService::new(PostgresFeedTokenRepository::new(pool.clone())),
+        PostgresSyncRunRepository::new(pool.clone()),
+    )
+    .layer(Extension(ConnectInfo(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        43_210,
+    )))))
 }
 
 async fn status(app: &axum::Router, path: &str) -> StatusCode {

@@ -86,6 +86,9 @@ pub enum SourceRepositoryError {
 /// Pool-backed source reads.
 #[allow(async_fn_in_trait)]
 pub trait SourceRepository: Send + Sync {
+    /// Returns all sources in deterministic display-name order.
+    async fn list(&self) -> Result<Vec<Source>, SourceRepositoryError>;
+
     /// Finds one source by its durable identifier.
     async fn find(&self, source_id: SourceId) -> Result<Option<Source>, SourceRepositoryError>;
 
@@ -117,6 +120,18 @@ impl PostgresSourceRepository {
 }
 
 impl SourceRepository for PostgresSourceRepository {
+    async fn list(&self) -> Result<Vec<Source>, SourceRepositoryError> {
+        sqlx::query(&format!(
+            "SELECT {SOURCE_COLUMNS} FROM sources ORDER BY display_name ASC, id ASC"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .into_iter()
+        .map(decode_source)
+        .collect()
+    }
+
     async fn find(&self, source_id: SourceId) -> Result<Option<Source>, SourceRepositoryError> {
         validate_source_id(source_id)?;
         sqlx::query(&format!(

@@ -39,8 +39,8 @@ error states. It has one administrator whose username and password are supplied
 through `ADMIN_USERNAME` and `ADMIN_PASSWORD`; there is no user-management
 lifecycle in the first version. The panel uses the same API and
 application-service boundaries as other clients and does not expose credentials,
-session tokens, or browser controls. The panel is a release target and is not
-yet fully implemented in the current incremental tree. The release target also
+session tokens, or browser controls. The panel is implemented when
+administration is explicitly enabled. The release target also
 includes a reproducible Docker image build and the deployment documentation
 needed to run the release image; those build artifacts are not yet in the
 current incremental tree.
@@ -53,37 +53,47 @@ The following items are intentionally deferred until after the first release:
   useful repair/backfill improvement, but the first release relies on the
   normal source synchronization path.
 
+## HTTP listener configuration
+
+The public feeds, health endpoints, and optional admin panel share one HTTP
+listener. Configure its bind host and port with environment variables:
+
+```text
+HTTP_BIND=0.0.0.0
+HTTP_PORT=8080
+```
+
+`HTTP_BIND` defaults to `0.0.0.0` and accepts an IP address or resolvable host
+name. `HTTP_PORT` defaults to `8080` and must be between `1` and `65535`.
+There is no separate host or port for the admin panel. For an IPv6 bind, use a
+raw address such as `::1`; the runtime adds the required brackets when it
+constructs the socket address.
+
 ## Roadmap
 
 These possible features are ordered approximately by user value and operational
 impact, not by implementation difficulty. The list is a planning guide rather
 than a commitment:
 
-1. **Complete the authenticated admin panel and its API.** Add source
-   management, synchronization status, feed-link copying, safe error states,
-   session protection, CSRF validation, and login rate limiting for the single
-   environment-configured administrator (`ADMIN_USERNAME` and
-   `ADMIN_PASSWORD`). User management is intentionally out of scope for the
-   first version. This is the highest-value first-version milestone.
-2. **Build and publish the release Docker image.** Provide a reproducible,
+1. **Build and publish the release Docker image.** Provide a reproducible,
    minimal image with a documented runtime configuration and deployment
    workflow. This is required for the first release.
-3. **Add browser health and worker readiness diagnostics.** Report WebDriver
+2. **Add browser health and worker readiness diagnostics.** Report WebDriver
    availability and timezone mismatches separately from API liveness and
    PostgreSQL readiness, and prevent browser jobs from being claimed while the
    browser sidecar is unhealthy.
-4. **Add QR-code login.** Implement the bounded, single-use login-attempt
+3. **Add QR-code login.** Implement the bounded, single-use login-attempt
    lifecycle and interactive confirmation flow so operators do not need to
    supply a pre-authenticated browser profile. This remains deferred after the
    first release.
-5. **Add missed-article repair/backfill jobs.** Queue and process articles
+4. **Add missed-article repair/backfill jobs.** Queue and process articles
    missed during synchronization with bounded retries and deduplication. This
    improves recovery after partial upstream failures but is not required for
    the first release.
-6. **Persist archived assets and rewrite feed URLs.** Store approved media in
+5. **Persist archived assets and rewrite feed URLs.** Store approved media in
    local or object storage so archived articles can remain useful when
    upstream assets change or disappear.
-7. **Evaluate PGMQ as a queue transport optimization.** The current custom
+6. **Evaluate PGMQ as a queue transport optimization.** The current custom
    `jobs` table remains the version-one transport; PGMQ can be evaluated later
    if queue throughput or operational overhead becomes a demonstrated
    bottleneck.
@@ -116,12 +126,29 @@ This service boundary is implemented and tested. A deployment-specific
 `CredentialRefresher` can be injected into `RuntimeSupervisor`; that enables
 `credential_refresh` jobs in the worker plan and makes the runtime scheduler
 enqueue one deduplicated refresh job for each active account within the
-refresh window. The project does not prescribe an upstream refresh protocol
-or expose this flow as an administrative HTTP route yet. The current
+refresh window. The current
 browser-backed source-sync runtime still uses a pre-authenticated browser
 profile. See
 [`AuthService`](src/application/auth_service.rs) and the
 [authentication architecture](ARCHITECTURE.md#source-scheduling-and-account-leases).
+
+### Single-admin panel and API
+
+Enable the first-version administration surface with `ADMIN_ENABLED=true`,
+`ADMIN_USERNAME`, `ADMIN_PASSWORD`, and an independent `SESSION_SIGNING_KEY`.
+Open `/admin/login` and submit the configured credentials. A successful
+`POST /api/admin/login` returns a short-lived `HttpOnly` session cookie and a
+CSRF token; send that token as `X-CSRF-Token` on every state-changing admin
+request. The panel is available at `/admin` and uses these API routes:
+
+- `GET /api/admin/sources` and `POST /api/admin/sources` for source management;
+- `POST /api/admin/sources/{id}/enabled` and `/gate` for operator controls;
+- `POST /api/admin/sources/{id}/feed-token` to create/rotate a copyable feed
+  link; and
+- `GET /api/admin/sources/{id}/sync-runs` for synchronization history.
+
+There is no user-management endpoint. Put the application behind TLS in a
+deployment so the session cookie and credentials are protected in transit.
 
 ### QR login
 

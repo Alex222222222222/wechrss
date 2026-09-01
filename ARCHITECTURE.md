@@ -4,7 +4,8 @@ This document describes the planned Rust implementation of the existing
 `wechrss-main` Python service. The current Rust tree remains intentionally
 incremental: it defines boundaries and ownership, with the domain/configuration
 policies and the first PostgreSQL job/cache-persistence slices implemented
-while interactive login and administrative HTTP behavior remain unimplemented.
+while interactive login remains unimplemented. Administrative HTTP behavior
+for the single configured administrator is executable.
 Process liveness and PostgreSQL-backed API readiness diagnostics are executable.
 Encrypted credential persistence and non-interactive
 refresh are implemented as an application service.
@@ -12,9 +13,9 @@ The pure RSS renderer, normalized article persistence, cache-first feed
 delivery decision service, archive sanitizer, unauthenticated public article
 browser path, and database-only feed rebuild orchestration are executable.
 The public feed-token lifecycle and its tokenized feed route are executable;
-administrative routes still need to compose their application services. The
-first usable version also includes a small web UI over those application/API
-boundaries; its pages remain incremental work in the current tree.
+administrative routes compose the source, feed-token, and synchronization-run
+application/repository boundaries. The first usable version also includes a
+small web UI over those application/API boundaries.
 
 The first usable version deliberately defers interactive QR-code login and the
 queue/handler used to repair articles missed during synchronization. The latter
@@ -58,11 +59,11 @@ The current and target contracts must not be confused:
 
 | Area | Executable now | Target contract and implementation gate |
 | --- | --- | --- |
-| Runtime | `RuntimeSupervisor` consumes the validated `RuntimePlan`, opens the shared PostgreSQL pool, applies SQLx migrations, binds the selected API, and supervises scheduler, feed-rebuild, and configuration-gated authenticated source-sync loops with graceful shutdown; an injected refresh transport also enables account-expiry scheduling | QR/login exchange, administrative routes, and browser health remain future work; API liveness/readiness are executable |
+| Runtime | `RuntimeSupervisor` consumes the validated `RuntimePlan`, opens the shared PostgreSQL pool, applies SQLx migrations, binds the selected API, and supervises scheduler, feed-rebuild, and configuration-gated authenticated source-sync loops with graceful shutdown; an injected refresh transport also enables account-expiry scheduling | QR/login exchange and browser health remain future work; API liveness/readiness and single-admin routes are executable |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, type-aware feed-rebuild/source-sync dispatch, lease-fenced credential-refresh dispatch when a transport is injected, and shutdown-aware heartbeat/outcome execution | Article-backfill dispatch, plus removal of compatibility `now` parameters, remain future work |
-| Configuration | Environment-only `AppConfig` with role, lease, cache, public RSS URL, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint; the supervisor consumes the parsed role and policy values | Complete administrative configuration still needs an executable application boundary |
+| Configuration | Environment-only `AppConfig` with role, lease, cache, public RSS URL, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint; the supervisor consumes the parsed role and policy values | QR-login configuration remains future work |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, feed-build leases, and encrypted WeRead account credential records with optimistic versions | QR-login state and remaining transaction-scoped views are design-only |
-| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, authenticated WeRead article-list transport through a pre-authenticated profile and account lease, source-sync finalization through an injected acquisition port, feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, public tokenized feed route, and API liveness/readiness routes | Login/QR exchange, source-sync/application HTTP handlers, administrative routes, browser health, and the first-version web UI remain future work |
+| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, authenticated WeRead article-list transport through a pre-authenticated profile and account lease, source-sync finalization through an injected acquisition port, feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, public tokenized feed route, API liveness/readiness routes, and single-admin source/panel routes | Login/QR exchange and browser health remain future work |
 | Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, and external-image reporting through ArchiveService | Asset persistence and URL rewriting remain future work |
 
 Environment variables in this document are parsed into `AppConfig`, and
@@ -558,8 +559,8 @@ implemented in `src/application/feed_rebuild_service.rs`. Public feed-token
 lifecycle is implemented in `src/domain/feed_token.rs`,
 `src/persistence/repositories/feed_token_repository.rs`, and
 `src/application/feed_token_service.rs`; the public route composition is
-implemented in `src/web/api.rs`, while administrative route composition remains
-future work.
+implemented in `src/web/api.rs`; the authenticated administrative API and panel
+are composed in `src/web/admin.rs` and `src/web/ui.rs`.
 
 Feed tokens are 32 random bytes encoded as unpadded base64url. PostgreSQL
 stores only the SHA-256 digest in `feed_tokens`, with one current row per
@@ -826,7 +827,7 @@ ASSET_ARCHIVE_BACKEND / ASSET_ARCHIVE_LOCAL_PATH /
 ASSET_ARCHIVE_S3_ENDPOINT / ASSET_ARCHIVE_S3_BUCKET /
 ASSET_ARCHIVE_S3_REGION / ASSET_ARCHIVE_S3_ACCESS_KEY /
 ASSET_ARCHIVE_S3_SECRET_KEY
-ADMIN_ENABLED / ADMIN_PASSWORD / SESSION_SIGNING_KEY /
+ADMIN_ENABLED / ADMIN_USERNAME / ADMIN_PASSWORD / SESSION_SIGNING_KEY /
 CREDENTIAL_ENCRYPTION_KEY
 ```
 
@@ -1135,8 +1136,8 @@ authenticated source-sync adapter is configured, and dispatches feed-rebuild,
 source-sync, and transport-backed credential-refresh jobs through one
 type-aware worker handler.
 
-The remaining tree intentionally contains no administrative route handlers,
-source HTTP orchestration, or interactive login/credential exchange. Durable
+The remaining tree intentionally contains no interactive login/credential
+exchange. Durable
 credential persistence and non-interactive refresh are executable, and active
 accounts can be scheduled for refresh when a transport is injected, but they
 are not provisioned by an HTTP route. Concrete source-sync acquisition/runtime composition is executable

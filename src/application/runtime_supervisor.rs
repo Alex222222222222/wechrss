@@ -8,8 +8,7 @@
 //! Authenticated source work is constructed only when a pre-authenticated
 //! browser profile and account identity are configured. Non-interactive
 //! credential refresh can additionally be wired with a deployment-specific
-//! transport; QR login and administrative routes remain intentionally
-//! deferred.
+//! transport; QR login remains intentionally deferred.
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration as StdDuration};
 
@@ -46,10 +45,11 @@ use crate::{
             job_repository::PostgresJobRepository,
             scheduler_repository::PostgresSchedulerRepository,
             source_repository::PostgresSourceRepository,
+            sync_run_repository::PostgresSyncRunRepository,
         },
         unit_of_work::UnitOfWorkFactory,
     },
-    web::api::feed_router,
+    web::{admin::admin_router, api::feed_router, auth::AdminAuthenticator},
 };
 
 use super::{
@@ -64,6 +64,7 @@ use super::{
     job_service::JobService,
     runtime::{RuntimeComponent, RuntimePlan, RuntimePlanError},
     scheduler::{CredentialRefreshScheduleConfig, Scheduler, SchedulerConfigError},
+    source_service::SourceService,
     source_sync_acquirer::{
         BrowserSourceSyncAcquirer, BrowserSourceSyncAcquirerConfig,
         BrowserSourceSyncAcquirerConfigError, BrowserSourceSyncAcquirerDependencies,
@@ -250,12 +251,6 @@ impl RuntimeSupervisor {
         if plan.component(AppRole::Scheduler).is_some() && !config.weread_source_sync_configured() {
             return Err(RuntimeSupervisorError::SourceSyncNotConfigured);
         }
-        if matches!(
-            plan.component(AppRole::Api),
-            Some(RuntimeComponent::Api(api)) if api.admin_enabled()
-        ) {
-            return Err(RuntimeSupervisorError::AdminRoutesNotImplemented);
-        }
         if plan.component(AppRole::Worker).is_some() && config.rss_feed_url.is_none() {
             return Err(RuntimeSupervisorError::FeedUrlNotConfigured);
         }
@@ -303,10 +298,13 @@ impl RuntimeSupervisor {
                     let router = self.build_api_router()?;
                     let role_shutdown = role_shutdown_rx.clone();
                     tasks.spawn(async move {
-                        axum::serve(listener, router)
-                            .with_graceful_shutdown(wait_for_shutdown(role_shutdown))
-                            .await
-                            .map_err(RuntimeSupervisorError::HttpServe)
+                        axum::serve(
+                            listener,
+                            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                        )
+                        .with_graceful_shutdown(wait_for_shutdown(role_shutdown))
+                        .await
+                        .map_err(RuntimeSupervisorError::HttpServe)
                     });
                 }
                 RuntimeComponent::Scheduler(scheduler) => {
@@ -420,12 +418,39 @@ impl RuntimeSupervisor {
             queue,
             feed_config,
         );
-        Ok(feed_router(
+        let mut router = feed_router(
             FeedTokenService::new(PostgresFeedTokenRepository::new(self.pool.clone())),
             feed_service,
             self.pool.clone(),
             self.config.timezone,
-        ))
+        );
+        if self.config.admin_enabled {
+            let auth = AdminAuthenticator::new(
+                self.config
+                    .admin_username
+                    .clone()
+                    .ok_or(RuntimeSupervisorError::AdminAuthConfig)?,
+                self.config
+                    .admin_password
+                    .clone()
+                    .ok_or(RuntimeSupervisorError::AdminAuthConfig)?,
+                self.config
+                    .session_signing_key
+                    .clone()
+                    .ok_or(RuntimeSupervisorError::AdminAuthConfig)?,
+            )
+            .map_err(RuntimeSupervisorError::AdminAuth)?;
+            router = router.merge(admin_router(
+                auth,
+                SourceService::new(
+                    PostgresSourceRepository::new(self.pool.clone()),
+                    UnitOfWorkFactory::new(self.pool.clone()),
+                ),
+                FeedTokenService::new(PostgresFeedTokenRepository::new(self.pool.clone())),
+                PostgresSyncRunRepository::new(self.pool.clone()),
+            ));
+        }
+        Ok(router)
     }
 
     fn build_worker(
@@ -612,10 +637,20 @@ impl RuntimeSupervisor {
 async fn bind_listener(
     api: &super::runtime::ApiRuntimePlan,
 ) -> Result<TcpListener, RuntimeSupervisorError> {
-    let address = format!("{}:{}", api.bind(), api.port());
+    let address = listener_address(api.bind(), api.port());
     TcpListener::bind(&address)
         .await
         .map_err(|error| RuntimeSupervisorError::HttpBind { address, error })
+}
+
+fn listener_address(bind: &str, port: u16) -> String {
+    // A raw IPv6 address needs brackets before a port is appended. Preserve
+    // bracketed values so operators may also provide the conventional form.
+    if bind.contains(':') && !bind.starts_with('[') {
+        format!("[{bind}]:{port}")
+    } else {
+        format!("{bind}:{port}")
+    }
 }
 
 fn browser_pool_for_plan(
@@ -661,10 +696,12 @@ pub enum RuntimeSupervisorError {
     /// Role configuration was invalid.
     #[error(transparent)]
     Plan(#[from] RuntimePlanError),
-    /// Administrative handlers are not yet complete, so startup must fail
-    /// rather than silently ignoring an enabled setting.
-    #[error("ADMIN_ENABLED is not supported until administrative routes are implemented")]
-    AdminRoutesNotImplemented,
+    /// Enabled administration was missing one of the validated credentials.
+    #[error("administrative authentication configuration is incomplete")]
+    AdminAuthConfig,
+    /// Administrative authentication could not be constructed.
+    #[error(transparent)]
+    AdminAuth(#[from] crate::web::auth::AuthConfigError),
     /// Scheduler and source-sync workers require authenticated acquisition
     /// settings so queued source work is executable.
     #[error("authenticated WeRead source-sync settings are required for the scheduler role")]
@@ -879,6 +916,17 @@ mod tests {
         assert!(supervisor.plan().component(AppRole::Worker).is_none());
     }
 
+    #[test]
+    fn listener_address_brackets_raw_ipv6_binds() {
+        assert_eq!(listener_address("::1", 18_080), "[::1]:18080");
+    }
+
+    #[test]
+    fn listener_address_preserves_bracketed_ipv6_and_hostnames() {
+        assert_eq!(listener_address("[::1]", 18_081), "[::1]:18081");
+        assert_eq!(listener_address("localhost", 18_082), "localhost:18082");
+    }
+
     #[tokio::test]
     async fn non_worker_roles_do_not_require_browser_capacity() {
         let mut config = config("api");
@@ -959,13 +1007,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enabling_unimplemented_administration_fails_closed() {
+    async fn enabled_administration_requires_credentials_when_router_is_built() {
         let mut config = config("api");
         config.admin_enabled = true;
 
+        let supervisor = RuntimeSupervisor::new(config, lazy_pool()).unwrap();
         assert!(matches!(
-            RuntimeSupervisor::new(config, lazy_pool()),
-            Err(RuntimeSupervisorError::AdminRoutesNotImplemented)
+            supervisor.api_router(),
+            Err(RuntimeSupervisorError::AdminAuthConfig)
         ));
     }
 

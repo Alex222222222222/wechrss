@@ -16,6 +16,7 @@
 //! degraded. Administrative routes are registered only when complete
 //! authentication/session configuration is explicitly enabled.
 
+pub mod admin;
 pub mod api;
 pub mod auth;
 pub mod ui;
