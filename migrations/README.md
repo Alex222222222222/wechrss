@@ -1,9 +1,10 @@
 # Migration design notes
 
 Applied SQLx migrations are immutable after publication because SQLx records
-their checksums. This project has not published a release yet, so `0001_jobs.sql`
-is kept as the complete initial coordination schema rather than introducing a
-temporary rolling-upgrade migration.
+their checksums. The initial coordination schema is `0001_jobs.sql`; encrypted
+WeRead account persistence is added by the forward `0002_weread_accounts.sql`
+migration. This project has not published a release yet, so either file may
+still be revised before the first release if its contract changes.
 
 The initial schema provides:
 
@@ -15,8 +16,10 @@ The initial schema provides:
   reservations, and feed revision used to fence feed publication and
   atomically enqueue due work;
 - an optional stable `account_id` relationship for authenticated list
-  acquisition; the credential/account table and foreign key are deferred until
-  that repository contract is implemented;
+  acquisition;
+- encrypted WeRead account credential metadata and optimistic credential
+  versions in `weread_accounts`; raw access and refresh tokens are never
+  stored in this table;
 - revision-aware `feed_cache` rows with a source foreign key;
 - hash-only `feed_tokens` rows with one rotatable/revocable public capability
   per source;
@@ -36,7 +39,7 @@ Later forward migrations are added only as their executable repository contract
 is implemented. They may:
 
 - add later source lifecycle fields;
-- add credential and archive tables; and
+- add later credential/login fields or archive tables; and
 - extend the feed-cache rows only if the final RSS contract needs fields beyond
   the current XML/ETag/revision payload.
 

@@ -4,8 +4,9 @@ This document describes the planned Rust implementation of the existing
 `wechrss-main` Python service. The current Rust tree remains intentionally
 incremental: it defines boundaries and ownership, with the domain/configuration
 policies and the first PostgreSQL job/cache-persistence slices implemented
-while login/credential refresh, administrative HTTP behavior, and health
-diagnostics remain unimplemented.
+while interactive login, administrative HTTP behavior, and health diagnostics
+remain unimplemented. Encrypted credential persistence and non-interactive
+refresh are implemented as an application service.
 The pure RSS renderer, normalized article persistence, cache-first feed
 delivery decision service, archive sanitizer, unauthenticated public article
 browser path, and database-only feed rebuild orchestration are executable.
@@ -46,11 +47,11 @@ The current and target contracts must not be confused:
 
 | Area | Executable now | Target contract and implementation gate |
 | --- | --- | --- |
-| Runtime | `RuntimeSupervisor` consumes the validated `RuntimePlan`, opens the shared PostgreSQL pool, applies SQLx migrations, binds the selected API, and supervises scheduler, feed-rebuild, and configuration-gated authenticated source-sync loops with graceful shutdown | Login/credential refresh, administrative routes, browser health, and readiness diagnostics remain future work |
-| Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, type-aware feed-rebuild/source-sync dispatch, and shutdown-aware heartbeat/outcome execution | Article-backfill and credential-refresh dispatch, plus removal of compatibility `now` parameters, remain future work |
+| Runtime | `RuntimeSupervisor` consumes the validated `RuntimePlan`, opens the shared PostgreSQL pool, applies SQLx migrations, binds the selected API, and supervises scheduler, feed-rebuild, and configuration-gated authenticated source-sync loops with graceful shutdown; an injected refresh transport also enables account-expiry scheduling | QR/login exchange, administrative routes, browser health, and readiness diagnostics remain future work |
+| Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, type-aware feed-rebuild/source-sync dispatch, lease-fenced credential-refresh dispatch when a transport is injected, and shutdown-aware heartbeat/outcome execution | Article-backfill dispatch, plus removal of compatibility `now` parameters, remain future work |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, public RSS URL, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint; the supervisor consumes the parsed role and policy values | Complete administrative configuration still needs an executable application boundary |
-| Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
-| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, authenticated WeRead article-list transport through a pre-authenticated profile and account lease, source-sync finalization through an injected acquisition port, feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, and public tokenized feed route | Login/QR exchange, credential refresh, source-sync/application HTTP handlers, administrative routes, and health/readiness wiring remain future work |
+| Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, feed-build leases, and encrypted WeRead account credential records with optimistic versions | QR-login state and remaining transaction-scoped views are design-only |
+| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, authenticated WeRead article-list transport through a pre-authenticated profile and account lease, source-sync finalization through an injected acquisition port, feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, and public tokenized feed route | Login/QR exchange, source-sync/application HTTP handlers, administrative routes, and health/readiness wiring remain future work |
 | Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, and external-image reporting through ArchiveService | Asset persistence and URL rewriting remain future work |
 
 Environment variables in this document are parsed into `AppConfig`, and
@@ -856,8 +857,9 @@ adapter. `WEREAD_ARTICLE_LIST_URL` defaults to
 HTTPS endpoint without credentials, fragments, or a non-default port. Runtime
 source-sync listing holds the account lease through its authenticated request,
 applies the shared request pacing policy, then releases it before public article
-fetching. Login, QR exchange, and credential refresh are intentionally not
-implemented in this first executable slice.
+fetching. QR exchange and interactive login are intentionally not implemented
+in this first executable slice; provisioned credentials can be refreshed by
+the authentication application service.
 
 ### Reference: `we-mp-rss` browser anti-detection approach
 
@@ -1108,14 +1110,20 @@ the configured quiet-hours policy to the atomic source-scheduling operation.
 That repository samples PostgreSQL time and applies the policy inside its
 transaction. `Scheduler::run_until_shutdown` owns polling, shutdown, and
 transient-error backoff around this boundary; runtime composition still owns
-role selection and metrics. It must call this boundary rather than reimplement
-source selection. `RuntimeSupervisor` composes the scheduler only when the
-authenticated source-sync adapter is configured, and dispatches feed-rebuild
-and source-sync jobs through one type-aware worker handler.
+role selection and metrics. When a refresh transport is injected, each pass
+also selects active accounts nearing expiry and inserts a deduplicated
+`credential_refresh` job; this maintenance pass is not suppressed by source
+quiet hours. It must call this boundary rather than reimplement source or
+account selection. `RuntimeSupervisor` composes the scheduler only when the
+authenticated source-sync adapter is configured, and dispatches feed-rebuild,
+source-sync, and transport-backed credential-refresh jobs through one
+type-aware worker handler.
 
 The remaining tree intentionally contains no administrative route handlers,
-source HTTP orchestration, login/credential persistence, or credential
-refresh. Concrete source-sync acquisition/runtime composition is executable
+source HTTP orchestration, or interactive login/credential exchange. Durable
+credential persistence and non-interactive refresh are executable, and active
+accounts can be scheduled for refresh when a transport is injected, but they
+are not provisioned by an HTTP route. Concrete source-sync acquisition/runtime composition is executable
 from a pre-authenticated browser profile. Binary asset
 persistence, and URL rewriting remain documentation-only; the pure
 archive sanitizer and `ArchiveService` are executable. Acquisition now
@@ -1134,14 +1142,18 @@ including the shared `UnitOfWorkFactory` outcome path. `Worker::run_until_shutdo
 adds bounded idle polling, transient-error
 backoff, and graceful shutdown between passes. Article and sync-run persistence
 and `FeedService` implement the database/cache boundaries described above.
+`AuthService` implements encrypted credential provisioning and
+lease-serialized, optimistic-version refresh checks; `CredentialRepository`
+stores ciphertext only, and refresh failures leave the prior version intact.
+Interactive QR/login exchange remains intentionally deferred.
 `SyncService` implements the pure acquisition-result merge, archive
 normalization, and typed failure classification used by the executable
 source-sync handler in `src/application/source_sync_handler.rs` and its
 browser-backed runtime acquirer. That handler allocates observation
 versions before public-page acquisition and commits article upserts, source
 scheduling/gates, sync-run completion, optional feed-rebuild enqueueing, and
-fenced job outcomes through one `UnitOfWork`. Login/refresh and credential
-persistence remain future work. A valid public
+fenced job outcomes through one `UnitOfWork`. Login/QR exchange remains future
+work. A valid public
 page may omit its publication timestamp;
 the service prefers the page value, then the authenticated list value, and
 rejects the observation only when both are absent. Malformed WeRead article

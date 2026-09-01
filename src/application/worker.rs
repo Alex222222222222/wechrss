@@ -133,6 +133,10 @@ impl WorkerConfig {
         &self.allowed_job_types
     }
 
+    pub(crate) fn allowed_job_types_mut(&mut self) -> &mut Vec<JobType> {
+        &mut self.allowed_job_types
+    }
+
     /// Returns the interval between lease heartbeats.
     pub const fn heartbeat_every(&self) -> StdDuration {
         self.heartbeat_every

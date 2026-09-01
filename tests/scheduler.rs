@@ -82,6 +82,7 @@ async fn scheduler_loop_dispatches_multiple_passes_before_shutdown() {
         SchedulerLoopStats {
             passes: 2,
             enqueued_sources: 0,
+            enqueued_credential_refreshes: 0,
             quiet_passes: 0,
             errors: 0,
         }
@@ -109,6 +110,7 @@ async fn scheduler_loop_counts_an_error_before_shutdown() {
         SchedulerLoopStats {
             passes: 1,
             enqueued_sources: 0,
+            enqueued_credential_refreshes: 0,
             quiet_passes: 0,
             errors: 1,
         }

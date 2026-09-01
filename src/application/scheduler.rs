@@ -4,7 +4,8 @@
 //! [`SchedulerRepository`] operation. A scheduler replica passes its quiet-hours
 //! policy to the repository, which samples the PostgreSQL clock and evaluates
 //! that policy before locking, filtering, enqueueing, and reserving one bounded
-//! batch. It does not read source rows first, insert jobs separately, or run
+//! batch. When configured, the same pass also schedules due credential-refresh
+//! jobs. It does not read source rows first, insert jobs separately, or run
 //! synchronization itself.
 //!
 //! [`Scheduler::run_until_shutdown`] supplies the Tokio polling boundary around
@@ -16,7 +17,8 @@
 //! configured IANA timezone inside the scheduling transaction. A quiet pass
 //! performs no source writes; a pass at the exclusive end boundary proceeds.
 //! The repository remains responsible for due-time selection, active-job
-//! deduplication, source gates, and reservation persistence.
+//! deduplication, source gates, account expiry selection, and reservation
+//! persistence.
 //!
 //! High availability: every replica may invoke `run_once` concurrently. The
 //! scheduler has no process-local coordination state, so disjoint source
@@ -27,7 +29,7 @@
 //!
 //! Non-responsibilities: worker claims, browser work, RSS rendering, and HTTP
 //! responses. Feed-cache maintenance jobs may use the same queue independently
-//! because this wrapper only schedules source-sync work.
+//! because this wrapper schedules durable queue work but never executes it.
 
 use std::time::Duration as StdDuration;
 
@@ -38,7 +40,8 @@ use tokio::time;
 use crate::{
     domain::pacing::QuietHours,
     persistence::repositories::scheduler_repository::{
-        EnqueuedSource, SchedulerPass, SchedulerRepository, SchedulerRepositoryError,
+        EnqueuedCredentialRefresh, EnqueuedSource, SchedulerPass, SchedulerRepository,
+        SchedulerRepositoryError,
     },
 };
 
@@ -101,6 +104,45 @@ pub enum SchedulerConfigError {
     /// Reservations must be representable as a positive millisecond interval.
     #[error("scheduler reservation must be a positive whole number of milliseconds")]
     InvalidReservation,
+    /// The credential refresh window cannot be negative.
+    #[error("credential refresh window must not be negative")]
+    InvalidCredentialRefreshWindow,
+    /// Credential refresh jobs need at least one allowed attempt.
+    #[error("credential refresh max attempts must be positive")]
+    InvalidCredentialRefreshAttempts,
+}
+
+/// Settings for scheduling non-interactive credential refresh work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialRefreshScheduleConfig {
+    refresh_before: Duration,
+    max_attempts: u32,
+}
+
+impl CredentialRefreshScheduleConfig {
+    /// Creates a bounded credential-refresh scheduling policy.
+    pub fn new(refresh_before: Duration, max_attempts: u32) -> Result<Self, SchedulerConfigError> {
+        if refresh_before < Duration::zero() {
+            return Err(SchedulerConfigError::InvalidCredentialRefreshWindow);
+        }
+        if max_attempts == 0 {
+            return Err(SchedulerConfigError::InvalidCredentialRefreshAttempts);
+        }
+        Ok(Self {
+            refresh_before,
+            max_attempts,
+        })
+    }
+
+    /// Returns the window before expiry in which a refresh job is created.
+    pub const fn refresh_before(self) -> Duration {
+        self.refresh_before
+    }
+
+    /// Returns the retry budget assigned to refresh jobs.
+    pub const fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
 }
 
 /// Validated polling policy for the shutdown-aware scheduler loop.
@@ -157,6 +199,8 @@ pub struct SchedulerLoopStats {
     pub passes: u64,
     /// Number of source-sync jobs inserted across all passes.
     pub enqueued_sources: usize,
+    /// Number of credential-refresh jobs inserted across all passes.
+    pub enqueued_credential_refreshes: usize,
     /// Number of passes skipped because quiet hours were active.
     pub quiet_passes: u64,
     /// Number of repository failures retried by the loop.
@@ -166,12 +210,17 @@ pub struct SchedulerLoopStats {
 /// Result of one scheduler pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchedulerRun {
-    /// No upstream source work was enqueued because quiet hours are active.
-    SkippedQuietHours,
+    /// No source work was enqueued because quiet hours are active.
+    SkippedQuietHours {
+        /// Credential-refresh jobs inserted before the quiet-hours decision.
+        credential_refreshes: Vec<EnqueuedCredentialRefresh>,
+    },
     /// The repository completed its atomic enqueue/reservation operation.
     Enqueued {
         /// Sources whose source-sync jobs were inserted.
         sources: Vec<EnqueuedSource>,
+        /// Credential-refresh jobs inserted for accounts nearing expiry.
+        credential_refreshes: Vec<EnqueuedCredentialRefresh>,
     },
 }
 
@@ -188,6 +237,7 @@ pub struct Scheduler<R> {
     repository: R,
     config: SchedulerConfig,
     quiet_hours: Option<QuietHours>,
+    credential_refresh: Option<CredentialRefreshScheduleConfig>,
 }
 
 impl<R> Scheduler<R> {
@@ -197,7 +247,14 @@ impl<R> Scheduler<R> {
             repository,
             config,
             quiet_hours,
+            credential_refresh: None,
         }
+    }
+
+    /// Enables account credential-refresh scheduling for this scheduler.
+    pub fn with_credential_refresh(mut self, config: CredentialRefreshScheduleConfig) -> Self {
+        self.credential_refresh = Some(config);
+        self
     }
 
     /// Returns the settings used by this scheduler.
@@ -212,6 +269,18 @@ where
 {
     /// Runs one bounded scheduling pass.
     pub async fn run_once(&self) -> Result<SchedulerRun, SchedulerError> {
+        let credential_refreshes = match self.credential_refresh {
+            Some(config) => {
+                self.repository
+                    .enqueue_due_credential_refreshes(
+                        self.config.batch_limit,
+                        config.refresh_before,
+                        config.max_attempts,
+                    )
+                    .await?
+            }
+            None => Vec::new(),
+        };
         let result = self
             .repository
             .enqueue_due_sources(
@@ -221,8 +290,13 @@ where
             )
             .await?;
         match result {
-            SchedulerPass::SkippedQuietHours => Ok(SchedulerRun::SkippedQuietHours),
-            SchedulerPass::Enqueued(sources) => Ok(SchedulerRun::Enqueued { sources }),
+            SchedulerPass::SkippedQuietHours => Ok(SchedulerRun::SkippedQuietHours {
+                credential_refreshes,
+            }),
+            SchedulerPass::Enqueued(sources) => Ok(SchedulerRun::Enqueued {
+                sources,
+                credential_refreshes,
+            }),
         }
     }
 
@@ -246,12 +320,23 @@ where
 
             stats.passes += 1;
             let wait = match self.run_once().await {
-                Ok(SchedulerRun::SkippedQuietHours) => {
+                Ok(SchedulerRun::SkippedQuietHours {
+                    credential_refreshes,
+                }) => {
                     stats.quiet_passes += 1;
+                    stats.enqueued_credential_refreshes = stats
+                        .enqueued_credential_refreshes
+                        .saturating_add(credential_refreshes.len());
                     loop_config.poll_interval()
                 }
-                Ok(SchedulerRun::Enqueued { sources }) => {
+                Ok(SchedulerRun::Enqueued {
+                    sources,
+                    credential_refreshes,
+                }) => {
                     stats.enqueued_sources = stats.enqueued_sources.saturating_add(sources.len());
+                    stats.enqueued_credential_refreshes = stats
+                        .enqueued_credential_refreshes
+                        .saturating_add(credential_refreshes.len());
                     loop_config.poll_interval()
                 }
                 Err(error) => {
@@ -283,10 +368,12 @@ mod tests {
     use super::*;
 
     type RepositoryCall = (usize, Duration, Option<QuietHours>);
+    type RefreshRepositoryCall = (usize, Duration, u32);
 
     #[derive(Clone)]
     struct RecordingRepository {
         calls: Arc<Mutex<Vec<RepositoryCall>>>,
+        refresh_calls: Arc<Mutex<Vec<RefreshRepositoryCall>>>,
         database_now: DateTime<Utc>,
         fail: bool,
     }
@@ -295,6 +382,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 calls: Arc::default(),
+                refresh_calls: Arc::default(),
                 database_now: at("2026-08-28T12:00:00Z"),
                 fail: false,
             }
@@ -304,6 +392,10 @@ mod tests {
     impl RecordingRepository {
         async fn calls(&self) -> Vec<RepositoryCall> {
             self.calls.lock().await.clone()
+        }
+
+        async fn refresh_calls(&self) -> Vec<RefreshRepositoryCall> {
+            self.refresh_calls.lock().await.clone()
         }
     }
 
@@ -326,6 +418,22 @@ mod tests {
             } else {
                 Ok(SchedulerPass::Enqueued(Vec::new()))
             }
+        }
+
+        async fn enqueue_due_credential_refreshes(
+            &self,
+            limit: usize,
+            refresh_before: Duration,
+            max_attempts: u32,
+        ) -> Result<Vec<EnqueuedCredentialRefresh>, SchedulerRepositoryError> {
+            self.refresh_calls
+                .lock()
+                .await
+                .push((limit, refresh_before, max_attempts));
+            Ok(vec![EnqueuedCredentialRefresh::new(
+                crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(1)),
+                uuid::Uuid::from_u128(2),
+            )])
         }
     }
 
@@ -360,6 +468,14 @@ mod tests {
             SchedulerConfig::new(1, Duration::zero()),
             Err(SchedulerConfigError::InvalidReservation)
         ));
+        assert!(matches!(
+            CredentialRefreshScheduleConfig::new(Duration::seconds(-1), 3),
+            Err(SchedulerConfigError::InvalidCredentialRefreshWindow)
+        ));
+        assert!(matches!(
+            CredentialRefreshScheduleConfig::new(Duration::minutes(5), 0),
+            Err(SchedulerConfigError::InvalidCredentialRefreshAttempts)
+        ));
     }
 
     #[test]
@@ -386,10 +502,11 @@ mod tests {
             Some(quiet_hours()),
         );
 
-        assert_eq!(
+        assert!(matches!(
             scheduler.run_once().await.unwrap(),
-            SchedulerRun::SkippedQuietHours
-        );
+            SchedulerRun::SkippedQuietHours { credential_refreshes }
+                if credential_refreshes.is_empty()
+        ));
         assert_eq!(
             repository.calls().await,
             vec![(100, Duration::minutes(1), Some(quiet_hours()))]
@@ -404,7 +521,10 @@ mod tests {
 
         assert!(matches!(
             scheduler.run_once().await.unwrap(),
-            SchedulerRun::Enqueued { sources } if sources.is_empty()
+            SchedulerRun::Enqueued {
+                sources,
+                credential_refreshes,
+            } if sources.is_empty() && credential_refreshes.is_empty()
         ));
         assert_eq!(
             repository.calls().await,
@@ -418,7 +538,10 @@ mod tests {
         let scheduler = Scheduler::new(repository.clone(), SchedulerConfig::default(), None);
         assert!(matches!(
             scheduler.run_once().await.unwrap(),
-            SchedulerRun::Enqueued { sources } if sources.is_empty()
+            SchedulerRun::Enqueued {
+                sources,
+                credential_refreshes,
+            } if sources.is_empty() && credential_refreshes.is_empty()
         ));
         assert_eq!(repository.calls().await.len(), 1);
 
@@ -435,6 +558,33 @@ mod tests {
             ))
         ));
         assert_eq!(failing_repository.calls().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forwards_credential_refresh_schedule_and_reports_inserted_jobs() {
+        let repository = RecordingRepository::default();
+        let scheduler = Scheduler::new(repository.clone(), SchedulerConfig::default(), None)
+            .with_credential_refresh(
+                CredentialRefreshScheduleConfig::new(Duration::minutes(5), 4)
+                    .expect("refresh configuration should be valid"),
+            );
+
+        let SchedulerRun::Enqueued {
+            sources,
+            credential_refreshes,
+        } = scheduler
+            .run_once()
+            .await
+            .expect("scheduler should succeed")
+        else {
+            panic!("scheduler should not be quiet in this test");
+        };
+        assert!(sources.is_empty());
+        assert_eq!(credential_refreshes.len(), 1);
+        assert_eq!(
+            repository.refresh_calls().await,
+            vec![(100, Duration::minutes(5), 4)]
+        );
     }
 
     #[test]

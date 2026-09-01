@@ -4,6 +4,7 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 use wechrss::{
+    domain::credentials::WeReadAccountId,
     domain::pacing::QuietHours,
     domain::source::{SchedulingGate, SourceId},
     persistence::repositories::scheduler_repository::{
@@ -237,6 +238,63 @@ async fn postgres_scheduler_rolls_back_prior_inserts_when_a_source_is_invalid(po
     assert_eq!(reservation_count, 0);
 }
 
+#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+async fn postgres_scheduler_enqueues_due_credential_refreshes_and_deduplicates(pool: PgPool) {
+    let due = WeReadAccountId::from_uuid(Uuid::new_v4());
+    let disabled = WeReadAccountId::from_uuid(Uuid::new_v4());
+    let future = WeReadAccountId::from_uuid(Uuid::new_v4());
+    insert_account(&pool, due, "clock_timestamp() + interval '1 minute'", false).await;
+    insert_account(
+        &pool,
+        disabled,
+        "clock_timestamp() - interval '1 minute'",
+        true,
+    )
+    .await;
+    insert_account(
+        &pool,
+        future,
+        "clock_timestamp() + interval '1 hour'",
+        false,
+    )
+    .await;
+
+    let repository = PostgresSchedulerRepository::new(pool.clone());
+    let scheduled = repository
+        .enqueue_due_credential_refreshes(10, Duration::minutes(5), 4)
+        .await
+        .expect("credential refresh scheduling should succeed");
+    assert_eq!(scheduled.len(), 1);
+    assert_eq!(scheduled[0].account_id(), due);
+    assert_ne!(scheduled[0].job_id(), Uuid::nil());
+
+    let job: (String, Option<Uuid>, i64, serde_json::Value) = sqlx::query_as(
+        "SELECT job_type, source_id, max_attempts, payload_json FROM jobs WHERE id = $1",
+    )
+    .bind(scheduled[0].job_id())
+    .fetch_one(&pool)
+    .await
+    .expect("refresh job should be queryable");
+    assert_eq!(job.0, "credential_refresh");
+    assert_eq!(job.1, None);
+    assert_eq!(job.2, 4);
+    assert_eq!(job.3["account_id"], due.as_uuid().to_string());
+
+    assert!(repository
+        .enqueue_due_credential_refreshes(10, Duration::minutes(5), 4)
+        .await
+        .expect("repeated credential scheduling should succeed")
+        .is_empty());
+    let active_job_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE dedupe_key = $1 AND status IN ('queued', 'running', 'retry_wait', 'deferred')",
+    )
+    .bind(format!("credential_refresh:{due}"))
+    .fetch_one(&pool)
+    .await
+    .expect("active refresh job count should be queryable");
+    assert_eq!(active_job_count, 1);
+}
+
 async fn insert_source(
     pool: &PgPool,
     enabled: bool,
@@ -258,6 +316,25 @@ async fn insert_source(
     .await
     .expect("test source should be insertable");
     source_id
+}
+
+async fn insert_account(
+    pool: &PgPool,
+    account_id: WeReadAccountId,
+    expires_at: &str,
+    disabled: bool,
+) {
+    let query = format!(
+        "INSERT INTO weread_accounts (account_id, display_name, credentials_ciphertext, access_expires_at, disabled) VALUES ($1, $2, $3, {expires_at}, $4)"
+    );
+    sqlx::query(&query)
+        .bind(account_id.as_uuid())
+        .bind(format!("account-{account_id}"))
+        .bind(b"encrypted-placeholder".as_slice())
+        .bind(disabled)
+        .execute(pool)
+        .await
+        .expect("test account should be insertable");
 }
 
 async fn set_source_time_state(pool: &PgPool, source_id: SourceId, column: &str, state: &str) {

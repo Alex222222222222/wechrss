@@ -27,8 +27,9 @@
 //! source history reads are implemented in
 //! [`repositories::sync_run_repository`]. Hash-only public feed-token storage
 //! and active-source resolution are implemented in
-//! [`repositories::feed_token_repository`]. Credential and archive repository
-//! SQL remain future work.
+//! [`repositories::feed_token_repository`]. Encrypted WeRead account
+//! credentials are stored by [`repositories::credential_repository`]; QR/login
+//! exchange remains outside this persistence boundary.
 //! The job repository exports separate `JobQueue`, `JobEnqueueTransaction`,
 //! `JobOutcomeTransaction`, and `ExpiredJobRecovery` ports;
 //! `UnitOfWork::job_enqueue` and `UnitOfWork::job_outcomes` are the narrow

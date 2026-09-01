@@ -20,7 +20,8 @@
 //! rejects unsupported or unsafe values before they reach persistence. The
 //! concrete browser adapter below keeps the authenticated WebDriver capability
 //! private and parses only the response body needed by source synchronization.
-//! QR exchange and credential refresh remain future work.
+//! QR exchange remains outside this protocol adapter; credential refresh is
+//! handled by the application authentication lifecycle.
 
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};

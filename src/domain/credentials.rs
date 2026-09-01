@@ -20,9 +20,156 @@
 
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use uuid::Uuid;
+
+/// Errors raised while constructing refreshable WeRead credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CredentialError {
+    /// A token must contain non-whitespace data.
+    #[error("credential token must not be empty")]
+    EmptyToken,
+    /// Access credentials must expire after they are issued.
+    #[error("access credential expiry must be in the future")]
+    ExpiryNotAfterIssue,
+}
+
+/// The secret material needed for authenticated WeRead requests.
+///
+/// The values are intentionally not serializable or printable. Persistence
+/// must encrypt this value before it reaches PostgreSQL; callers should only
+/// borrow the secrets for the duration of one authenticated request.
+#[derive(Clone)]
+pub struct WeReadCredentials {
+    access_token: SecretString,
+    refresh_token: SecretString,
+    access_expires_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for WeReadCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WeReadCredentials")
+            .field("access_token", &"<secret>")
+            .field("refresh_token", &"<secret>")
+            .field("access_expires_at", &self.access_expires_at)
+            .finish()
+    }
+}
+
+impl WeReadCredentials {
+    /// Creates credentials and validates their non-secret lifecycle metadata.
+    pub fn new(
+        access_token: impl Into<String>,
+        refresh_token: impl Into<String>,
+        access_expires_at: DateTime<Utc>,
+        issued_at: DateTime<Utc>,
+    ) -> Result<Self, CredentialError> {
+        let access_token = access_token.into();
+        let refresh_token = refresh_token.into();
+        if access_token.trim().is_empty() || refresh_token.trim().is_empty() {
+            return Err(CredentialError::EmptyToken);
+        }
+        if access_expires_at <= issued_at {
+            return Err(CredentialError::ExpiryNotAfterIssue);
+        }
+        Ok(Self {
+            access_token: SecretString::new(access_token.into_boxed_str()),
+            refresh_token: SecretString::new(refresh_token.into_boxed_str()),
+            access_expires_at,
+        })
+    }
+
+    /// Returns the access token only to the authenticated transport boundary.
+    pub fn access_token(&self) -> &str {
+        self.access_token.expose_secret()
+    }
+
+    /// Returns the refresh token only to the refresh transport boundary.
+    pub fn refresh_token(&self) -> &str {
+        self.refresh_token.expose_secret()
+    }
+
+    /// Returns the access-token expiry without exposing secret material.
+    pub const fn access_expires_at(&self) -> DateTime<Utc> {
+        self.access_expires_at
+    }
+
+    /// Reports whether refresh should happen before an authenticated request.
+    pub fn needs_refresh(&self, now: DateTime<Utc>, refresh_before: Duration) -> bool {
+        now.checked_add_signed(refresh_before)
+            .is_none_or(|deadline| self.access_expires_at <= deadline)
+    }
+
+    /// Replaces tokens after a successful refresh response.
+    pub fn refreshed(
+        &self,
+        access_token: impl Into<String>,
+        refresh_token: Option<String>,
+        access_expires_at: DateTime<Utc>,
+        issued_at: DateTime<Utc>,
+    ) -> Result<Self, CredentialError> {
+        Self::new(
+            access_token,
+            refresh_token.unwrap_or_else(|| self.refresh_token().to_owned()),
+            access_expires_at,
+            issued_at,
+        )
+    }
+}
+
+/// Non-secret account state returned by authentication status operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeReadAccount {
+    account_id: WeReadAccountId,
+    display_name: String,
+    credential_version: i64,
+    access_expires_at: DateTime<Utc>,
+    disabled: bool,
+}
+
+impl WeReadAccount {
+    /// Reconstructs account metadata returned by a trusted repository.
+    pub(crate) fn from_parts(
+        account_id: WeReadAccountId,
+        display_name: String,
+        credential_version: i64,
+        access_expires_at: DateTime<Utc>,
+        disabled: bool,
+    ) -> Self {
+        Self {
+            account_id,
+            display_name,
+            credential_version,
+            access_expires_at,
+            disabled,
+        }
+    }
+
+    /// Returns the stable account identity.
+    pub const fn account_id(&self) -> WeReadAccountId {
+        self.account_id
+    }
+    /// Returns the operator-facing label.
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+    /// Returns the optimistic credential revision.
+    pub const fn credential_version(&self) -> i64 {
+        self.credential_version
+    }
+    /// Returns the access-token expiry.
+    pub const fn access_expires_at(&self) -> DateTime<Utc> {
+        self.access_expires_at
+    }
+    /// Reports whether this account is disabled.
+    pub const fn disabled(&self) -> bool {
+        self.disabled
+    }
+}
 
 /// Stable identity of one configured WeRead account.
 ///

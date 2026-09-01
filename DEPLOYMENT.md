@@ -2,10 +2,13 @@
 
 > **Implementation status:** the Rust binary now loads environment-only
 > configuration, applies pending SQLx migrations, and composes the selected API,
-> scheduler, feed-rebuild, and authenticated source-sync worker roles. Source
-> synchronization is enabled only when a pre-authenticated browser profile and
-> a WeRead account ID are configured together. Login/QR exchange, credential
-> refresh, administrative routes, and browser health checks remain unfinished.
+> scheduler, feed-rebuild, and authenticated source-sync worker roles. Encrypted
+> WeRead credential provisioning and lease-serialized non-interactive refresh
+> are available as an application service. A deployment-specific refresh
+> transport can be injected into the runtime worker; QR/login exchange,
+> administrative routes, and browser health checks remain unfinished. Source
+> synchronization still requires a pre-authenticated browser profile and
+> WeRead account ID.
 
 When browser-backed source synchronization is enabled, its worker and browser
 sidecar must use the same IANA timezone for quiet-hours decisions and

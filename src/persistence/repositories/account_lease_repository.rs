@@ -281,6 +281,21 @@ impl MemoryAccountLeaseRepository {
     pub async fn set_now(&self, now: DateTime<Utc>) {
         self.state.lock().await.now = now;
     }
+
+    /// Reports whether the supplied owner and fencing token still hold a live
+    /// lease. This read-only helper lets in-memory repositories model the same
+    /// fencing relationship as the PostgreSQL implementation in unit tests.
+    pub async fn is_held(
+        &self,
+        account_id: WeReadAccountId,
+        owner: &str,
+        token: AccountLeaseToken,
+    ) -> bool {
+        let state = self.state.lock().await;
+        state.leases.get(&account_id).is_some_and(|lease| {
+            lease.owner() == owner && lease.token() == token && lease.is_live_at(state.now)
+        })
+    }
 }
 
 #[async_trait::async_trait]

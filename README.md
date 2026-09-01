@@ -31,6 +31,63 @@ with or endorsed by any third-party service it may interact with.
 Review the project documentation and the applicable third-party policies before
 running any component.
 
+## WeRead authentication
+
+Authentication is split into two separate flows. Both flows must use an
+account-specific distributed lease, and neither flow may expose access or
+refresh tokens in logs, API responses, job payloads, or error messages.
+
+### Non-interactive provisioning and refresh
+
+The implemented authentication lifecycle accepts credentials from a trusted
+operator or another approved login adapter through `AuthService::provision`.
+Credentials are encrypted with the configured `CREDENTIAL_ENCRYPTION_KEY`
+before being written to PostgreSQL. The `weread_accounts` table stores only
+encrypted credential material, account metadata, expiry, and an optimistic
+credential version.
+
+`AuthService::refresh_if_needed` samples the repository's authoritative clock,
+checks the configured refresh window, and refreshes only when the access
+credential is near expiry. Refresh is serialized with the existing account
+lease; the lease is heartbeated while the exchange runs, and a lease-fenced,
+version-checked replacement prevents stale writes. A refresh response may
+rotate the refresh token. If it does not, the previous refresh token is
+retained. Authentication-required and risk-control results stop the operation
+and require operator action; they are not retried automatically.
+
+This service boundary is implemented and tested. A deployment-specific
+`CredentialRefresher` can be injected into `RuntimeSupervisor`; that enables
+`credential_refresh` jobs in the worker plan and makes the runtime scheduler
+enqueue one deduplicated refresh job for each active account within the
+refresh window. The project does not prescribe an upstream refresh protocol
+or expose this flow as an administrative HTTP route yet. The current
+browser-backed source-sync runtime still uses a pre-authenticated browser
+profile. See
+[`AuthService`](src/application/auth_service.rs) and the
+[authentication architecture](ARCHITECTURE.md#source-scheduling-and-account-leases).
+
+### QR login
+
+QR login is intentionally not implemented yet and requires user interaction.
+The planned flow is:
+
+1. create a short-lived, single-use login attempt bound to one account;
+2. display the upstream QR image or safe equivalent without logging its value;
+3. poll with a bounded interval and deadline, handling pending, scanned,
+   confirmed, expired, cancelled, and risk-controlled states;
+4. exchange the confirmed result for credentials through a dedicated
+   `CredentialRefresher`/login transport; and
+5. validate the account identity, encrypt the credentials, provision the
+   account, and discard the temporary login state.
+
+The eventual route must require administrator authentication, CSRF protection,
+login rate limiting, single-use attempt expiry, and explicit cancellation.
+QR contents and upstream credentials must never be persisted or returned in
+status responses. Until that boundary exists, operators must not expect a QR
+endpoint or attempt to place login secrets in environment variables or source
+files. Automated tests can cover the state machine and expiry transitions;
+the real QR scan remains an opt-in manual test.
+
 ## Test coverage
 
 Generate coverage locally with `cargo-llvm-cov`. The reports are build

@@ -46,6 +46,33 @@ pub struct EnqueuedSource {
     reserved_until: chrono::DateTime<chrono::Utc>,
 }
 
+/// A credential-refresh job inserted by the scheduler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnqueuedCredentialRefresh {
+    account_id: crate::domain::credentials::WeReadAccountId,
+    job_id: Uuid,
+}
+
+impl EnqueuedCredentialRefresh {
+    /// Creates an enqueue result for an account refresh job.
+    pub const fn new(
+        account_id: crate::domain::credentials::WeReadAccountId,
+        job_id: Uuid,
+    ) -> Self {
+        Self { account_id, job_id }
+    }
+
+    /// Returns the account whose credentials need refreshing.
+    pub const fn account_id(&self) -> crate::domain::credentials::WeReadAccountId {
+        self.account_id
+    }
+
+    /// Returns the durable job identifier.
+    pub const fn job_id(&self) -> Uuid {
+        self.job_id
+    }
+}
+
 /// Outcome of one atomic source-scheduling pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchedulerPass {
@@ -85,6 +112,12 @@ pub enum SchedulerRepositoryError {
     /// A reservation must be representable as a positive millisecond interval.
     #[error("scheduler reservation must be a positive whole number of milliseconds")]
     InvalidReservation,
+    /// A credential refresh window cannot be negative.
+    #[error("credential refresh window must not be negative")]
+    InvalidRefreshWindow,
+    /// A generated credential-refresh job must have a positive retry budget.
+    #[error("credential refresh max attempts must be positive")]
+    InvalidRefreshMaxAttempts,
     /// A persisted source retry limit cannot be represented by the job domain.
     #[error("source {source_id} has invalid max_attempts value {value}")]
     InvalidMaxAttempts {
@@ -111,6 +144,22 @@ pub trait SchedulerRepository: Send + Sync {
         reservation_for: Duration,
         quiet_hours: Option<QuietHours>,
     ) -> Result<SchedulerPass, SchedulerRepositoryError>;
+
+    /// Enqueues due credential-refresh jobs for active accounts.
+    ///
+    /// Implementations must use an active-job deduplication key so concurrent
+    /// scheduler replicas cannot create more than one refresh job per account.
+    /// The default is an empty pass for repositories that do not persist
+    /// account credentials.
+    async fn enqueue_due_credential_refreshes(
+        &self,
+        limit: usize,
+        refresh_before: Duration,
+        max_attempts: u32,
+    ) -> Result<Vec<EnqueuedCredentialRefresh>, SchedulerRepositoryError> {
+        let _ = (limit, refresh_before, max_attempts);
+        Ok(Vec::new())
+    }
 }
 
 /// PostgreSQL implementation of the atomic due-source operation.
@@ -292,6 +341,114 @@ impl SchedulerRepository for PostgresSchedulerRepository {
             .await
             .map_err(SchedulerRepositoryError::Storage)?;
         Ok(SchedulerPass::Enqueued(enqueued))
+    }
+
+    async fn enqueue_due_credential_refreshes(
+        &self,
+        limit: usize,
+        refresh_before: Duration,
+        max_attempts: u32,
+    ) -> Result<Vec<EnqueuedCredentialRefresh>, SchedulerRepositoryError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        if refresh_before < Duration::zero() {
+            return Err(SchedulerRepositoryError::InvalidRefreshWindow);
+        }
+        let limit = i64::try_from(limit)
+            .map_err(|_| SchedulerRepositoryError::InvalidLimit { value: limit })?;
+        if max_attempts == 0 {
+            return Err(SchedulerRepositoryError::InvalidRefreshMaxAttempts);
+        }
+        let max_attempts = i64::from(max_attempts);
+        let refresh_milliseconds = refresh_before.num_milliseconds();
+
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(SchedulerRepositoryError::Storage)?;
+        let db_now: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(SchedulerRepositoryError::Storage)?;
+        let account_rows = sqlx::query(
+            r#"
+            SELECT account_id
+            FROM weread_accounts
+            WHERE NOT disabled
+              AND access_expires_at <= $2
+                  + ($3::double precision * INTERVAL '1 millisecond')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM jobs AS active_job
+                  WHERE active_job.dedupe_key = 'credential_refresh:' || weread_accounts.account_id::text
+                    AND active_job.status IN ('queued', 'running', 'retry_wait', 'deferred')
+              )
+            ORDER BY access_expires_at ASC, account_id ASC
+            LIMIT $1
+            FOR UPDATE OF weread_accounts SKIP LOCKED
+            "#,
+        )
+        .bind(limit)
+        .bind(db_now)
+        .bind(refresh_milliseconds)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(SchedulerRepositoryError::Storage)?;
+
+        let mut enqueued = Vec::with_capacity(account_rows.len());
+        for account_row in account_rows {
+            let account_id = crate::domain::credentials::WeReadAccountId::from_uuid(
+                account_row
+                    .try_get("account_id")
+                    .map_err(SchedulerRepositoryError::Storage)?,
+            );
+            let job_id = Uuid::new_v4();
+            let dedupe_key = format!("credential_refresh:{account_id}");
+            let inserted = sqlx::query(
+                r#"
+                INSERT INTO jobs (
+                    id, job_type, source_id, status, priority, run_after,
+                    claim_count, failure_count, max_attempts, lease_owner,
+                    lease_token, lease_until, heartbeat_at, started_at,
+                    finished_at, last_error, payload_json, dedupe_key,
+                    created_at, updated_at
+                )
+                VALUES (
+                    $1, 'credential_refresh', NULL, 'queued', 0, $2,
+                    0, 0, $3, NULL, NULL, NULL, NULL, NULL,
+                    NULL, NULL, $4, $5, $2, $2
+                )
+                ON CONFLICT (dedupe_key)
+                    WHERE status IN ('queued', 'running', 'retry_wait', 'deferred')
+                DO NOTHING
+                RETURNING id
+                "#,
+            )
+            .bind(job_id)
+            .bind(db_now)
+            .bind(max_attempts)
+            .bind(json!({ "account_id": account_id.as_uuid() }))
+            .bind(&dedupe_key)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(SchedulerRepositoryError::Storage)?;
+
+            let Some(inserted) = inserted else {
+                continue;
+            };
+            let job_id: Uuid = inserted
+                .try_get("id")
+                .map_err(SchedulerRepositoryError::Storage)?;
+            enqueued.push(EnqueuedCredentialRefresh { account_id, job_id });
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(SchedulerRepositoryError::Storage)?;
+        Ok(enqueued)
     }
 }
 

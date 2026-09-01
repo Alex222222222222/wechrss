@@ -5,11 +5,13 @@
 //! PostgreSQL pool, builds only the selected adapters, and supervises the API,
 //! scheduler, and executable feed-rebuild/source-sync worker loops.
 //!
-//! Authenticated WeRead work is constructed only when a pre-authenticated
-//! browser profile and account identity are configured. Login, credential
-//! refresh, and administrative routes remain intentionally fail-closed.
+//! Authenticated source work is constructed only when a pre-authenticated
+//! browser profile and account identity are configured. Non-interactive
+//! credential refresh can additionally be wired with a deployment-specific
+//! transport; QR login and administrative routes remain intentionally
+//! deferred.
 
-use std::time::Duration as StdDuration;
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration as StdDuration};
 
 use axum::Router;
 use chrono::Duration;
@@ -25,6 +27,10 @@ use crate::{
         webdriver::{BrowserProfile, BrowserViewport, WebDriverFactory},
         weread::{BrowserWeReadAdapter, WeReadEndpointError},
     },
+    application::auth_service::{
+        AuthService, AuthServiceConfig, AuthServiceDependencies, CredentialRefreshJobHandler,
+        CredentialRefresher, RingCredentialCipher,
+    },
     config::{AppConfig, AppRole},
     domain::job::JobType,
     persistence::{
@@ -32,6 +38,7 @@ use crate::{
         repositories::{
             account_lease_repository::PostgresAccountLeaseRepository,
             article_repository::PostgresArticleRepository,
+            credential_repository::PostgresCredentialRepository,
             feed_cache_repository::{
                 PostgresFeedBuildLeaseRepository, PostgresFeedCacheRepository,
             },
@@ -56,7 +63,7 @@ use super::{
     feed_token_service::FeedTokenService,
     job_service::JobService,
     runtime::{RuntimeComponent, RuntimePlan, RuntimePlanError},
-    scheduler::Scheduler,
+    scheduler::{CredentialRefreshScheduleConfig, Scheduler, SchedulerConfigError},
     source_sync_acquirer::{
         BrowserSourceSyncAcquirer, BrowserSourceSyncAcquirerConfig,
         BrowserSourceSyncAcquirerConfigError, BrowserSourceSyncAcquirerDependencies,
@@ -86,9 +93,36 @@ type SourceSyncHandler = SourceSyncJobHandler<
     >,
 >;
 
+impl<S, L, R, C> OptionalJobHandler for CredentialRefreshJobHandler<S, L, R, C>
+where
+    S: crate::persistence::repositories::credential_repository::CredentialRepository,
+    L: crate::acquisition::browser_pool::AccountLeaseStore + Clone + 'static,
+    R: CredentialRefresher,
+    C: crate::application::auth_service::CredentialCipher,
+{
+    fn execute<'a>(
+        &'a self,
+        lease: &'a crate::persistence::repositories::job_repository::JobLease,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Pin<Box<dyn Future<Output = crate::application::worker::JobExecution> + Send + 'a>> {
+        Box::pin(self.execute_job(lease, now))
+    }
+}
+
+/// Object-safe adapter for an optional runtime job handler.
+pub trait OptionalJobHandler: Send + Sync {
+    /// Executes a claimed job with a `Send` future suitable for role tasks.
+    fn execute<'a>(
+        &'a self,
+        lease: &'a crate::persistence::repositories::job_repository::JobLease,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Pin<Box<dyn Future<Output = crate::application::worker::JobExecution> + Send + 'a>>;
+}
+
 pub struct RuntimeJobHandler<F, S> {
     feed_rebuild: F,
     source_sync: Option<S>,
+    credential_refresh: Option<Box<dyn OptionalJobHandler>>,
 }
 
 impl<F, S> RuntimeJobHandler<F, S> {
@@ -97,7 +131,17 @@ impl<F, S> RuntimeJobHandler<F, S> {
         Self {
             feed_rebuild,
             source_sync,
+            credential_refresh: None,
         }
+    }
+
+    /// Adds the transport-backed credential refresh handler to this worker.
+    pub fn with_credential_refresh<H>(mut self, handler: H) -> Self
+    where
+        H: OptionalJobHandler + 'static,
+    {
+        self.credential_refresh = Some(Box::new(handler));
+        self
     }
 }
 
@@ -117,6 +161,12 @@ where
                 Some(handler) => handler.execute(lease, now).await,
                 None => crate::application::worker::JobExecution::Failed {
                     error: "source-sync handler is not configured".to_owned(),
+                },
+            },
+            JobType::CredentialRefresh => match &self.credential_refresh {
+                Some(handler) => handler.execute(lease, now).await,
+                None => crate::application::worker::JobExecution::Failed {
+                    error: "credential-refresh handler is not configured".to_owned(),
                 },
             },
             _ => crate::application::worker::JobExecution::Failed {
@@ -140,6 +190,7 @@ pub struct RuntimeSupervisor {
     plan: RuntimePlan,
     pool: PgPool,
     browser_pool: Option<BrowserPool>,
+    credential_refresher: Option<Arc<dyn CredentialRefresher>>,
 }
 
 impl RuntimeSupervisor {
@@ -159,6 +210,7 @@ impl RuntimeSupervisor {
             plan,
             pool,
             browser_pool,
+            credential_refresher: None,
         })
     }
 
@@ -174,7 +226,23 @@ impl RuntimeSupervisor {
             plan,
             pool,
             browser_pool,
+            credential_refresher: None,
         })
+    }
+
+    /// Installs the deployment-specific non-interactive refresh transport.
+    ///
+    /// The transport is intentionally injected because the upstream refresh
+    /// exchange is not part of the browser adapter. Installing it also makes
+    /// `credential_refresh` jobs claimable by worker plans; without it those
+    /// jobs remain outside the runtime dispatch set.
+    pub fn with_credential_refresher<R>(mut self, refresher: R) -> Self
+    where
+        R: CredentialRefresher + 'static,
+    {
+        self.credential_refresher = Some(Arc::new(refresher));
+        self.plan.enable_credential_refresh();
+        self
     }
 
     fn validated_plan(config: &AppConfig) -> Result<RuntimePlan, RuntimeSupervisorError> {
@@ -244,9 +312,21 @@ impl RuntimeSupervisor {
                 RuntimeComponent::Scheduler(scheduler) => {
                     let scheduler_config = scheduler.scheduler_config();
                     let loop_config = scheduler.loop_config();
+                    let credential_refresh_enabled = scheduler.credential_refresh_enabled();
                     let repository = PostgresSchedulerRepository::new(self.pool.clone());
                     let scheduler =
                         Scheduler::new(repository, scheduler_config, self.config.quiet_hours);
+                    let scheduler = match credential_refresh_enabled {
+                        true => {
+                            let refresh_config = CredentialRefreshScheduleConfig::new(
+                                Duration::minutes(5),
+                                self.config.job_max_attempts,
+                            )
+                            .map_err(RuntimeSupervisorError::SchedulerConfig)?;
+                            scheduler.with_credential_refresh(refresh_config)
+                        }
+                        false => scheduler,
+                    };
                     let role_shutdown = role_shutdown_rx.clone();
                     tasks.spawn(async move {
                         scheduler
@@ -375,6 +455,12 @@ impl RuntimeSupervisor {
             .then(|| self.build_source_sync_handler(worker_index))
             .transpose()?;
         let handler = RuntimeJobHandler::new(feed_handler, source_sync);
+        let handler = match self.credential_refresher.clone() {
+            Some(refresher) => handler.with_credential_refresh(
+                self.build_credential_refresh_handler(refresher, worker_index)?,
+            ),
+            None => handler,
+        };
         Worker::new(
             JobService::new(
                 PostgresJobRepository::new(self.pool.clone()),
@@ -385,6 +471,44 @@ impl RuntimeSupervisor {
             plan.worker_config().clone(),
         )
         .map_err(RuntimeSupervisorError::WorkerConfig)
+    }
+
+    fn build_credential_refresh_handler(
+        &self,
+        refresher: Arc<dyn CredentialRefresher>,
+        worker_index: u32,
+    ) -> Result<
+        CredentialRefreshJobHandler<
+            PostgresCredentialRepository,
+            PostgresAccountLeaseRepository,
+            Arc<dyn CredentialRefresher>,
+            RingCredentialCipher,
+        >,
+        RuntimeSupervisorError,
+    > {
+        let auth_config = AuthServiceConfig::new(
+            Duration::minutes(5),
+            chrono_duration(self.config.account_lease, "ACCOUNT_LEASE_SECONDS")?,
+            chrono_duration(self.config.account_heartbeat, "ACCOUNT_HEARTBEAT_SECONDS")?,
+        )
+        .map_err(RuntimeSupervisorError::AuthServiceConfig)?;
+        let cipher = RingCredentialCipher::new(&self.config.credential_encryption_key)
+            .map_err(RuntimeSupervisorError::CredentialCipher)?;
+        let service = AuthService::new(
+            AuthServiceDependencies {
+                accounts: PostgresCredentialRepository::new(self.pool.clone()),
+                leases: PostgresAccountLeaseRepository::new(self.pool.clone()),
+                refresher,
+                cipher,
+            },
+            auth_config,
+        );
+        CredentialRefreshJobHandler::new(
+            service,
+            format!("{}-auth-worker-{worker_index}", self.config.instance_id),
+            chrono_duration(self.config.job_poll_interval, "JOB_POLL_SECONDS")?,
+        )
+        .map_err(RuntimeSupervisorError::AuthService)
     }
 
     fn build_source_sync_handler(
@@ -582,6 +706,18 @@ pub enum RuntimeSupervisorError {
     /// Source-sync handler policy was invalid after configuration.
     #[error(transparent)]
     SourceSyncHandlerConfig(#[from] SourceSyncJobHandlerConfigError),
+    /// Scheduler credential-refresh settings were invalid after conversion.
+    #[error(transparent)]
+    SchedulerConfig(#[from] SchedulerConfigError),
+    /// Authentication refresh policy was invalid after configuration.
+    #[error(transparent)]
+    AuthServiceConfig(#[from] super::auth_service::AuthServiceConfigError),
+    /// Authentication credential encryption could not be initialized.
+    #[error(transparent)]
+    CredentialCipher(#[from] super::auth_service::CredentialCipherError),
+    /// Authentication refresh handler construction failed.
+    #[error(transparent)]
+    AuthService(#[from] super::auth_service::AuthServiceError),
     /// Worker construction failed.
     #[error(transparent)]
     WorkerConfig(#[from] super::worker::WorkerConfigError),
@@ -616,7 +752,11 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
 
     use super::*;
-    use crate::config::AppConfig;
+    use crate::{
+        application::auth_service::{CredentialRefreshError, RefreshedCredentials},
+        config::AppConfig,
+        domain::credentials::WeReadAccountId,
+    };
 
     fn config(roles: &str) -> AppConfig {
         AppConfig::from_env_iter([
@@ -678,6 +818,55 @@ mod tests {
         PgPoolOptions::new()
             .connect_lazy("postgres://unused")
             .expect("lazy test pool URL should be valid")
+    }
+
+    #[derive(Clone)]
+    struct UnavailableRefresher;
+
+    #[async_trait::async_trait]
+    impl CredentialRefresher for UnavailableRefresher {
+        async fn refresh(
+            &self,
+            _account_id: WeReadAccountId,
+            _refresh_token: &str,
+        ) -> Result<RefreshedCredentials, CredentialRefreshError> {
+            Err(CredentialRefreshError::Transient)
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_refresh_transport_adds_credential_jobs_to_worker_dispatch() {
+        let supervisor = RuntimeSupervisor::new(config("worker"), lazy_pool())
+            .unwrap()
+            .with_credential_refresher(UnavailableRefresher);
+        let RuntimeComponent::Worker(plan) = supervisor
+            .plan()
+            .component(AppRole::Worker)
+            .expect("worker plan should exist")
+        else {
+            panic!("worker role should produce a worker plan")
+        };
+
+        assert!(plan
+            .worker_config()
+            .allowed_job_types()
+            .contains(&JobType::CredentialRefresh));
+    }
+
+    #[tokio::test]
+    async fn injected_refresh_transport_enables_scheduler_refresh_passes() {
+        let supervisor = RuntimeSupervisor::new(authenticated_config("all"), lazy_pool())
+            .unwrap()
+            .with_credential_refresher(UnavailableRefresher);
+        let RuntimeComponent::Scheduler(plan) = supervisor
+            .plan()
+            .component(AppRole::Scheduler)
+            .expect("scheduler plan should exist")
+        else {
+            panic!("scheduler role should produce a scheduler plan")
+        };
+
+        assert!(plan.credential_refresh_enabled());
     }
 
     #[tokio::test]

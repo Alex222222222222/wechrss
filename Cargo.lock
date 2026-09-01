@@ -3190,6 +3190,7 @@ dependencies = [
  "rand 0.9.5",
  "rand_distr",
  "regex",
+ "ring",
  "rss",
  "scraper",
  "secrecy",

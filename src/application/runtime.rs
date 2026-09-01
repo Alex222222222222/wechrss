@@ -32,11 +32,12 @@ use super::{
     worker::{WorkerConfig, WorkerConfigError, WorkerLoopConfig, WorkerLoopConfigError},
 };
 
-/// The currently executable worker job kinds.
+/// The default executable worker job kinds.
 ///
-/// Only job kinds with complete runtime composition are claimable here.
-/// Keeping this list explicit prevents runtime composition from silently
-/// turning an uncomposed handler into claimed work.
+/// Credential refresh is added separately only when a deployment injects a
+/// concrete refresh transport into [`super::runtime_supervisor::RuntimeSupervisor`].
+/// Keeping this default list explicit prevents runtime composition from
+/// silently turning an uncomposed handler into claimed work.
 pub const EXECUTABLE_WORKER_JOB_TYPES: &[JobType] = &[JobType::FeedRebuild, JobType::SourceSync];
 
 /// A validated HTTP component plan.
@@ -69,6 +70,7 @@ impl ApiRuntimePlan {
 pub struct SchedulerRuntimePlan {
     scheduler: SchedulerConfig,
     loop_config: SchedulerLoopConfig,
+    credential_refresh_enabled: bool,
 }
 
 impl SchedulerRuntimePlan {
@@ -80,6 +82,15 @@ impl SchedulerRuntimePlan {
     /// Returns the shutdown-aware scheduler loop settings.
     pub const fn loop_config(&self) -> SchedulerLoopConfig {
         self.loop_config
+    }
+
+    /// Returns whether this scheduler should create credential-refresh jobs.
+    pub const fn credential_refresh_enabled(&self) -> bool {
+        self.credential_refresh_enabled
+    }
+
+    pub(crate) fn enable_credential_refresh(&mut self) {
+        self.credential_refresh_enabled = true;
     }
 }
 
@@ -118,6 +129,18 @@ impl WorkerRuntimePlan {
     pub const fn source_sync_enabled(&self) -> bool {
         self.source_sync_enabled
     }
+
+    pub(crate) fn enable_credential_refresh(&mut self) {
+        if !self
+            .dispatch
+            .allowed_job_types()
+            .contains(&JobType::CredentialRefresh)
+        {
+            self.dispatch
+                .allowed_job_types_mut()
+                .push(JobType::CredentialRefresh);
+        }
+    }
 }
 
 /// One role-specific component selected by [`RuntimePlan`].
@@ -139,6 +162,16 @@ pub struct RuntimePlan {
 }
 
 impl RuntimePlan {
+    pub(crate) fn enable_credential_refresh(&mut self) {
+        for component in &mut self.components {
+            match component {
+                RuntimeComponent::Scheduler(scheduler) => scheduler.enable_credential_refresh(),
+                RuntimeComponent::Worker(worker) => worker.enable_credential_refresh(),
+                RuntimeComponent::Api(_) => {}
+            }
+        }
+    }
+
     /// Builds the role plan from validated application configuration.
     ///
     /// Components are emitted in stable API, scheduler, worker order. No
@@ -169,6 +202,7 @@ impl RuntimePlan {
             components.push(RuntimeComponent::Scheduler(SchedulerRuntimePlan {
                 scheduler: SchedulerConfig::default(),
                 loop_config: scheduler_loop,
+                credential_refresh_enabled: false,
             }));
         }
 
