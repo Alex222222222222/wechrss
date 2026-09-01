@@ -6,7 +6,8 @@
 > WeRead credential provisioning and lease-serialized non-interactive refresh
 > are available as an application service. A deployment-specific refresh
 > transport can be injected into the runtime worker; QR/login exchange,
-> administrative routes, and browser health checks remain unfinished. Source
+> administrative routes, and browser health checks remain unfinished. API
+> liveness/readiness endpoints are available. Source
 > synchronization still requires a pre-authenticated browser profile and
 > WeRead account ID.
 
@@ -155,12 +156,22 @@ volumes only when session persistence or local asset storage is selected.
 Public article extraction uses a clean ephemeral profile and never reuses the
 authenticated account profile.
 
-API readiness requires PostgreSQL but does not fail solely because WebDriver is
-unavailable, allowing persisted RSS feeds to remain serviceable. Browser and
+API readiness is exposed at `/api/ready` and requires PostgreSQL; it does not
+fail solely because WebDriver is unavailable, allowing persisted RSS feeds to
+remain serviceable. Browser and
 browser-timezone health are exposed as degraded component status and stop
 workers from claiming browser jobs. A worker-only process may make browser
-availability part of its own readiness condition. Liveness remains a local
-process check.
+availability part of its own readiness condition. Liveness is exposed at
+`/api/health` and is a local process check.
+
+The first usable version includes a small operator web UI for source
+management, synchronization status, feed-link copying, and safe error states.
+The UI is a release target and is not yet complete in the incremental tree.
+Interactive QR-code login is deferred until after the first release because it
+requires user interaction and a dedicated login-attempt lifecycle. A durable
+queue and handler for articles missed during synchronization is also deferred;
+it is a post-release repair/backfill improvement rather than a first-release
+requirement.
 
 ## Timezone verification
 

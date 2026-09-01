@@ -4,15 +4,22 @@ This document describes the planned Rust implementation of the existing
 `wechrss-main` Python service. The current Rust tree remains intentionally
 incremental: it defines boundaries and ownership, with the domain/configuration
 policies and the first PostgreSQL job/cache-persistence slices implemented
-while interactive login, administrative HTTP behavior, and health diagnostics
-remain unimplemented. Encrypted credential persistence and non-interactive
+while interactive login and administrative HTTP behavior remain unimplemented.
+Process liveness and PostgreSQL-backed API readiness diagnostics are executable.
+Encrypted credential persistence and non-interactive
 refresh are implemented as an application service.
 The pure RSS renderer, normalized article persistence, cache-first feed
 delivery decision service, archive sanitizer, unauthenticated public article
 browser path, and database-only feed rebuild orchestration are executable.
 The public feed-token lifecycle and its tokenized feed route are executable;
-administrative and health routes still need to compose their application
-services.
+administrative routes still need to compose their application services. The
+first usable version also includes a small web UI over those application/API
+boundaries; its pages remain incremental work in the current tree.
+
+The first usable version deliberately defers interactive QR-code login and the
+queue/handler used to repair articles missed during synchronization. The latter
+is a post-release backfill improvement, not a prerequisite for the initial
+source-sync path.
 
 ## Goals
 
@@ -28,6 +35,8 @@ services.
 - Pause new upstream work during configured quiet hours in an IANA timezone.
 - Keep authentication, browser protocol details, business rules, and storage
   replaceable independently.
+- Provide a small operator web UI for source management, synchronization
+  status, feed-link copying, and safe error presentation.
 
 ## Implementation status and contract policy
 
@@ -47,11 +56,11 @@ The current and target contracts must not be confused:
 
 | Area | Executable now | Target contract and implementation gate |
 | --- | --- | --- |
-| Runtime | `RuntimeSupervisor` consumes the validated `RuntimePlan`, opens the shared PostgreSQL pool, applies SQLx migrations, binds the selected API, and supervises scheduler, feed-rebuild, and configuration-gated authenticated source-sync loops with graceful shutdown; an injected refresh transport also enables account-expiry scheduling | QR/login exchange, administrative routes, browser health, and readiness diagnostics remain future work |
+| Runtime | `RuntimeSupervisor` consumes the validated `RuntimePlan`, opens the shared PostgreSQL pool, applies SQLx migrations, binds the selected API, and supervises scheduler, feed-rebuild, and configuration-gated authenticated source-sync loops with graceful shutdown; an injected refresh transport also enables account-expiry scheduling | QR/login exchange, administrative routes, and browser health remain future work; API liveness/readiness are executable |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, type-aware feed-rebuild/source-sync dispatch, lease-fenced credential-refresh dispatch when a transport is injected, and shutdown-aware heartbeat/outcome execution | Article-backfill dispatch, plus removal of compatibility `now` parameters, remain future work |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, public RSS URL, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint; the supervisor consumes the parsed role and policy values | Complete administrative configuration still needs an executable application boundary |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, feed-build leases, and encrypted WeRead account credential records with optimistic versions | QR-login state and remaining transaction-scoped views are design-only |
-| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, authenticated WeRead article-list transport through a pre-authenticated profile and account lease, source-sync finalization through an injected acquisition port, feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, and public tokenized feed route | Login/QR exchange, source-sync/application HTTP handlers, administrative routes, and health/readiness wiring remain future work |
+| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, authenticated WeRead article-list transport through a pre-authenticated profile and account lease, source-sync finalization through an injected acquisition port, feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, public tokenized feed route, and API liveness/readiness routes | Login/QR exchange, source-sync/application HTTP handlers, administrative routes, browser health, and the first-version web UI remain future work |
 | Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, and external-image reporting through ArchiveService | Asset persistence and URL rewriting remain future work |
 
 Environment variables in this document are parsed into `AppConfig`, and
@@ -925,6 +934,9 @@ without exposing it in logs.
 - Logs contain identifiers and error classifications, never access or refresh
   tokens.
 - `/api/health` is process liveness and does not contact dependencies.
+- `/api/ready` checks PostgreSQL with a lightweight query and returns `503` when
+  the dependency is unavailable. Its JSON diagnostic reports only stable
+  component status and the configured timezone.
 - API readiness requires PostgreSQL but does not fail solely because the browser
   sidecar is unavailable; cached RSS remains serviceable. Browser and timezone
   health are reported as degraded components and prevent browser jobs from
@@ -1132,8 +1144,8 @@ capacity/lease ownership, public WebDriver navigation, common article
 extraction, bounded public-page pacing/scroll execution, expected
 browser-timezone validation, and pure current/legacy WeRead article-list
 response parsing, authenticated transport, account leasing, authenticated
-request pacing, and public article handoff are executable; login/refresh and
-browser health remain future work.
+request pacing, and public article handoff are executable; interactive login
+and browser health remain future work.
 `SourceService` implements source create/read, operator enable/gate changes,
 and the initial-job slice described above. `JobService` implements queue
 lifecycle and transaction-scoped outcome binding; `Worker::run_once` implements

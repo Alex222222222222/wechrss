@@ -423,6 +423,8 @@ impl RuntimeSupervisor {
         Ok(feed_router(
             FeedTokenService::new(PostgresFeedTokenRepository::new(self.pool.clone())),
             feed_service,
+            self.pool.clone(),
+            self.config.timezone,
         ))
     }
 

@@ -5,6 +5,7 @@ use axum::{
     http::{header, Request, StatusCode},
 };
 use chrono::{Duration, Utc};
+use chrono_tz::UTC;
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -86,6 +87,69 @@ async fn feed_route_serves_xml_and_honors_conditional_requests(pool: PgPool) {
             .expect("304 body should be readable")
             .len(),
         0
+    );
+}
+
+#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+async fn health_routes_report_liveness_and_database_readiness(pool: PgPool) {
+    let app = router(&pool);
+
+    let liveness = app
+        .clone()
+        .oneshot(get_request("/api/health", None))
+        .await
+        .expect("liveness request should complete");
+    assert_eq!(liveness.status(), StatusCode::OK);
+    assert_eq!(liveness.headers()[header::CONTENT_TYPE], "application/json");
+    assert_eq!(
+        to_bytes(liveness.into_body(), usize::MAX)
+            .await
+            .expect("liveness body should be readable"),
+        r#"{"status":"ok"}"#
+    );
+
+    let readiness = app
+        .oneshot(get_request("/api/ready", None))
+        .await
+        .expect("readiness request should complete");
+    assert_eq!(readiness.status(), StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(readiness.into_body(), usize::MAX)
+                .await
+                .expect("readiness body should be readable"),
+        )
+        .expect("readiness body should be JSON"),
+        serde_json::json!({
+            "status": "ready",
+            "database": "ready",
+            "timezone": "UTC"
+        })
+    );
+}
+
+#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+async fn readiness_returns_service_unavailable_when_database_is_closed(pool: PgPool) {
+    let app = router(&pool);
+    pool.close().await;
+
+    let response = app
+        .oneshot(get_request("/api/ready", None))
+        .await
+        .expect("readiness request should complete even when the database is closed");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("readiness body should be readable"),
+        )
+        .expect("readiness body should be JSON"),
+        serde_json::json!({
+            "status": "not_ready",
+            "database": "unavailable",
+            "timezone": "UTC"
+        })
     );
 }
 
@@ -188,7 +252,7 @@ fn router(pool: &PgPool) -> axum::Router {
         queue,
         FeedServiceConfig::default(),
     );
-    feed_router(token_service, feed_service)
+    feed_router(token_service, feed_service, pool.clone(), UTC)
 }
 
 fn get_request(path: &str, etag: Option<&str>) -> Request<Body> {

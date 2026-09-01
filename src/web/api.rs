@@ -27,11 +27,14 @@ use axum::{
     body::Body,
     extract::{Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
-    Router,
+    Json, Router,
 };
 use chrono::Duration;
+use chrono_tz::Tz;
+use serde_json::json;
+use sqlx::PgPool;
 
 use crate::{
     application::{
@@ -55,6 +58,8 @@ use crate::{
 pub fn feed_router<R, C, Q>(
     token_service: FeedTokenService<R>,
     feed_service: FeedService<C, Q>,
+    pool: PgPool,
+    timezone: Tz,
 ) -> Router
 where
     R: FeedTokenRepository + 'static,
@@ -64,8 +69,12 @@ where
     let state = Arc::new(FeedApiState {
         token_service,
         feed_service,
+        pool,
+        timezone,
     });
     Router::new()
+        .route("/api/health", get(liveness))
+        .route("/api/ready", get(readiness::<R, C, Q>))
         // Axum does not allow a literal suffix in the same segment as a path
         // parameter, so the handler validates the exact `.xml` shape below.
         .route("/feeds/{*feed_path}", get(feed::<R, C, Q>))
@@ -75,6 +84,45 @@ where
 struct FeedApiState<R, C, Q> {
     token_service: FeedTokenService<R>,
     feed_service: FeedService<C, Q>,
+    pool: PgPool,
+    timezone: Tz,
+}
+
+/// Reports that this process is alive without contacting any dependency.
+async fn liveness() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({ "status": "ok" })))
+}
+
+/// Reports whether the API can reach its required PostgreSQL dependency.
+///
+/// The response intentionally contains only stable component status and the
+/// configured timezone. Database errors are not returned to callers because
+/// they may contain connection details.
+async fn readiness<R, C, Q>(State(state): State<Arc<FeedApiState<R, C, Q>>>) -> Response
+where
+    R: FeedTokenRepository + 'static,
+    C: FeedCacheRepository + 'static,
+    Q: FeedRebuildQueue + 'static,
+{
+    let database_available = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.pool)
+        .await
+        .is_ok_and(|value| value == 1);
+    let (status, database, status_code) = if database_available {
+        ("ready", "ready", StatusCode::OK)
+    } else {
+        ("not_ready", "unavailable", StatusCode::SERVICE_UNAVAILABLE)
+    };
+
+    (
+        status_code,
+        Json(json!({
+            "status": status,
+            "database": database,
+            "timezone": state.timezone.to_string(),
+        })),
+    )
+        .into_response()
 }
 
 async fn feed<R, C, Q>(
@@ -201,6 +249,7 @@ fn retry_after_seconds(delay: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use axum::{body::to_bytes, response::IntoResponse};
     use chrono::{DateTime, Utc};
 
     use super::*;
@@ -218,6 +267,19 @@ mod tests {
         assert_eq!(
             timestamp.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
             "Thu, 01 Jan 1970 00:00:00 GMT"
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_does_not_require_a_database_connection() {
+        let response = liveness().await.into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("liveness body should be readable"),
+            r#"{"status":"ok"}"#
         );
     }
 }

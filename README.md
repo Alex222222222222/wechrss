@@ -31,6 +31,57 @@ with or endorsed by any third-party service it may interact with.
 Review the project documentation and the applicable third-party policies before
 running any component.
 
+## First usable version scope
+
+The first usable version includes a small authenticated web UI for source
+management, synchronization status, feed-link copying, and operator-facing
+error states. It uses the same API and application-service boundaries as other
+clients; it does not expose credentials, session tokens, or browser controls.
+The UI is a release target and is not yet fully implemented in the current
+incremental tree. It also includes a reproducible Docker image build and the
+deployment documentation needed to run the release image.
+
+The following items are intentionally deferred until after the first release:
+
+- QR-code login, because it requires interactive user confirmation and a
+  dedicated login-attempt lifecycle; and
+- a queue and handler for articles missed during synchronization. This is a
+  useful repair/backfill improvement, but the first release relies on the
+  normal source synchronization path.
+
+## Roadmap
+
+These possible features are ordered approximately by user value and operational
+impact, not by implementation difficulty. The list is a planning guide rather
+than a commitment:
+
+1. **Complete the authenticated web UI and its admin API.** Add source
+   management, synchronization status, feed-link copying, safe error states,
+   session protection, CSRF validation, and login rate limiting. This is the
+   highest-value first-version milestone.
+2. **Build and publish the release Docker image.** Provide a reproducible,
+   minimal image with a documented runtime configuration and deployment
+   workflow. This is required for the first release.
+3. **Add browser health and worker readiness diagnostics.** Report WebDriver
+   availability and timezone mismatches separately from API liveness and
+   PostgreSQL readiness, and prevent browser jobs from being claimed while the
+   browser sidecar is unhealthy.
+4. **Add QR-code login.** Implement the bounded, single-use login-attempt
+   lifecycle and interactive confirmation flow so operators do not need to
+   supply a pre-authenticated browser profile. This remains deferred after the
+   first release.
+5. **Add missed-article repair/backfill jobs.** Queue and process articles
+   missed during synchronization with bounded retries and deduplication. This
+   improves recovery after partial upstream failures but is not required for
+   the first release.
+6. **Persist archived assets and rewrite feed URLs.** Store approved media in
+   local or object storage so archived articles can remain useful when
+   upstream assets change or disappear.
+7. **Evaluate PGMQ as a queue transport optimization.** The current custom
+   `jobs` table remains the version-one transport; PGMQ can be evaluated later
+   if queue throughput or operational overhead becomes a demonstrated
+   bottleneck.
+
 ## WeRead authentication
 
 Authentication is split into two separate flows. Both flows must use an
