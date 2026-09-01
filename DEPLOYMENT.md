@@ -3,9 +3,11 @@
 > **Implementation status:** the Rust binary now loads environment-only
 > configuration, applies pending SQLx migrations, and composes the selected
 > API and database-only feed-rebuild worker roles. Scheduler startup is rejected
-> until source synchronization is executable. Authenticated source
-> synchronization, administrative routes, and browser health checks are still
-> not executable, so deployments must not enable those unfinished capabilities.
+> until concrete authenticated source acquisition and browser dependencies are
+> composed. The injected-port synchronization finalization handler is covered
+> by tests, but authenticated transport, administrative routes, and browser
+> health checks are still not executable, so deployments must not enable those
+> unfinished capabilities.
 
 When browser-backed source synchronization is enabled, its worker and browser
 sidecar must use the same IANA timezone for quiet-hours decisions and
@@ -43,8 +45,9 @@ and sidecar. Secrets such as database URLs and encryption keys belong in a
 Kubernetes Secret.
 
 The currently executable role sets are `APP_ROLES=api`, `worker`, or
-`api,worker`. `scheduler` and `all` fail startup until source synchronization
-is executable, because the current worker cannot consume source-sync jobs.
+`api,worker`. `scheduler` and `all` fail startup until concrete source-sync
+acquisition is composed, because the current runtime worker cannot consume
+source-sync jobs.
 `RSS_FEED_URL` must be set to the public HTTP(S) URL that generated RSS
 channels should advertise. Browser-session capacity and worker replica count
 must be intentional; increasing API replicas for RSS traffic must not

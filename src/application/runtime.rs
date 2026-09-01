@@ -7,10 +7,11 @@
 //! component plans to construct only the roles selected by `APP_ROLES`.
 //!
 //! The plan is conservative about worker dispatch. The database-only feed
-//! rebuild path is executable, but source synchronization, article backfill,
-//! and credential refresh still lack their complete handlers. Those job kinds
-//! therefore are not included in the current worker plan; a worker must never
-//! claim work that it cannot execute and durably complete.
+//! rebuild path is executable, and source synchronization has an injected-port
+//! finalization handler, but concrete authenticated acquisition is not yet
+//! composed into the runtime. Source-sync, article-backfill, and credential-
+//! refresh jobs therefore are not included in the current worker plan; a
+//! worker must never claim work that it cannot execute and durably complete.
 //!
 //! API readiness does not depend on WebDriver availability. The API plan only
 //! contains HTTP settings, while browser-dependent worker health remains a
@@ -34,9 +35,9 @@ use super::{
 
 /// The currently executable worker job kinds.
 ///
-/// Source synchronization and the other job kinds remain queued until their
-/// complete handlers exist. Keeping this list explicit prevents runtime
-/// composition from silently turning an unfinished handler into claimed work.
+/// Only job kinds with complete runtime composition are claimable here.
+/// Keeping this list explicit prevents runtime composition from silently
+/// turning an uncomposed handler into claimed work.
 pub const EXECUTABLE_WORKER_JOB_TYPES: &[JobType] = &[JobType::FeedRebuild];
 
 /// A validated HTTP component plan.

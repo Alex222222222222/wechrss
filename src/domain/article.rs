@@ -371,14 +371,16 @@ impl Article {
 pub struct ArticleUpsertResult {
     article: Article,
     feed_visible_change: bool,
+    created: bool,
 }
 
 impl ArticleUpsertResult {
     /// Creates a repository result.
-    pub(crate) fn new(article: Article, feed_visible_change: bool) -> Self {
+    pub(crate) fn new(article: Article, feed_visible_change: bool, created: bool) -> Self {
         Self {
             article,
             feed_visible_change,
+            created,
         }
     }
 
@@ -395,6 +397,11 @@ impl ArticleUpsertResult {
     /// Reports whether RSS-visible fields changed.
     pub const fn feed_visible_change(&self) -> bool {
         self.feed_visible_change
+    }
+
+    /// Reports whether the upsert inserted a new article row.
+    pub const fn created(&self) -> bool {
+        self.created
     }
 }
 

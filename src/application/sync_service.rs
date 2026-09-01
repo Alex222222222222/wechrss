@@ -27,20 +27,20 @@
 //! Credentials are scoped to the account/list acquisition step; the article
 //! page adapter must not receive or require them.
 //!
-//! The executable slice currently prepares one page result for persistence:
-//! list metadata is used as a fallback for missing page metadata, the public
-//! page HTML is sanitized and hashed through [`ArchiveService`], and the
-//! optional external-image set is retained for a later asset policy. It also
-//! classifies typed WeRead and public-page failures into the stable sync-run
-//! failure vocabulary without copying upstream response text into durable
-//! diagnostics. Transport, database writes, feed rendering, and job outcome
-//! commits remain behind the ports described below.
+//! The executable preparation slice is consumed by
+//! [`super::source_sync_handler::SourceSyncJobHandler`]: list metadata is used
+//! as a fallback for missing page metadata, public page HTML is sanitized and
+//! hashed through [`ArchiveService`], and the optional external-image set is
+//! retained for a later asset policy. This service also classifies typed
+//! WeRead and public-page failures into the stable sync-run vocabulary without
+//! copying upstream response text into durable diagnostics. Transport and
+//! concrete browser/account composition remain behind the acquisition port.
 //!
 //! Non-responsibilities: polling due sources, implementing WebDriver commands,
-//! storing raw secrets, or serving RSS requests. A future full source-sync
-//! handler must perform acquisition outside a transaction and pass the
-//! prepared values through one shared `UnitOfWork` for article, source,
-//! sync-run, feed-cache, and job writes.
+//! storing raw secrets, or serving RSS requests. The source-sync handler
+//! performs acquisition outside a transaction and passes prepared values
+//! through one shared `UnitOfWork` for article, source, sync-run, and job
+//! writes; feed-cache publication remains the separate feed-rebuild job.
 
 use chrono::{DateTime, Utc};
 use thiserror::Error;
@@ -87,6 +87,24 @@ impl ClassifiedSyncFailure {
     /// Returns the safe failure summary to persist.
     pub fn failure(&self) -> &SyncFailure {
         &self.failure
+    }
+
+    /// Creates an application-owned permanent failure with a safe message.
+    pub(crate) fn permanent(message: &'static str) -> Self {
+        Self {
+            outcome: SyncOutcome::Failed,
+            failure: SyncFailure::new(SyncFailureClass::Permanent, message)
+                .expect("static synchronization failure messages must be valid"),
+        }
+    }
+
+    /// Creates an application-owned retryable failure with a safe message.
+    pub(crate) fn retryable(message: &'static str) -> Self {
+        Self {
+            outcome: SyncOutcome::RetryableFailure,
+            failure: SyncFailure::new(SyncFailureClass::Retryable, message)
+                .expect("static synchronization failure messages must be valid"),
+        }
     }
 }
 

@@ -365,9 +365,9 @@ pub enum RuntimeSupervisorError {
     /// rather than silently ignoring an enabled setting.
     #[error("ADMIN_ENABLED is not supported until administrative routes are implemented")]
     AdminRoutesNotImplemented,
-    /// The scheduler currently creates source-sync jobs without an executable
-    /// source-sync worker handler.
-    #[error("scheduler role is not supported until source synchronization is implemented")]
+    /// The scheduler currently creates source-sync jobs without concrete
+    /// authenticated acquisition dependencies in the runtime.
+    #[error("scheduler role is not supported until source-sync acquisition is composed")]
     SchedulerNotImplemented,
     /// Feed workers must not publish a placeholder channel URL.
     #[error("RSS_FEED_URL is required when the worker role is enabled")]
@@ -487,7 +487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_fails_closed_until_source_sync_handler_exists() {
+    async fn scheduler_fails_closed_until_source_sync_acquisition_is_composed() {
         assert!(matches!(
             RuntimeSupervisor::new(config("scheduler"), lazy_pool()),
             Err(RuntimeSupervisorError::SchedulerNotImplemented)

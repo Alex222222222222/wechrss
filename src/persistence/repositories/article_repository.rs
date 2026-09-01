@@ -245,7 +245,7 @@ impl ArticleTransactionRepository for PostgresArticleTransaction<'_, '_> {
                     // than allowing out-of-order acquisition to regress RSS
                     // content. `fetched_at` is deliberately not used for this
                     // comparison because it records completion time.
-                    return Ok(ArticleUpsertResult::new(current, false));
+                    return Ok(ArticleUpsertResult::new(current, false, false));
                 }
                 let merged = current.merge_observation(&article);
                 let changed = feed_visible_change(&current, &merged);
@@ -254,7 +254,11 @@ impl ArticleTransactionRepository for PostgresArticleTransaction<'_, '_> {
                 } else {
                     update_observation(transaction, &merged).await?
                 };
-                return Ok(ArticleUpsertResult::new(decode_article(row)?, changed));
+                return Ok(ArticleUpsertResult::new(
+                    decode_article(row)?,
+                    changed,
+                    false,
+                ));
             }
 
             let row = sqlx::query(&format!(
@@ -277,7 +281,7 @@ impl ArticleTransactionRepository for PostgresArticleTransaction<'_, '_> {
             .map_err(|error| map_insert_error(error, source_id))?;
 
             if let Some(row) = row {
-                return Ok(ArticleUpsertResult::new(decode_article(row)?, true));
+                return Ok(ArticleUpsertResult::new(decode_article(row)?, true, true));
             }
 
             // A concurrent transaction won the primary-key race. Its row is

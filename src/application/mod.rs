@@ -23,5 +23,6 @@ pub mod runtime;
 pub mod runtime_supervisor;
 pub mod scheduler;
 pub mod source_service;
+pub mod source_sync_handler;
 pub mod sync_service;
 pub mod worker;
