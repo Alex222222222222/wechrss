@@ -34,7 +34,7 @@
 //! ASSET_ARCHIVE_S3_ENDPOINT / ASSET_ARCHIVE_S3_BUCKET /
 //! ASSET_ARCHIVE_S3_REGION / ASSET_ARCHIVE_S3_ACCESS_KEY /
 //! ASSET_ARCHIVE_S3_SECRET_KEY
-//! ADMIN_ENABLED / ADMIN_PASSWORD / SESSION_SIGNING_KEY /
+//! ADMIN_ENABLED / ADMIN_USERNAME / ADMIN_PASSWORD / SESSION_SIGNING_KEY /
 //! CREDENTIAL_ENCRYPTION_KEY
 //! ```
 //!
@@ -150,6 +150,7 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "ASSET_ARCHIVE_S3_ACCESS_KEY",
     "ASSET_ARCHIVE_S3_SECRET_KEY",
     "ADMIN_ENABLED",
+    "ADMIN_USERNAME",
     "ADMIN_PASSWORD",
     "SESSION_SIGNING_KEY",
     "CREDENTIAL_ENCRYPTION_KEY",
@@ -418,6 +419,8 @@ pub struct AppConfig {
     pub asset_archive: AssetArchiveConfig,
     /// Whether administrative routes should be constructed.
     pub admin_enabled: bool,
+    /// Administrator username, present only when administration is enabled.
+    pub admin_username: Option<String>,
     /// Administrator password, present only when administration is enabled.
     pub admin_password: Option<SecretString>,
     /// Session-signing key, present only when administration is enabled.
@@ -464,7 +467,8 @@ impl AppConfig {
             raw.admin_enabled.as_deref().unwrap_or("false"),
             "ADMIN_ENABLED",
         )?;
-        let (admin_password, session_signing_key) = if admin_enabled {
+        let (admin_username, admin_password, session_signing_key) = if admin_enabled {
+            let admin_username = required(raw.admin_username.clone(), "ADMIN_USERNAME")?;
             let admin_password = required(raw.admin_password.clone(), "ADMIN_PASSWORD")?;
             let session_signing_key =
                 required(raw.session_signing_key.clone(), "SESSION_SIGNING_KEY")?;
@@ -477,11 +481,12 @@ impl AppConfig {
                 });
             }
             (
+                Some(admin_username),
                 Some(SecretString::new(admin_password.into_boxed_str())),
                 Some(SecretString::new(session_signing_key.into_boxed_str())),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         let parsed_database_url =
@@ -768,6 +773,7 @@ impl AppConfig {
             pacing,
             asset_archive,
             admin_enabled,
+            admin_username,
             admin_password,
             session_signing_key,
             credential_encryption_key: SecretString::new(
@@ -846,6 +852,7 @@ struct RawConfig {
     asset_archive_s3_access_key: Option<String>,
     asset_archive_s3_secret_key: Option<String>,
     admin_enabled: Option<String>,
+    admin_username: Option<String>,
     admin_password: Option<String>,
     session_signing_key: Option<String>,
     credential_encryption_key: Option<String>,
@@ -1375,6 +1382,7 @@ mod tests {
         assert_eq!(config.feed_build_heartbeat, Duration::from_secs(60));
         assert!(matches!(config.asset_archive, AssetArchiveConfig::Disabled));
         assert!(!config.admin_enabled);
+        assert!(config.admin_username.is_none());
         assert!(config.admin_password.is_none());
         assert!(config.session_signing_key.is_none());
         assert!(config.quiet_hours.unwrap().is_quiet_at(
@@ -1686,12 +1694,15 @@ mod tests {
         assert!(matches!(
             AppConfig::from_env_iter(environment),
             Err(ConfigError::Missing {
-                variable: "ADMIN_PASSWORD"
+                variable: "ADMIN_USERNAME"
             })
         ));
 
         let mut environment = replace_environment(valid_environment(), "ADMIN_ENABLED", "true");
-        environment.push(("ADMIN_PASSWORD".to_owned(), "admin-password".to_owned()));
+        environment.extend([
+            ("ADMIN_USERNAME".to_owned(), "admin".to_owned()),
+            ("ADMIN_PASSWORD".to_owned(), "admin-password".to_owned()),
+        ]);
         assert!(matches!(
             AppConfig::from_env_iter(environment),
             Err(ConfigError::Missing {
@@ -1701,11 +1712,13 @@ mod tests {
 
         let mut environment = replace_environment(valid_environment(), "ADMIN_ENABLED", "true");
         environment.extend([
+            ("ADMIN_USERNAME".to_owned(), "admin".to_owned()),
             ("ADMIN_PASSWORD".to_owned(), "admin-password".to_owned()),
             ("SESSION_SIGNING_KEY".to_owned(), "session-key".to_owned()),
         ]);
         let config = AppConfig::from_env_iter(environment).unwrap();
         assert!(config.admin_enabled);
+        assert_eq!(config.admin_username.as_deref(), Some("admin"));
         assert_eq!(
             config.admin_password.unwrap().expose_secret(),
             "admin-password"
@@ -1733,6 +1746,7 @@ mod tests {
 
         let mut environment = replace_environment(valid_environment(), "ADMIN_ENABLED", "true");
         environment.extend([
+            ("ADMIN_USERNAME".to_owned(), "admin".to_owned()),
             ("ADMIN_PASSWORD".to_owned(), "same-secret".to_owned()),
             ("SESSION_SIGNING_KEY".to_owned(), "same-secret".to_owned()),
         ]);

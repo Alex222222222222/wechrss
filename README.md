@@ -33,13 +33,17 @@ running any component.
 
 ## First usable version scope
 
-The first usable version includes a small authenticated web UI for source
+The first usable version includes a small authenticated admin panel for source
 management, synchronization status, feed-link copying, and operator-facing
-error states. It uses the same API and application-service boundaries as other
-clients; it does not expose credentials, session tokens, or browser controls.
-The UI is a release target and is not yet fully implemented in the current
-incremental tree. It also includes a reproducible Docker image build and the
-deployment documentation needed to run the release image.
+error states. It has one administrator whose username and password are supplied
+through `ADMIN_USERNAME` and `ADMIN_PASSWORD`; there is no user-management
+lifecycle in the first version. The panel uses the same API and
+application-service boundaries as other clients and does not expose credentials,
+session tokens, or browser controls. The panel is a release target and is not
+yet fully implemented in the current incremental tree. The release target also
+includes a reproducible Docker image build and the deployment documentation
+needed to run the release image; those build artifacts are not yet in the
+current incremental tree.
 
 The following items are intentionally deferred until after the first release:
 
@@ -55,10 +59,12 @@ These possible features are ordered approximately by user value and operational
 impact, not by implementation difficulty. The list is a planning guide rather
 than a commitment:
 
-1. **Complete the authenticated web UI and its admin API.** Add source
+1. **Complete the authenticated admin panel and its API.** Add source
    management, synchronization status, feed-link copying, safe error states,
-   session protection, CSRF validation, and login rate limiting. This is the
-   highest-value first-version milestone.
+   session protection, CSRF validation, and login rate limiting for the single
+   environment-configured administrator (`ADMIN_USERNAME` and
+   `ADMIN_PASSWORD`). User management is intentionally out of scope for the
+   first version. This is the highest-value first-version milestone.
 2. **Build and publish the release Docker image.** Provide a reproducible,
    minimal image with a documented runtime configuration and deployment
    workflow. This is required for the first release.

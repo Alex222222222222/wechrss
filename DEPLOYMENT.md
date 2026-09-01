@@ -164,9 +164,11 @@ workers from claiming browser jobs. A worker-only process may make browser
 availability part of its own readiness condition. Liveness is exposed at
 `/api/health` and is a local process check.
 
-The first usable version includes a small operator web UI for source
+The first usable version includes a small authenticated admin panel for source
 management, synchronization status, feed-link copying, and safe error states.
-The UI is a release target and is not yet complete in the incremental tree.
+It has one administrator configured through `ADMIN_USERNAME` and
+`ADMIN_PASSWORD`; user management is out of scope. The panel is a release
+target and is not yet complete in the incremental tree.
 Interactive QR-code login is deferred until after the first release because it
 requires user interaction and a dedicated login-attempt lifecycle. A durable
 queue and handler for articles missed during synchronization is also deferred;

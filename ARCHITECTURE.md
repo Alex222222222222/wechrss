@@ -35,8 +35,10 @@ source-sync path.
 - Pause new upstream work during configured quiet hours in an IANA timezone.
 - Keep authentication, browser protocol details, business rules, and storage
   replaceable independently.
-- Provide a small operator web UI for source management, synchronization
-  status, feed-link copying, and safe error presentation.
+- Provide a small authenticated admin panel for source management,
+  synchronization status, feed-link copying, and safe error presentation. The
+  first version has one administrator configured by environment; user
+  management is out of scope.
 
 ## Implementation status and contract policy
 
@@ -905,9 +907,11 @@ interval. Once RSS rendering exposes a configurable maximum render duration,
 the same validation must include that duration. `RSS_CACHE_MISS_WAIT_MS` is a
 short bounded wait and never approaches browser or source-sync timeouts.
 
-`ADMIN_ENABLED` defaults to false. When true, both `ADMIN_PASSWORD` and an
-independent `SESSION_SIGNING_KEY` are required and startup fails if either is
-missing. When false, management, QR-login, and credential mutation routes are
+`ADMIN_ENABLED` defaults to false. When true, `ADMIN_USERNAME`,
+`ADMIN_PASSWORD`, and an independent `SESSION_SIGNING_KEY` are required and
+startup fails if any is missing. The first version has one environment-configured
+administrator and does not provide user management. When false, management,
+QR-login, and credential mutation routes are
 not registered. Feed and health routes remain available. Session cookies are
 `HttpOnly`, `SameSite=Lax` or stricter, and `Secure` when served over HTTPS;
 state-changing UI requests require CSRF validation. Deployments terminate TLS
