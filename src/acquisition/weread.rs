@@ -18,19 +18,25 @@
 //! browser or network. It accepts the current `data` envelope and the legacy
 //! `reviews[].subReviews[]` envelope, normalizes nested review records, and
 //! rejects unsupported or unsafe values before they reach persistence. The
-//! concrete Thirtyfour/browser protocol adapter, QR exchange, pacing hooks,
-//! and credential refresh remain future work.
+//! concrete browser adapter below keeps the authenticated WebDriver capability
+//! private and parses only the response body needed by source synchronization.
+//! QR exchange and credential refresh remain future work.
 
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 use thiserror::Error;
+use url::Url;
 
 use crate::domain::{credentials::WeReadAccountId, source::VerifiedWechatArticleUrl};
 
 use super::{
     browser_pool::{AccountLeaseError, AccountLeaseStore},
+    pacing::PacingController,
     webdriver::AuthenticatedRequest,
 };
+
+const WEREAD_HOST: &str = "i.weread.qq.com";
+const WEREAD_ARTICLE_LIST_PATH: &str = "/web/mp/articles";
 
 /// One normalized article-list entry returned by the WeRead adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,12 +104,26 @@ pub enum WeReadAdapterError {
     /// The upstream response did not match a supported shape.
     #[error("WeRead protocol error: {0}")]
     Protocol(String),
+    /// The authenticated browser transport failed before a valid response
+    /// could be parsed.
+    #[error("WeRead browser operation failed: {0}")]
+    Browser(String),
     /// A response omitted the stable identity needed for idempotent storage.
     #[error("WeRead article review_id must not be empty")]
     InvalidReviewId,
     /// An upstream URL could not be reduced to a verified public WeChat URL.
     #[error("WeRead article URL is not a verified public WeChat URL")]
     InvalidArticleUrl,
+}
+
+/// Validation failure for the authenticated WeRead article-list endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum WeReadEndpointError {
+    /// The endpoint is not the HTTPS WeRead article-list API.
+    #[error(
+        "WeRead article-list endpoint must be HTTPS i.weread.qq.com/web/mp/articles without credentials, fragments, or a non-default port"
+    )]
+    Invalid,
 }
 
 impl From<AccountLeaseError> for WeReadAdapterError {
@@ -313,6 +333,115 @@ fn integer_value(value: &Value) -> Option<i64> {
         .or_else(|| value.as_str()?.trim().parse().ok())
 }
 
+/// Thirtyfour-backed authenticated article-list adapter.
+#[derive(Debug, Clone)]
+pub struct BrowserWeReadAdapter {
+    endpoint: Url,
+    pacing: Option<PacingController>,
+}
+
+impl BrowserWeReadAdapter {
+    /// Creates an adapter for the validated WeRead article-list endpoint.
+    pub fn new(mut endpoint: Url) -> Result<Self, WeReadEndpointError> {
+        validate_article_list_endpoint(&endpoint)?;
+        if endpoint.port() == Some(443) {
+            endpoint
+                .set_port(None)
+                .map_err(|_| WeReadEndpointError::Invalid)?;
+        }
+        Ok(Self {
+            endpoint,
+            pacing: None,
+        })
+    }
+
+    /// Adds the shared pacing controller used before authenticated requests.
+    pub fn with_pacing(mut self, pacing: PacingController) -> Self {
+        self.pacing = Some(pacing);
+        self
+    }
+
+    /// Returns the configured endpoint without exposing browser credentials.
+    pub fn endpoint(&self) -> &Url {
+        &self.endpoint
+    }
+}
+
+impl<R> WeReadAdapter<R> for BrowserWeReadAdapter
+where
+    R: AccountLeaseStore,
+{
+    async fn list_articles(
+        &self,
+        book_id: &str,
+        mut request: AuthenticatedRequest<'_, R>,
+    ) -> Result<Vec<WeReadArticleReference>, WeReadAdapterError> {
+        let endpoint = article_list_endpoint(&self.endpoint, book_id)?;
+        request.ensure_usable().map_err(WeReadAdapterError::from)?;
+        if let Some(pacing) = &self.pacing {
+            pacing.wait(crate::domain::pacing::DelayKind::Request).await;
+        }
+        request.ensure_usable().map_err(WeReadAdapterError::from)?;
+        request
+            .goto(endpoint.as_str())
+            .await
+            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+        request.ensure_usable().map_err(WeReadAdapterError::from)?;
+        let body = request
+            .body_text()
+            .await
+            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+        request.ensure_usable().map_err(WeReadAdapterError::from)?;
+        parse_article_list_body(&body)
+    }
+}
+
+fn validate_article_list_endpoint(endpoint: &Url) -> Result<(), WeReadEndpointError> {
+    if endpoint.scheme() != "https"
+        || endpoint.host_str() != Some(WEREAD_HOST)
+        || endpoint.path() != WEREAD_ARTICLE_LIST_PATH
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.fragment().is_some()
+        || endpoint.port().is_some_and(|port| port != 443)
+    {
+        return Err(WeReadEndpointError::Invalid);
+    }
+    Ok(())
+}
+
+fn article_list_endpoint(endpoint: &Url, book_id: &str) -> Result<Url, WeReadAdapterError> {
+    let book_id = book_id.trim();
+    if book_id.is_empty() {
+        return Err(WeReadAdapterError::Protocol(
+            "book_id must not be empty".to_owned(),
+        ));
+    }
+    let mut endpoint = endpoint.clone();
+    let configured_query = endpoint
+        .query_pairs()
+        .filter(|(key, _)| key != "bookId" && key != "offset")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    endpoint.set_query(None);
+    {
+        let mut query = endpoint.query_pairs_mut();
+        for (key, value) in configured_query {
+            query.append_pair(&key, &value);
+        }
+        query
+            .append_pair("bookId", book_id)
+            .append_pair("offset", "0");
+    }
+    Ok(endpoint)
+}
+
+fn parse_article_list_body(body: &str) -> Result<Vec<WeReadArticleReference>, WeReadAdapterError> {
+    let payload = serde_json::from_str::<Value>(body)
+        .map_err(|error| WeReadAdapterError::Protocol(format!("response was not JSON: {error}")))?;
+    parse_article_list_payload(&payload)
+}
+
 /// Port for authenticated WeRead account/list operations.
 #[allow(async_fn_in_trait)]
 pub trait WeReadAdapter<R>: Send + Sync
@@ -322,6 +451,7 @@ where
     /// Lists normalized article references using a freshly heartbeated request.
     async fn list_articles(
         &self,
+        book_id: &str,
         request: AuthenticatedRequest<'_, R>,
     ) -> Result<Vec<WeReadArticleReference>, WeReadAdapterError>;
 }
@@ -350,8 +480,10 @@ mod tests {
     {
         async fn list_articles(
             &self,
+            book_id: &str,
             request: AuthenticatedRequest<'_, R>,
         ) -> Result<Vec<WeReadArticleReference>, WeReadAdapterError> {
+            assert_eq!(book_id, "book-1");
             let _account_id = request.account_id();
             Ok(vec![
                 WeReadArticleReference::new("review-1", None, None).unwrap()
@@ -548,6 +680,110 @@ mod tests {
         );
     }
 
+    #[test]
+    fn maps_non_json_browser_bodies_to_protocol_errors() {
+        assert!(matches!(
+            parse_article_list_body("<html>login required</html>"),
+            Err(WeReadAdapterError::Protocol(message)) if message.starts_with("response was not JSON:")
+        ));
+    }
+
+    #[test]
+    fn appends_book_identity_without_discarding_configured_endpoint_query() {
+        let adapter = BrowserWeReadAdapter::new(
+            "https://i.weread.qq.com/web/mp/articles?count=100"
+                .parse()
+                .unwrap(),
+        )
+        .unwrap();
+        let endpoint = article_list_endpoint(adapter.endpoint(), "book/with spaces").unwrap();
+        assert_eq!(
+            endpoint.as_str(),
+            "https://i.weread.qq.com/web/mp/articles?count=100&bookId=book%2Fwith+spaces&offset=0"
+        );
+    }
+
+    #[test]
+    fn replaces_configured_book_identity_and_offset() {
+        let endpoint: Url =
+            "https://i.weread.qq.com/web/mp/articles?bookId=wrong&offset=99&count=100"
+                .parse()
+                .unwrap();
+        let endpoint = article_list_endpoint(&endpoint, "right").unwrap();
+
+        assert_eq!(
+            endpoint.as_str(),
+            "https://i.weread.qq.com/web/mp/articles?count=100&bookId=right&offset=0"
+        );
+    }
+
+    #[test]
+    fn rejects_an_empty_book_identity_before_touching_the_browser() {
+        let endpoint: Url = "https://i.weread.qq.com/web/mp/articles".parse().unwrap();
+        assert_eq!(
+            article_list_endpoint(&endpoint, "  "),
+            Err(WeReadAdapterError::Protocol(
+                "book_id must not be empty".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_untrusted_article_list_endpoints_at_construction() {
+        for value in [
+            "http://i.weread.qq.com/web/mp/articles",
+            "https://example.test/web/mp/articles",
+            "https://i.weread.qq.com/web/mp/other",
+            "https://i.weread.qq.com:8443/web/mp/articles",
+            "https://user:password@i.weread.qq.com/web/mp/articles",
+            "https://i.weread.qq.com/web/mp/articles#fragment",
+        ] {
+            let endpoint = value.parse().expect("test URL should parse");
+            assert!(
+                matches!(
+                    BrowserWeReadAdapter::new(endpoint),
+                    Err(WeReadEndpointError::Invalid)
+                ),
+                "unsafe endpoint should be rejected: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_the_default_https_port_for_the_article_list_endpoint() {
+        let adapter = BrowserWeReadAdapter::new(
+            "https://i.weread.qq.com:443/web/mp/articles"
+                .parse()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            adapter.endpoint().as_str(),
+            "https://i.weread.qq.com/web/mp/articles"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_pacing_waits_before_authenticated_navigation() {
+        use crate::domain::pacing::{DelayDistribution, PacingPolicy};
+
+        let delay = DelayDistribution::new(10.0, 0.0, 10.0, 10.0).unwrap();
+        let policy = PacingPolicy::new(
+            delay,
+            delay,
+            delay,
+            delay,
+            1,
+            1,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        let pacing = PacingController::from_seed(policy, 1);
+        let started = tokio::time::Instant::now();
+        pacing.wait(crate::domain::pacing::DelayKind::Request).await;
+        assert!(started.elapsed() >= std::time::Duration::from_millis(8));
+    }
+
     #[tokio::test]
     async fn adapter_receives_only_an_authenticated_session() {
         let repository = MemoryAccountLeaseRepository::new(Utc::now());
@@ -567,7 +803,7 @@ mod tests {
             .prepare_request(chrono::Duration::seconds(30))
             .await
             .unwrap();
-        let entries = FakeAdapter.list_articles(request).await.unwrap();
+        let entries = FakeAdapter.list_articles("book-1", request).await.unwrap();
         assert_eq!(entries[0].review_id, "review-1");
     }
 }

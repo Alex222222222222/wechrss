@@ -4,7 +4,8 @@ This document describes the planned Rust implementation of the existing
 `wechrss-main` Python service. The current Rust tree remains intentionally
 incremental: it defines boundaries and ownership, with the domain/configuration
 policies and the first PostgreSQL job/cache-persistence slices implemented
-while authenticated protocol work and most HTTP behavior remain unimplemented.
+while login/credential refresh, administrative HTTP behavior, and health
+diagnostics remain unimplemented.
 The pure RSS renderer, normalized article persistence, cache-first feed
 delivery decision service, archive sanitizer, unauthenticated public article
 browser path, and database-only feed rebuild orchestration are executable.
@@ -45,11 +46,11 @@ The current and target contracts must not be confused:
 
 | Area | Executable now | Target contract and implementation gate |
 | --- | --- | --- |
-| Runtime | `RuntimeSupervisor` consumes the validated `RuntimePlan`, opens the shared PostgreSQL pool, applies SQLx migrations, binds the selected API, and supervises database-only feed-rebuild loops with graceful shutdown; worker dispatch remains limited to executable feed-rebuild jobs | Scheduler composition is fail-closed until concrete authenticated acquisition and browser dependencies are composed; administrative routes, browser health, and readiness diagnostics remain future work |
-| Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, and shutdown-aware heartbeat/outcome execution | Synchronization-specific dispatch and removal of compatibility `now` parameters remain future work |
+| Runtime | `RuntimeSupervisor` consumes the validated `RuntimePlan`, opens the shared PostgreSQL pool, applies SQLx migrations, binds the selected API, and supervises scheduler, feed-rebuild, and configuration-gated authenticated source-sync loops with graceful shutdown | Login/credential refresh, administrative routes, browser health, and readiness diagnostics remain future work |
+| Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, type-aware feed-rebuild/source-sync dispatch, and shutdown-aware heartbeat/outcome execution | Article-backfill and credential-refresh dispatch, plus removal of compatibility `now` parameters, remain future work |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, public RSS URL, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint; the supervisor consumes the parsed role and policy values | Complete administrative configuration still needs an executable application boundary |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, and feed-build leases | Credential records and remaining transaction-scoped views are design-only |
-| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, current/legacy WeRead article-list response parsing, source-sync finalization through an injected acquisition port, database-only feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, and public tokenized feed route | Authenticated protocol transport, concrete runtime source-sync composition, source-sync/application HTTP handlers, administrative routes, and health/readiness wiring remain future work |
+| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, authenticated WeRead article-list transport through a pre-authenticated profile and account lease, source-sync finalization through an injected acquisition port, feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, and public tokenized feed route | Login/QR exchange, credential refresh, source-sync/application HTTP handlers, administrative routes, and health/readiness wiring remain future work |
 | Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, and external-image reporting through ArchiveService | Asset persistence and URL rewriting remain future work |
 
 Environment variables in this document are parsed into `AppConfig`, and
@@ -63,7 +64,8 @@ permitted.
 
 Application-owned prefixes are `APP_`, `HTTP_`, `WORKER_`, `JOB_`, `ACCOUNT_`,
 `SOURCE_`, `RSS_`, `FEED_`, `PACING_`, `SCROLL_`, `ASSET_`, `ADMIN_`, `SESSION_`,
-`CREDENTIAL_`, `QUIET_`, `WEBDRIVER_`, `BROWSER_`, and `DATABASE_POOL_`, plus
+`CREDENTIAL_`, `QUIET_`, `WEBDRIVER_`, `BROWSER_`, `WEREAD_`, and
+`DATABASE_POOL_`, plus
 the exact `DATABASE_URL`.
 The legacy `ARCHIVE_` names remain recognized only for a deprecation error or
 explicit compatibility migration. Unknown variables under an owned prefix are
@@ -72,10 +74,11 @@ startup errors; unrelated environment names are ignored.
 ## Runtime shape
 
 The first runtime is a modular monolith, but each process has an explicit role
-set: `api`, `scheduler`, `worker`, or `all`. The currently executable supervisor
-accepts `api`, `worker`, and `api,worker`; it rejects `scheduler` and `all` until
-concrete source-sync acquisition dependencies are composed, preventing the
-scheduler from creating work no worker can execute. Kubernetes may scale API
+set: `api`, `scheduler`, `worker`, or `all`. The supervisor accepts scheduler
+and source-sync worker execution when the authenticated profile and account
+settings are configured together; otherwise scheduler startup fails closed and
+workers remain feed-rebuild-only, preventing the scheduler from creating work
+no worker can execute. Kubernetes may scale API
 and worker processes independently
 so RSS traffic does not implicitly increase upstream-fetch concurrency. The
 current feed-rebuild worker is database-only; a browser sidecar becomes
@@ -436,6 +439,28 @@ migration set, so connection, CPU, and I/O capacity still limit useful
 parallelism. The ignored real-browser test remains a separately controlled
 WebDriver test and is not part of the normal nextest run.
 
+Mutation testing is also part of the validation workflow for behavior-heavy
+application code. Install `cargo-mutants` once, then use nextest as its test
+runner. The focused command below checks the browser-backed source-sync bridge
+without requiring an external database:
+
+```sh
+cargo install cargo-mutants --locked
+cargo mutants --test-tool nextest --jobs 4 --timeout 180 \
+  --file src/application/source_sync_acquirer.rs -- --lib
+```
+
+`cargo-mutants` runs a baseline before applying mutations and reports caught,
+missed, timed-out, and unviable mutations. A mutation-testing check is
+successful only when there are no missed mutations; unviable mutations are
+compiler-invalid variants and should be reviewed if their count changes.
+Keep mutation-process concurrency lower than the `cargo nextest -j 16`
+database-test setting because each mutation is a separate build/test process.
+For repository or other database-backed mutations, provide the same external
+administrative `DATABASE_URL` used by the SQLx tests and omit `-- --lib` so
+the relevant integration tests are included. Do not put private connection
+details in tracked files.
+
 `0001_jobs.sql` is part of the embedded migration history and remains immutable
 after publication. It contains the corrected `deferred`, `claim_count`, and
 `failure_count` model, with active indexes that include `deferred`. No release
@@ -772,7 +797,8 @@ DATABASE_URL
 DATABASE_POOL_MIN_CONNECTIONS / DATABASE_POOL_MAX_CONNECTIONS
 WEBDRIVER_URL / BROWSER_ENGINE / WORKER_CONCURRENCY
 BROWSER_USER_AGENT / BROWSER_LOCALE / BROWSER_VIEWPORT_WIDTH /
-BROWSER_VIEWPORT_HEIGHT / BROWSER_EXTRA_ARGS
+BROWSER_VIEWPORT_HEIGHT / BROWSER_EXTRA_ARGS /
+BROWSER_AUTHENTICATED_PROFILE / WEREAD_ACCOUNT_ID / WEREAD_ARTICLE_LIST_URL
 APP_INSTANCE_ID / HTTP_BIND / HTTP_PORT
 APP_ROLES
 APP_TIMEZONE / QUIET_HOURS_START / QUIET_HOURS_END
@@ -822,6 +848,17 @@ headless, or profile settings, including Chromium `--user-data-dir` and
 Firefox `-profile`; public sessions therefore cannot opt into a persistent
 credential-bearing browser profile through this setting.
 
+`BROWSER_AUTHENTICATED_PROFILE` and `WEREAD_ACCOUNT_ID` are optional but must
+be supplied together to compose authenticated source synchronization. The
+profile is pre-authenticated and is used only by the WeRead article-list
+adapter. `WEREAD_ARTICLE_LIST_URL` defaults to
+`https://i.weread.qq.com/web/mp/articles` and is accepted only as that exact
+HTTPS endpoint without credentials, fragments, or a non-default port. Runtime
+source-sync listing holds the account lease through its authenticated request,
+applies the shared request pacing policy, then releases it before public article
+fetching. Login, QR exchange, and credential refresh are intentionally not
+implemented in this first executable slice.
+
 ### Reference: `we-mp-rss` browser anti-detection approach
 
 The upstream `we-mp-rss` implementation is recorded here as a research
@@ -843,8 +880,9 @@ arguments. It intentionally does not inject that JavaScript or claim to hide
 continue to classify verification pages as a terminal upstream result.
 
 `APP_ROLES` is a validated set containing `api`, `scheduler`, and/or `worker`;
-`all` expands to all three, but the current supervisor rejects `scheduler` and
-`all` until concrete source-sync acquisition is composed. Worker concurrency is
+`all` expands to all three. Scheduler and source-sync worker startup require
+the authenticated profile/account pair; without it, scheduler startup is
+rejected and workers claim feed-rebuild jobs only. Worker concurrency is
 configured independently from API replica count. `RSS_FEED_URL` is an optional
 validated public HTTP(S) URL for generated RSS channel links and is required
 when the worker role is enabled. `ASSET_ARCHIVE_BACKEND` is the enum `disabled | local | s3`
@@ -983,17 +1021,17 @@ than add more empty module shells. Work proceeds in this order:
    `FeedRebuildJobHandler` already maps pre-publication rebuild failures to
    explicit worker outcomes.
 4. Build role-aware runtime composition and integrate the worker loop and
-   heartbeat cancellation. The current supervisor covers the API and
-   database-only feed-rebuild worker; scheduler startup remains gated until
-   concrete authenticated/source-browser dependencies are composed, and
-   degraded browser health behavior remains gated on that future worker path.
+   heartbeat cancellation. The supervisor now covers the API, scheduler,
+   database-only feed-rebuild, and configuration-gated authenticated
+   source-sync worker paths. Degraded browser health behavior remains gated on
+   the future readiness boundary.
 5. Complete the acquisition slice with fresh-profile creation and browser
    health checks behind the now-executable verified-URL, Thirtyfour,
    browser-capability, public pacing/scroll, and expected-timezone ports. Public
    identity resolution, navigation, redirect rejection, common article
-   extraction, and bounded
-   public-page pacing/scroll execution are already executable. Authenticated
-   protocol pacing hooks remain part of the WeRead adapter work.
+   extraction, and bounded public-page pacing/scroll execution are already
+   executable. Authenticated request pacing is also wired through the shared
+   WeRead/article-page controller.
 6. Implement synchronization, RSS publication, and HTTP/UI boundaries, followed
    by multi-replica fencing, DST, redirect-isolation, cache-stampede, and
    end-to-end tests.
@@ -1071,21 +1109,22 @@ That repository samples PostgreSQL time and applies the policy inside its
 transaction. `Scheduler::run_until_shutdown` owns polling, shutdown, and
 transient-error backoff around this boundary; runtime composition still owns
 role selection and metrics. It must call this boundary rather than reimplement
-source selection. `RuntimeSupervisor` does not compose this role until
-concrete authenticated acquisition and browser dependencies are available,
-because the current worker dispatch only claims database-only `feed_rebuild`
-jobs.
+source selection. `RuntimeSupervisor` composes the scheduler only when the
+authenticated source-sync adapter is configured, and dispatches feed-rebuild
+and source-sync jobs through one type-aware worker handler.
 
 The remaining tree intentionally contains no administrative route handlers,
-source HTTP orchestration, credential persistence, or concrete source-sync
-acquisition/runtime composition. Credential persistence, binary asset
+source HTTP orchestration, login/credential persistence, or credential
+refresh. Concrete source-sync acquisition/runtime composition is executable
+from a pre-authenticated browser profile. Binary asset
 persistence, and URL rewriting remain documentation-only; the pure
 archive sanitizer and `ArchiveService` are executable. Acquisition now
 contains executable identity resolution, capability/session ports, local
 capacity/lease ownership, public WebDriver navigation, common article
 extraction, bounded public-page pacing/scroll execution, expected
 browser-timezone validation, and pure current/legacy WeRead article-list
-response parsing; authenticated transport, authenticated pacing hooks, and
+response parsing, authenticated transport, account leasing, authenticated
+request pacing, and public article handoff are executable; login/refresh and
 browser health remain future work.
 `SourceService` implements source create/read, operator enable/gate changes,
 and the initial-job slice described above. `JobService` implements queue
@@ -1097,12 +1136,12 @@ backoff, and graceful shutdown between passes. Article and sync-run persistence
 and `FeedService` implement the database/cache boundaries described above.
 `SyncService` implements the pure acquisition-result merge, archive
 normalization, and typed failure classification used by the executable
-injected-port source-sync handler in
-`src/application/source_sync_handler.rs`. That handler allocates observation
+source-sync handler in `src/application/source_sync_handler.rs` and its
+browser-backed runtime acquirer. That handler allocates observation
 versions before public-page acquisition and commits article upserts, source
 scheduling/gates, sync-run completion, optional feed-rebuild enqueueing, and
-fenced job outcomes through one `UnitOfWork`. Transport, account-session
-ownership, and concrete runtime composition remain future work. A valid public
+fenced job outcomes through one `UnitOfWork`. Login/refresh and credential
+persistence remain future work. A valid public
 page may omit its publication timestamp;
 the service prefers the page value, then the authenticated list value, and
 rejects the observation only when both are absent. Malformed WeRead article

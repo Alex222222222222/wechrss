@@ -18,6 +18,8 @@
 //! WEBDRIVER_URL / BROWSER_ENGINE / WORKER_CONCURRENCY
 //! BROWSER_USER_AGENT / BROWSER_LOCALE / BROWSER_VIEWPORT_WIDTH /
 //! BROWSER_VIEWPORT_HEIGHT / BROWSER_EXTRA_ARGS
+//! BROWSER_AUTHENTICATED_PROFILE / WEREAD_ACCOUNT_ID /
+//! WEREAD_ARTICLE_LIST_URL
 //! APP_INSTANCE_ID / HTTP_BIND / HTTP_PORT / APP_ROLES
 //! APP_TIMEZONE / QUIET_HOURS_START / QUIET_HOURS_END
 //! JOB_POLL_SECONDS / JOB_LEASE_SECONDS / JOB_HEARTBEAT_SECONDS /
@@ -68,6 +70,7 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
+use crate::domain::credentials::WeReadAccountId;
 use crate::domain::pacing::{
     DelayDistribution, PacingError, PacingPolicy, QuietHours, MAX_SCROLL_PIXELS, MAX_SCROLL_STEPS,
 };
@@ -96,6 +99,9 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "BROWSER_VIEWPORT_WIDTH",
     "BROWSER_VIEWPORT_HEIGHT",
     "BROWSER_EXTRA_ARGS",
+    "BROWSER_AUTHENTICATED_PROFILE",
+    "WEREAD_ACCOUNT_ID",
+    "WEREAD_ARTICLE_LIST_URL",
     "WORKER_CONCURRENCY",
     "APP_INSTANCE_ID",
     "HTTP_BIND",
@@ -167,6 +173,7 @@ const APPLICATION_ENVIRONMENT_PREFIXES: &[&str] = &[
     "QUIET_",
     "WEBDRIVER_",
     "BROWSER_",
+    "WEREAD_",
     "DATABASE_POOL_",
 ];
 
@@ -360,6 +367,12 @@ pub struct AppConfig {
     /// token. These are operator-controlled and are applied only to the
     /// selected WebDriver browser.
     pub browser_extra_args: Vec<String>,
+    /// Optional pre-authenticated browser profile used only for WeRead.
+    pub browser_authenticated_profile: Option<String>,
+    /// Stable WeRead account identity used by sources without an override.
+    pub weread_account_id: Option<WeReadAccountId>,
+    /// HTTPS endpoint used by the authenticated WeRead article-list adapter.
+    pub weread_article_list_url: Url,
     /// Stable identity used in PostgreSQL job leases.
     pub instance_id: String,
     /// HTTP bind address or hostname.
@@ -548,6 +561,18 @@ impl AppConfig {
             "BROWSER_VIEWPORT_HEIGHT",
         )?;
         let browser_extra_args = parse_browser_extra_args(raw.browser_extra_args)?;
+        let browser_authenticated_profile = parse_optional_profile_path(
+            raw.browser_authenticated_profile,
+            "BROWSER_AUTHENTICATED_PROFILE",
+        )?;
+        let weread_account_id = parse_optional_weread_account_id(raw.weread_account_id)?;
+        if browser_authenticated_profile.is_some() != weread_account_id.is_some() {
+            return Err(ConfigError::InvalidValue {
+                variable: "WEREAD_ACCOUNT_ID",
+                reason: "must be set together with BROWSER_AUTHENTICATED_PROFILE",
+            });
+        }
+        let weread_article_list_url = parse_weread_article_list_url(raw.weread_article_list_url)?;
         let http_port = raw.http_port.unwrap_or(8080);
         if http_port == 0 {
             return Err(ConfigError::InvalidValue {
@@ -716,6 +741,9 @@ impl AppConfig {
             browser_viewport_width,
             browser_viewport_height,
             browser_extra_args,
+            browser_authenticated_profile,
+            weread_account_id,
+            weread_article_list_url,
             instance_id: raw
                 .app_instance_id
                 .filter(|value| !value.trim().is_empty())
@@ -747,6 +775,12 @@ impl AppConfig {
             ),
         })
     }
+
+    /// Returns whether authenticated WeRead source synchronization can be
+    /// constructed by the runtime.
+    pub const fn weread_source_sync_configured(&self) -> bool {
+        self.browser_authenticated_profile.is_some() && self.weread_account_id.is_some()
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -761,6 +795,9 @@ struct RawConfig {
     browser_viewport_width: Option<u32>,
     browser_viewport_height: Option<u32>,
     browser_extra_args: Option<String>,
+    browser_authenticated_profile: Option<String>,
+    weread_account_id: Option<String>,
+    weread_article_list_url: Option<String>,
     worker_concurrency: Option<u32>,
     app_instance_id: Option<String>,
     http_bind: Option<String>,
@@ -902,6 +939,70 @@ fn parse_browser_extra_args(value: Option<String>) -> Result<Vec<String>, Config
         });
     }
     Ok(arguments)
+}
+
+fn parse_optional_profile_path(
+    value: Option<String>,
+    variable: &'static str,
+) -> Result<Option<String>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(ConfigError::InvalidValue {
+            variable,
+            reason: "must be non-empty and free of control characters",
+        });
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn parse_optional_weread_account_id(
+    value: Option<String>,
+) -> Result<Option<WeReadAccountId>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let account_id = value
+        .trim()
+        .parse::<Uuid>()
+        .map_err(|_| ConfigError::InvalidValue {
+            variable: "WEREAD_ACCOUNT_ID",
+            reason: "expected a valid UUID",
+        })?;
+    if account_id.is_nil() {
+        return Err(ConfigError::InvalidValue {
+            variable: "WEREAD_ACCOUNT_ID",
+            reason: "must not be the nil UUID",
+        });
+    }
+    Ok(Some(WeReadAccountId::from_uuid(account_id)))
+}
+
+fn parse_weread_article_list_url(value: Option<String>) -> Result<Url, ConfigError> {
+    let value = value.unwrap_or_else(|| "https://i.weread.qq.com/web/mp/articles".to_owned());
+    let url = value
+        .trim()
+        .parse::<Url>()
+        .map_err(|_| ConfigError::InvalidValue {
+            variable: "WEREAD_ARTICLE_LIST_URL",
+            reason: "expected a valid HTTPS WeRead article-list URL",
+        })?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("i.weread.qq.com")
+        || url.path() != "/web/mp/articles"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.port().is_some_and(|port| port != 443)
+    {
+        return Err(ConfigError::InvalidValue {
+            variable: "WEREAD_ARTICLE_LIST_URL",
+            reason: "must use HTTPS i.weread.qq.com/web/mp/articles without credentials, fragments, or a non-default port",
+        });
+    }
+    Ok(url)
 }
 
 fn browser_argument_name(argument: &str) -> Option<&str> {
@@ -1246,6 +1347,12 @@ mod tests {
         assert_eq!(config.browser_viewport_width, 1_280);
         assert_eq!(config.browser_viewport_height, 2_000);
         assert!(config.browser_extra_args.is_empty());
+        assert!(config.browser_authenticated_profile.is_none());
+        assert!(config.weread_account_id.is_none());
+        assert_eq!(
+            config.weread_article_list_url.as_str(),
+            "https://i.weread.qq.com/web/mp/articles"
+        );
         assert!(config.roles.contains(AppRole::Api));
         assert!(!config.roles.contains(AppRole::Scheduler));
         assert!(!config.roles.contains(AppRole::Worker));
@@ -1907,6 +2014,94 @@ mod tests {
                     Err(ConfigError::InvalidValue { variable: actual, .. }) if actual == variable
                 ),
                 "{variable}={value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_complete_authenticated_weread_settings() {
+        let environment = valid_environment()
+            .into_iter()
+            .chain([
+                (
+                    "BROWSER_AUTHENTICATED_PROFILE".to_owned(),
+                    "/var/lib/wechrss/weread-profile".to_owned(),
+                ),
+                (
+                    "WEREAD_ACCOUNT_ID".to_owned(),
+                    "00000000-0000-0000-0000-000000000001".to_owned(),
+                ),
+                (
+                    "WEREAD_ARTICLE_LIST_URL".to_owned(),
+                    "https://i.weread.qq.com/web/mp/articles?offset=0".to_owned(),
+                ),
+            ])
+            .collect::<Vec<_>>();
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        assert!(config.weread_source_sync_configured());
+        assert_eq!(
+            config.browser_authenticated_profile.as_deref(),
+            Some("/var/lib/wechrss/weread-profile")
+        );
+        assert_eq!(
+            config.weread_account_id.unwrap().as_uuid().to_string(),
+            "00000000-0000-0000-0000-000000000001"
+        );
+        assert_eq!(
+            config.weread_article_list_url.as_str(),
+            "https://i.weread.qq.com/web/mp/articles?offset=0"
+        );
+    }
+
+    #[test]
+    fn rejects_partial_or_unsafe_authenticated_weread_settings() {
+        let profile_only = replace_environment(
+            valid_environment(),
+            "BROWSER_AUTHENTICATED_PROFILE",
+            "/var/lib/wechrss/profile",
+        );
+        assert!(matches!(
+            AppConfig::from_env_iter(profile_only),
+            Err(ConfigError::InvalidValue {
+                variable: "WEREAD_ACCOUNT_ID",
+                ..
+            })
+        ));
+
+        let account_only = replace_environment(
+            valid_environment(),
+            "WEREAD_ACCOUNT_ID",
+            "00000000-0000-0000-0000-000000000001",
+        );
+        assert!(matches!(
+            AppConfig::from_env_iter(account_only),
+            Err(ConfigError::InvalidValue {
+                variable: "WEREAD_ACCOUNT_ID",
+                ..
+            })
+        ));
+
+        for endpoint in [
+            "http://i.weread.qq.com/web/mp/articles",
+            "https://example.com/web/mp/articles",
+            "https://i.weread.qq.com.evil.example/web/mp/articles",
+            "https://i.weread.qq.com/web/mp/other",
+            "https://i.weread.qq.com:8443/web/mp/articles",
+            "https://user:password@i.weread.qq.com/web/mp/articles",
+            "https://i.weread.qq.com/web/mp/articles#fragment",
+        ] {
+            let environment =
+                replace_environment(valid_environment(), "WEREAD_ARTICLE_LIST_URL", endpoint);
+            assert!(
+                matches!(
+                    AppConfig::from_env_iter(environment),
+                    Err(ConfigError::InvalidValue {
+                        variable: "WEREAD_ARTICLE_LIST_URL",
+                        ..
+                    })
+                ),
+                "unsafe endpoint {endpoint:?} should be rejected"
             );
         }
     }

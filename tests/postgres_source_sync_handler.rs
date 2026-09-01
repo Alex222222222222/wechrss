@@ -20,6 +20,7 @@ use wechrss::{
     },
     domain::{
         job::{JobType, NewJob},
+        pacing::QuietHours,
         source::{NewSource, SchedulingGate, SourceId, VerifiedWechatArticleUrl},
         sync::SyncOutcome,
     },
@@ -164,6 +165,58 @@ async fn source_sync_commits_article_run_schedule_and_feed_rebuild(pool: PgPool)
     assert_eq!(run.get::<i64, _>("articles_failed"), 0);
     assert_eq!(run.get::<i64, _>("archived_articles"), 1);
     assert_eq!(run.get::<i64, _>("archived_assets"), 0);
+}
+
+#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+async fn source_sync_defers_before_upstream_work_during_quiet_hours(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_id).await;
+    let job_id = enqueue_source_sync(&pool, source_id).await;
+    let lease = claim(&pool, Utc.timestamp_opt(1_700_000_000, 0).single().unwrap()).await;
+
+    let database_now: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (quiet_start, _) = database_now
+        .time()
+        .overflowing_sub_signed(Duration::hours(1));
+    let (quiet_end, _) = database_now
+        .time()
+        .overflowing_add_signed(Duration::hours(1));
+    let quiet_hours = QuietHours::new(chrono_tz::UTC, quiet_start, quiet_end).unwrap();
+    let handler = handler(
+        pool.clone(),
+        FakeAcquirer {
+            authentication_error: true,
+            ..FakeAcquirer::successful(
+                reference("quiet", "https://mp.weixin.qq.com/s/quiet"),
+                page("https://mp.weixin.qq.com/s/quiet", "Should not fetch"),
+            )
+        },
+        SourceSyncJobHandlerConfig::new(Duration::minutes(1), Duration::minutes(5))
+            .unwrap()
+            .with_quiet_hours(Some(quiet_hours)),
+    );
+
+    let outcome = handler
+        .execute(
+            &lease,
+            Utc.timestamp_opt(1_700_000_000, 0).single().unwrap(),
+        )
+        .await;
+    assert!(matches!(outcome, JobExecution::Deferred { .. }));
+
+    let run_count: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_runs WHERE job_id = $1")
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        run_count, 0,
+        "quiet-hours deferral must precede run creation"
+    );
 }
 
 #[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]

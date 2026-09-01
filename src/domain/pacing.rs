@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, NaiveTime, Utc};
+use chrono::{DateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
@@ -244,6 +244,31 @@ impl QuietHours {
             local_time >= self.start || local_time < self.end
         }
     }
+
+    /// Returns the next instant at which upstream work may resume.
+    ///
+    /// `None` is reserved for a timezone transition where the local end time
+    /// does not map to a unique instant; callers can use a bounded retry in
+    /// that rare case instead of guessing across a DST gap.
+    pub fn next_allowed_at(&self, instant: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if !self.is_quiet_at(instant) {
+            return Some(instant);
+        }
+        let local = instant.with_timezone(&self.timezone);
+        let end_date = if self.start < self.end || local.time() < self.end {
+            local.date_naive()
+        } else {
+            local.date_naive().succ_opt()?
+        };
+        let end_local = end_date.and_time(self.end);
+        match self.timezone.from_local_datetime(&end_local) {
+            chrono::LocalResult::Single(end) => Some(end.with_timezone(&Utc)),
+            chrono::LocalResult::Ambiguous(first, second) => {
+                Some(first.max(second).with_timezone(&Utc))
+            }
+            chrono::LocalResult::None => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +429,35 @@ mod tests {
         assert!(quiet.is_quiet_at(utc("2026-08-28T06:59:59Z")));
         assert!(!quiet.is_quiet_at(utc("2026-08-28T07:00:00Z")));
         assert!(!quiet.is_quiet_at(utc("2026-08-27T12:00:00Z")));
+    }
+
+    #[test]
+    fn next_allowed_at_returns_the_exclusive_end_boundary() {
+        let same_day = QuietHours::new(
+            chrono_tz::UTC,
+            NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            same_day.next_allowed_at(utc("2026-08-27T12:00:00Z")),
+            Some(utc("2026-08-27T17:00:00Z"))
+        );
+
+        let overnight = QuietHours::new(
+            chrono_tz::UTC,
+            NaiveTime::from_hms_opt(23, 0, 0).unwrap(),
+            NaiveTime::from_hms_opt(7, 0, 0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            overnight.next_allowed_at(utc("2026-08-28T02:00:00Z")),
+            Some(utc("2026-08-28T07:00:00Z"))
+        );
+        assert_eq!(
+            overnight.next_allowed_at(utc("2026-08-27T12:00:00Z")),
+            Some(utc("2026-08-27T12:00:00Z"))
+        );
     }
 
     #[test]

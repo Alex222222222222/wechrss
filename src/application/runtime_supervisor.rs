@@ -3,12 +3,11 @@
 //! [`super::runtime::RuntimePlan`] validates role selection without opening
 //! resources. This module is the next boundary: it opens the shared
 //! PostgreSQL pool, builds only the selected adapters, and supervises the API,
-//! scheduler, and currently executable feed-rebuild worker loops.
+//! scheduler, and executable feed-rebuild/source-sync worker loops.
 //!
-//! Source synchronization, authenticated WeRead work, browser health, and
-//! administrative routes are intentionally not constructed here until their
-//! handlers and readiness contracts are complete. A worker therefore claims
-//! only [`super::runtime::EXECUTABLE_WORKER_JOB_TYPES`].
+//! Authenticated WeRead work is constructed only when a pre-authenticated
+//! browser profile and account identity are configured. Login, credential
+//! refresh, and administrative routes remain intentionally fail-closed.
 
 use std::time::Duration as StdDuration;
 
@@ -19,10 +18,19 @@ use thiserror::Error;
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
 use crate::{
+    acquisition::{
+        article_page::WebDriverArticlePageFetcher,
+        browser_pool::BrowserPool,
+        pacing::PacingController,
+        webdriver::{BrowserProfile, BrowserViewport, WebDriverFactory},
+        weread::{BrowserWeReadAdapter, WeReadEndpointError},
+    },
     config::{AppConfig, AppRole},
+    domain::job::JobType,
     persistence::{
         postgres::{connect_pool, migrate},
         repositories::{
+            account_lease_repository::PostgresAccountLeaseRepository,
             article_repository::PostgresArticleRepository,
             feed_cache_repository::{
                 PostgresFeedBuildLeaseRepository, PostgresFeedCacheRepository,
@@ -49,18 +57,79 @@ use super::{
     job_service::JobService,
     runtime::{RuntimeComponent, RuntimePlan, RuntimePlanError},
     scheduler::Scheduler,
-    worker::Worker,
+    source_sync_acquirer::{
+        BrowserSourceSyncAcquirer, BrowserSourceSyncAcquirerConfig,
+        BrowserSourceSyncAcquirerConfigError, BrowserSourceSyncAcquirerDependencies,
+    },
+    source_sync_handler::{
+        SourceSyncJobHandler, SourceSyncJobHandlerConfig, SourceSyncJobHandlerConfigError,
+        SourceSyncJobHandlerDependencies,
+    },
+    sync_service::SyncService,
+    worker::{JobHandler, Worker},
 };
 
-type FeedRebuildWorker = Worker<
+type FeedRebuildHandler = FeedRebuildJobHandler<
+    PostgresSourceRepository,
+    PostgresArticleRepository,
+    PostgresFeedBuildLeaseRepository,
+    UnitOfWorkFactory,
+>;
+
+type SourceSyncHandler = SourceSyncJobHandler<
+    PostgresSourceRepository,
+    PostgresArticleRepository,
+    BrowserSourceSyncAcquirer<
+        PostgresAccountLeaseRepository,
+        BrowserWeReadAdapter,
+        WebDriverArticlePageFetcher,
+    >,
+>;
+
+pub struct RuntimeJobHandler<F, S> {
+    feed_rebuild: F,
+    source_sync: Option<S>,
+}
+
+impl<F, S> RuntimeJobHandler<F, S> {
+    /// Creates a type-aware runtime dispatcher.
+    pub fn new(feed_rebuild: F, source_sync: Option<S>) -> Self {
+        Self {
+            feed_rebuild,
+            source_sync,
+        }
+    }
+}
+
+impl<F, S> JobHandler for RuntimeJobHandler<F, S>
+where
+    F: JobHandler,
+    S: JobHandler,
+{
+    async fn execute(
+        &self,
+        lease: &crate::persistence::repositories::job_repository::JobLease,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> crate::application::worker::JobExecution {
+        match lease.job.job_type() {
+            JobType::FeedRebuild => self.feed_rebuild.execute(lease, now).await,
+            JobType::SourceSync => match &self.source_sync {
+                Some(handler) => handler.execute(lease, now).await,
+                None => crate::application::worker::JobExecution::Failed {
+                    error: "source-sync handler is not configured".to_owned(),
+                },
+            },
+            _ => crate::application::worker::JobExecution::Failed {
+                error: "runtime worker received an unsupported job type".to_owned(),
+            },
+        }
+    }
+}
+
+type RuntimeWorker = Worker<
     PostgresJobRepository,
     UnitOfWorkFactory,
-    FeedRebuildJobHandler<
-        PostgresSourceRepository,
-        PostgresArticleRepository,
-        PostgresFeedBuildLeaseRepository,
-        UnitOfWorkFactory,
-    >,
+    RuntimeJobHandler<FeedRebuildHandler, SourceSyncHandler>,
 >;
 
 /// A runtime supervisor with validated role selection and an open database
@@ -70,6 +139,7 @@ pub struct RuntimeSupervisor {
     config: AppConfig,
     plan: RuntimePlan,
     pool: PgPool,
+    browser_pool: Option<BrowserPool>,
 }
 
 impl RuntimeSupervisor {
@@ -83,7 +153,13 @@ impl RuntimeSupervisor {
         migrate(&pool)
             .await
             .map_err(RuntimeSupervisorError::Migration)?;
-        Ok(Self { config, plan, pool })
+        let browser_pool = browser_pool_for_plan(&plan)?;
+        Ok(Self {
+            config,
+            plan,
+            pool,
+            browser_pool,
+        })
     }
 
     /// Creates a supervisor from an already-open pool.
@@ -92,13 +168,19 @@ impl RuntimeSupervisor {
     /// migrations as a separately authorized step.
     pub fn new(config: AppConfig, pool: PgPool) -> Result<Self, RuntimeSupervisorError> {
         let plan = Self::validated_plan(&config)?;
-        Ok(Self { config, plan, pool })
+        let browser_pool = browser_pool_for_plan(&plan)?;
+        Ok(Self {
+            config,
+            plan,
+            pool,
+            browser_pool,
+        })
     }
 
     fn validated_plan(config: &AppConfig) -> Result<RuntimePlan, RuntimeSupervisorError> {
         let plan = RuntimePlan::from_config(config).map_err(RuntimeSupervisorError::Plan)?;
-        if plan.component(AppRole::Scheduler).is_some() {
-            return Err(RuntimeSupervisorError::SchedulerNotImplemented);
+        if plan.component(AppRole::Scheduler).is_some() && !config.weread_source_sync_configured() {
+            return Err(RuntimeSupervisorError::SourceSyncNotConfigured);
         }
         if matches!(
             plan.component(AppRole::Api),
@@ -268,7 +350,7 @@ impl RuntimeSupervisor {
         &self,
         plan: &super::runtime::WorkerRuntimePlan,
         worker_index: u32,
-    ) -> Result<FeedRebuildWorker, RuntimeSupervisorError> {
+    ) -> Result<RuntimeWorker, RuntimeSupervisorError> {
         let lease_for = chrono_duration(self.config.feed_build_lease, "FEED_BUILD_LEASE_SECONDS")?;
         let cache_ttl = chrono_duration(self.config.rss_cache_ttl, "RSS_CACHE_TTL_SECONDS")?;
         let retry_after = chrono_duration(self.config.job_poll_interval, "JOB_POLL_SECONDS")?;
@@ -287,7 +369,12 @@ impl RuntimeSupervisor {
         .map_err(RuntimeSupervisorError::FeedRebuild)?;
         let handler_config = FeedRebuildJobHandlerConfig::new(retry_after)
             .map_err(RuntimeSupervisorError::FeedRebuildHandlerConfig)?;
-        let handler = FeedRebuildJobHandler::new(rebuild_service, handler_config);
+        let feed_handler = FeedRebuildJobHandler::new(rebuild_service, handler_config);
+        let source_sync = plan
+            .source_sync_enabled()
+            .then(|| self.build_source_sync_handler(worker_index))
+            .transpose()?;
+        let handler = RuntimeJobHandler::new(feed_handler, source_sync);
         Worker::new(
             JobService::new(
                 PostgresJobRepository::new(self.pool.clone()),
@@ -298,6 +385,82 @@ impl RuntimeSupervisor {
             plan.worker_config().clone(),
         )
         .map_err(RuntimeSupervisorError::WorkerConfig)
+    }
+
+    fn build_source_sync_handler(
+        &self,
+        worker_index: u32,
+    ) -> Result<SourceSyncHandler, RuntimeSupervisorError> {
+        let account_id = self
+            .config
+            .weread_account_id
+            .ok_or(RuntimeSupervisorError::SourceSyncNotConfigured)?;
+        let profile_path = self
+            .config
+            .browser_authenticated_profile
+            .as_deref()
+            .ok_or(RuntimeSupervisorError::SourceSyncNotConfigured)?;
+        let browser_profile = BrowserProfile {
+            user_agent: self.config.browser_user_agent.clone(),
+            viewport: BrowserViewport::new(
+                self.config.browser_viewport_width,
+                self.config.browser_viewport_height,
+            ),
+            locale: self.config.browser_locale.clone(),
+            expected_timezone: Some(self.config.timezone),
+            extra_args: self.config.browser_extra_args.clone(),
+        };
+        let webdriver = WebDriverFactory::new(
+            self.config.webdriver_url.clone(),
+            self.config.browser_engine,
+        )
+        .with_profile(browser_profile)
+        .with_authenticated_profile_path(profile_path);
+        let acquisition_config = BrowserSourceSyncAcquirerConfig::new(
+            account_id,
+            format!("{}-source-worker", self.config.instance_id),
+            chrono_duration(self.config.account_lease, "ACCOUNT_LEASE_SECONDS")?,
+            chrono_duration(self.config.account_heartbeat, "ACCOUNT_HEARTBEAT_SECONDS")?,
+        )
+        .map_err(RuntimeSupervisorError::SourceSyncAcquirerConfig)?;
+        let pacing = PacingController::from_entropy(self.config.pacing);
+        let weread = BrowserWeReadAdapter::new(self.config.weread_article_list_url.clone())
+            .map_err(RuntimeSupervisorError::WeReadEndpoint)?
+            .with_pacing(pacing.clone());
+        let acquirer = BrowserSourceSyncAcquirer::new(
+            BrowserSourceSyncAcquirerDependencies {
+                browser_pool: self
+                    .browser_pool
+                    .clone()
+                    .ok_or(RuntimeSupervisorError::SourceSyncNotConfigured)?,
+                webdriver,
+                account_leases: PostgresAccountLeaseRepository::new(self.pool.clone()),
+                weread,
+                article_pages: WebDriverArticlePageFetcher::new(self.config.timezone)
+                    .with_pacing(pacing),
+            },
+            acquisition_config,
+            worker_index,
+        );
+        let handler_config = SourceSyncJobHandlerConfig::new(
+            chrono_duration(self.config.job_poll_interval, "JOB_POLL_SECONDS")?,
+            chrono_duration(
+                self.config.source_failure_cooldown,
+                "SOURCE_FAILURE_COOLDOWN_SECONDS",
+            )?,
+        )
+        .map_err(RuntimeSupervisorError::SourceSyncHandlerConfig)?
+        .with_quiet_hours(self.config.quiet_hours);
+        Ok(SourceSyncJobHandler::new(
+            SourceSyncJobHandlerDependencies {
+                sources: PostgresSourceRepository::new(self.pool.clone()),
+                articles: PostgresArticleRepository::new(self.pool.clone()),
+                unit_of_work: UnitOfWorkFactory::new(self.pool.clone()),
+                acquirer,
+                sync_service: SyncService::new(),
+            },
+            handler_config,
+        ))
     }
 
     fn feed_rebuild_config(
@@ -327,6 +490,17 @@ async fn bind_listener(
     TcpListener::bind(&address)
         .await
         .map_err(|error| RuntimeSupervisorError::HttpBind { address, error })
+}
+
+fn browser_pool_for_plan(
+    plan: &RuntimePlan,
+) -> Result<Option<BrowserPool>, RuntimeSupervisorError> {
+    let Some(RuntimeComponent::Worker(worker)) = plan.component(AppRole::Worker) else {
+        return Ok(None);
+    };
+    BrowserPool::new(worker.concurrency() as usize)
+        .map(Some)
+        .map_err(RuntimeSupervisorError::BrowserPool)
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
@@ -365,10 +539,10 @@ pub enum RuntimeSupervisorError {
     /// rather than silently ignoring an enabled setting.
     #[error("ADMIN_ENABLED is not supported until administrative routes are implemented")]
     AdminRoutesNotImplemented,
-    /// The scheduler currently creates source-sync jobs without concrete
-    /// authenticated acquisition dependencies in the runtime.
-    #[error("scheduler role is not supported until source-sync acquisition is composed")]
-    SchedulerNotImplemented,
+    /// Scheduler and source-sync workers require authenticated acquisition
+    /// settings so queued source work is executable.
+    #[error("authenticated WeRead source-sync settings are required for the scheduler role")]
+    SourceSyncNotConfigured,
     /// Feed workers must not publish a placeholder channel URL.
     #[error("RSS_FEED_URL is required when the worker role is enabled")]
     FeedUrlNotConfigured,
@@ -396,6 +570,18 @@ pub enum RuntimeSupervisorError {
     /// Feed rebuild service construction failed.
     #[error(transparent)]
     FeedRebuild(#[from] super::feed_rebuild_service::FeedRebuildError),
+    /// Browser-pool capacity could not be constructed.
+    #[error(transparent)]
+    BrowserPool(#[from] crate::acquisition::browser_pool::BrowserPoolError),
+    /// Source-sync account lease policy was invalid after configuration.
+    #[error(transparent)]
+    SourceSyncAcquirerConfig(#[from] BrowserSourceSyncAcquirerConfigError),
+    /// The authenticated WeRead endpoint violated its destination policy.
+    #[error(transparent)]
+    WeReadEndpoint(#[from] WeReadEndpointError),
+    /// Source-sync handler policy was invalid after configuration.
+    #[error(transparent)]
+    SourceSyncHandlerConfig(#[from] SourceSyncJobHandlerConfigError),
     /// Worker construction failed.
     #[error(transparent)]
     WorkerConfig(#[from] super::worker::WorkerConfigError),
@@ -456,6 +642,38 @@ mod tests {
         .expect("test configuration should be valid")
     }
 
+    fn authenticated_config(roles: &str) -> AppConfig {
+        AppConfig::from_env_iter([
+            (
+                "DATABASE_URL".to_owned(),
+                "postgres://user:pass@db/feed".to_owned(),
+            ),
+            (
+                "CREDENTIAL_ENCRYPTION_KEY".to_owned(),
+                "runtime-test-key".to_owned(),
+            ),
+            ("APP_ROLES".to_owned(), roles.to_owned()),
+            (
+                "APP_INSTANCE_ID".to_owned(),
+                "runtime-supervisor-test".to_owned(),
+            ),
+            ("WORKER_CONCURRENCY".to_owned(), "2".to_owned()),
+            (
+                "RSS_FEED_URL".to_owned(),
+                "https://feeds.example.test/wechrss.xml".to_owned(),
+            ),
+            (
+                "BROWSER_AUTHENTICATED_PROFILE".to_owned(),
+                "/profiles/weread".to_owned(),
+            ),
+            (
+                "WEREAD_ACCOUNT_ID".to_owned(),
+                "00000000-0000-0000-0000-000000000001".to_owned(),
+            ),
+        ])
+        .expect("authenticated test configuration should be valid")
+    }
+
     fn lazy_pool() -> PgPool {
         PgPoolOptions::new()
             .connect_lazy("postgres://unused")
@@ -468,6 +686,17 @@ mod tests {
 
         assert!(supervisor.api_router().unwrap().is_some());
         assert!(supervisor.plan().component(AppRole::Worker).is_none());
+    }
+
+    #[tokio::test]
+    async fn non_worker_roles_do_not_require_browser_capacity() {
+        let mut config = config("api");
+        config.worker_concurrency = 0;
+
+        let supervisor = RuntimeSupervisor::new(config, lazy_pool())
+            .expect("API-only runtime should not construct a worker browser pool");
+
+        assert!(supervisor.browser_pool.is_none());
     }
 
     #[tokio::test]
@@ -487,15 +716,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_fails_closed_until_source_sync_acquisition_is_composed() {
+    async fn scheduler_requires_authenticated_source_sync_configuration() {
         assert!(matches!(
             RuntimeSupervisor::new(config("scheduler"), lazy_pool()),
-            Err(RuntimeSupervisorError::SchedulerNotImplemented)
+            Err(RuntimeSupervisorError::SourceSyncNotConfigured)
         ));
         assert!(matches!(
             RuntimeSupervisor::new(config("all"), lazy_pool()),
-            Err(RuntimeSupervisorError::SchedulerNotImplemented)
+            Err(RuntimeSupervisorError::SourceSyncNotConfigured)
         ));
+    }
+
+    #[tokio::test]
+    async fn scheduler_and_source_sync_worker_are_composed_when_configured() {
+        let supervisor = RuntimeSupervisor::new(authenticated_config("all"), lazy_pool())
+            .expect("authenticated roles should be accepted");
+        assert!(matches!(
+            supervisor.plan().component(AppRole::Scheduler),
+            Some(RuntimeComponent::Scheduler(_))
+        ));
+        let RuntimeComponent::Worker(plan) = supervisor
+            .plan()
+            .component(AppRole::Worker)
+            .expect("worker plan should exist")
+        else {
+            panic!("worker role should produce a worker plan")
+        };
+        assert!(plan.source_sync_enabled());
+        supervisor
+            .build_worker(plan, 0)
+            .expect("authenticated source-sync worker should be constructible");
     }
 
     #[tokio::test]

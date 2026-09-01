@@ -73,6 +73,7 @@ where
 {
     async fn list_articles(
         &self,
+        _book_id: &str,
         request: AuthenticatedRequest<'_, R>,
     ) -> Result<Vec<WeReadArticleReference>, WeReadAdapterError> {
         let _account_id = request.account_id();
@@ -154,7 +155,7 @@ async fn pool_serializes_account_sessions_and_releases_after_completion() {
         .await
         .expect("a live account should prepare a request");
     let entries = adapter
-        .list_articles(request)
+        .list_articles("book-1", request)
         .await
         .expect("the authenticated adapter should receive a lease proof");
     assert_eq!(entries[0].review_id, "review-1");

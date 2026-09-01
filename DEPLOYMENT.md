@@ -1,13 +1,11 @@
 # Browser Sidecar Deployment Notes
 
 > **Implementation status:** the Rust binary now loads environment-only
-> configuration, applies pending SQLx migrations, and composes the selected
-> API and database-only feed-rebuild worker roles. Scheduler startup is rejected
-> until concrete authenticated source acquisition and browser dependencies are
-> composed. The injected-port synchronization finalization handler is covered
-> by tests, but authenticated transport, administrative routes, and browser
-> health checks are still not executable, so deployments must not enable those
-> unfinished capabilities.
+> configuration, applies pending SQLx migrations, and composes the selected API,
+> scheduler, feed-rebuild, and authenticated source-sync worker roles. Source
+> synchronization is enabled only when a pre-authenticated browser profile and
+> a WeRead account ID are configured together. Login/QR exchange, credential
+> refresh, administrative routes, and browser health checks remain unfinished.
 
 When browser-backed source synchronization is enabled, its worker and browser
 sidecar must use the same IANA timezone for quiet-hours decisions and
@@ -44,14 +42,36 @@ environment source instead of maintaining separate values for the application
 and sidecar. Secrets such as database URLs and encryption keys belong in a
 Kubernetes Secret.
 
-The currently executable role sets are `APP_ROLES=api`, `worker`, or
-`api,worker`. `scheduler` and `all` fail startup until concrete source-sync
-acquisition is composed, because the current runtime worker cannot consume
-source-sync jobs.
+The API role is executable by itself. The scheduler role and source-sync worker
+dispatch require the authenticated settings below; without them, a worker
+remains feed-rebuild-only and scheduler startup fails closed rather than
+creating jobs that no worker can execute. `APP_ROLES=all` therefore requires
+the same settings.
 `RSS_FEED_URL` must be set to the public HTTP(S) URL that generated RSS
 channels should advertise. Browser-session capacity and worker replica count
 must be intentional; increasing API replicas for RSS traffic must not
 automatically increase upstream fetch concurrency.
+
+### Authenticated WeRead source synchronization
+
+Set these values together to enable source-sync acquisition:
+
+```text
+BROWSER_AUTHENTICATED_PROFILE=/path/visible-to-the-browser-sidecar
+WEREAD_ACCOUNT_ID=<stable-account-uuid>
+WEREAD_ARTICLE_LIST_URL=https://i.weread.qq.com/web/mp/articles
+```
+
+The profile must already contain an authorized WeRead session and must be
+mounted into the browser sidecar at the configured path. The runtime uses it
+only for the authenticated article-list request, holds a PostgreSQL account
+lease while that request is active, and releases the lease before opening a
+clean public session for article content. It does not perform login, persist
+credentials, or send the authenticated profile to public WeChat pages. The
+article-list URL is restricted by configuration validation to the exact HTTPS
+`i.weread.qq.com/web/mp/articles` endpoint without credentials, fragments, or a
+non-default port. If either of the first two values is missing, source-sync
+composition is disabled and scheduler startup is rejected.
 
 ## Kubernetes
 
@@ -141,7 +161,7 @@ process check.
 
 ## Timezone verification
 
-The future browser adapter should evaluate the browser's local timezone and
+The browser adapter evaluates the browser's local timezone and
 compare it with the configured IANA timezone. A mismatch is a configuration
 error, not a reason to silently continue. This catches images that have `TZ`
 set but lack usable timezone data or browser-specific timezone configuration.

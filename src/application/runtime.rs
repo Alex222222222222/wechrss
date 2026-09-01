@@ -6,12 +6,11 @@
 //! side-effect free, while the eventual process supervisor can use the typed
 //! component plans to construct only the roles selected by `APP_ROLES`.
 //!
-//! The plan is conservative about worker dispatch. The database-only feed
-//! rebuild path is executable, and source synchronization has an injected-port
-//! finalization handler, but concrete authenticated acquisition is not yet
-//! composed into the runtime. Source-sync, article-backfill, and credential-
-//! refresh jobs therefore are not included in the current worker plan; a
-//! worker must never claim work that it cannot execute and durably complete.
+//! The plan is conservative about worker dispatch. Feed rebuild is always
+//! executable; source synchronization is included only when the validated
+//! configuration contains both a pre-authenticated browser profile and a
+//! default WeRead account identity. A worker must never claim work that its
+//! runtime cannot execute and durably complete.
 //!
 //! API readiness does not depend on WebDriver availability. The API plan only
 //! contains HTTP settings, while browser-dependent worker health remains a
@@ -38,7 +37,7 @@ use super::{
 /// Only job kinds with complete runtime composition are claimable here.
 /// Keeping this list explicit prevents runtime composition from silently
 /// turning an uncomposed handler into claimed work.
-pub const EXECUTABLE_WORKER_JOB_TYPES: &[JobType] = &[JobType::FeedRebuild];
+pub const EXECUTABLE_WORKER_JOB_TYPES: &[JobType] = &[JobType::FeedRebuild, JobType::SourceSync];
 
 /// A validated HTTP component plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +90,7 @@ pub struct WorkerRuntimePlan {
     jobs: JobServiceConfig,
     dispatch: WorkerConfig,
     loop_config: WorkerLoopConfig,
+    source_sync_enabled: bool,
 }
 
 impl WorkerRuntimePlan {
@@ -112,6 +112,11 @@ impl WorkerRuntimePlan {
     /// Returns the shutdown-aware worker loop settings.
     pub const fn loop_config(&self) -> WorkerLoopConfig {
         self.loop_config
+    }
+
+    /// Returns whether authenticated source synchronization is composed.
+    pub const fn source_sync_enabled(&self) -> bool {
+        self.source_sync_enabled
     }
 }
 
@@ -181,7 +186,12 @@ impl RuntimePlan {
                     WorkerConfigError::HeartbeatNotShorterThanLease,
                 ));
             }
-            let dispatch = WorkerConfig::new(EXECUTABLE_WORKER_JOB_TYPES.to_vec(), heartbeat)
+            let mut allowed_job_types = vec![JobType::FeedRebuild];
+            let source_sync_enabled = config.weread_source_sync_configured();
+            if source_sync_enabled {
+                allowed_job_types.push(JobType::SourceSync);
+            }
+            let dispatch = WorkerConfig::new(allowed_job_types, heartbeat)
                 .map_err(RuntimePlanError::WorkerConfig)?;
             let poll_interval = config.job_poll_interval;
             let loop_config = WorkerLoopConfig::new(poll_interval, poll_interval)
@@ -191,6 +201,7 @@ impl RuntimePlan {
                 jobs: job_service,
                 dispatch,
                 loop_config,
+                source_sync_enabled,
             }));
         }
 
@@ -305,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_plan_is_conservative_until_other_handlers_are_executable() {
+    fn worker_plan_claims_only_composed_job_types() {
         let plan = RuntimePlan::from_config(&config("worker")).unwrap();
         let RuntimeComponent::Worker(worker) = plan.component(AppRole::Worker).unwrap() else {
             panic!("worker role should produce a worker component")
@@ -316,7 +327,44 @@ mod tests {
             worker.worker_config().allowed_job_types(),
             &[JobType::FeedRebuild]
         );
+        assert!(!worker.source_sync_enabled());
         assert_eq!(worker.job_service_config().owner(), "runtime-test");
+    }
+
+    #[test]
+    fn worker_plan_includes_source_sync_when_authenticated_runtime_is_configured() {
+        let config = AppConfig::from_env_iter([
+            (
+                "DATABASE_URL".to_owned(),
+                "postgres://user:pass@db/feed".to_owned(),
+            ),
+            (
+                "CREDENTIAL_ENCRYPTION_KEY".to_owned(),
+                "test-key".to_owned(),
+            ),
+            ("APP_ROLES".to_owned(), "worker".to_owned()),
+            ("APP_INSTANCE_ID".to_owned(), "runtime-test".to_owned()),
+            ("WORKER_CONCURRENCY".to_owned(), "4".to_owned()),
+            (
+                "BROWSER_AUTHENTICATED_PROFILE".to_owned(),
+                "/profiles/weread".to_owned(),
+            ),
+            (
+                "WEREAD_ACCOUNT_ID".to_owned(),
+                "00000000-0000-0000-0000-000000000001".to_owned(),
+            ),
+        ])
+        .unwrap();
+        let plan = RuntimePlan::from_config(&config).unwrap();
+        let RuntimeComponent::Worker(worker) = plan.component(AppRole::Worker).unwrap() else {
+            panic!("worker role should produce a worker component")
+        };
+
+        assert!(worker.source_sync_enabled());
+        assert_eq!(
+            worker.worker_config().allowed_job_types(),
+            &[JobType::FeedRebuild, JobType::SourceSync]
+        );
     }
 
     #[test]

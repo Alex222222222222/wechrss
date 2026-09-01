@@ -68,6 +68,7 @@ impl PostgresAccountLeaseRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl AccountLeaseStore for PostgresAccountLeaseRepository {
     async fn acquire(
         &self,
@@ -282,6 +283,7 @@ impl MemoryAccountLeaseRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl AccountLeaseStore for MemoryAccountLeaseRepository {
     async fn acquire(
         &self,

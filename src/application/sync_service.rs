@@ -136,6 +136,7 @@ pub fn classify_acquisition_error(error: &SyncAcquisitionError) -> ClassifiedSyn
         SyncAcquisitionError::WeRead(WeReadAdapterError::LeaseLost { .. })
         | SyncAcquisitionError::WeRead(WeReadAdapterError::LeaseBackend(_))
         | SyncAcquisitionError::WeRead(WeReadAdapterError::Protocol(_))
+        | SyncAcquisitionError::WeRead(WeReadAdapterError::Browser(_))
         | SyncAcquisitionError::ArticlePage(ArticlePageError::Browser(_))
         | SyncAcquisitionError::ArticlePage(ArticlePageError::OperationTimedOut) => (
             SyncOutcome::RetryableFailure,

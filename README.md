@@ -31,3 +31,51 @@ with or endorsed by any third-party service it may interact with.
 Review the project documentation and the applicable third-party policies before
 running any component.
 
+## Test coverage
+
+Generate coverage locally with `cargo-llvm-cov`. The reports are build
+artifacts and are intentionally written under `target/`, not committed to the
+repository.
+
+Install the tool and its Rust support component once:
+
+```sh
+cargo install cargo-llvm-cov --locked
+rustup component add llvm-tools-preview
+```
+
+Run the database-independent unit-test coverage report with missing lines:
+
+```sh
+cargo llvm-cov --all-features --workspace --lib --text --show-missing-lines
+```
+
+Generate an HTML report for interactive inspection:
+
+```sh
+cargo llvm-cov --all-features --workspace --lib --html
+# Open target/llvm-cov/html/index.html in a browser.
+```
+
+Export an LCOV report for CI or other coverage tooling:
+
+```sh
+cargo llvm-cov --all-features --workspace --lib \
+  --lcov --summary-only --output-path target/llvm-cov/unit.lcov
+```
+
+To include PostgreSQL integration tests, set `DATABASE_URL` to an
+administrative PostgreSQL connection that the SQLx test harness may use, then
+run the integration targets:
+
+```sh
+: "${DATABASE_URL:?set DATABASE_URL before running database coverage}"
+cargo llvm-cov --all-features --workspace --tests --html \
+  --output-dir target/llvm-cov/integration-html
+```
+
+The integration command may create isolated databases for each
+`#[sqlx::test]`; use the same external development database and resource
+limits documented for the nextest workflow. Keep credentials in the shell or
+an ignored local development file, never in README examples or committed
+reports.

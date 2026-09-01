@@ -10,16 +10,19 @@
 //! WeChat article pages. It owns one local browser-pool permit and has no API
 //! for cookies, storage import, credentials, or account leases.
 //! [`AuthenticatedBrowserSession`] is a separate non-cloneable capability for
-//! WeRead account/list operations. It carries one account lease guard and
-//! cannot be converted into a public session. Dropping either session releases
-//! only local capacity; authenticated callers should explicitly call
-//! `release()` so the durable account lease is removed promptly.
+//! WeRead account/list operations. It carries one account lease guard and an
+//! authenticated WebDriver client, and cannot be converted into a public
+//! session. Dropping either session releases only local capacity;
+//! authenticated callers should explicitly call `release()` so the durable
+//! account lease and remote browser session are cleaned up promptly.
 //!
 //! The concrete public adapter now connects a fresh WebDriver session and
 //! exposes only safe navigation, current-URL, source, bounded scrolling, close,
 //! and environment diagnostic operations to sibling acquisition code. It does
 //! not expose cookies, storage, raw protocol commands, or an authenticated
-//! session. The factory asks the browser's `Intl` implementation to
+//! session. Authenticated sessions may use an explicitly configured,
+//! pre-authenticated browser profile; that profile is never accepted by the
+//! public-session path. The factory asks the browser's `Intl` implementation to
 //! canonicalize the configured IANA timezone and compares that result with the
 //! browser diagnostic when the profile declares an expected timezone; public
 //! article pacing and bounded scroll execution are coordinated by
@@ -47,7 +50,8 @@ use url::Url;
 use uuid::Uuid;
 
 use super::browser_pool::{
-    AccountLeaseError, AccountLeaseGuard, AccountLeaseStore, BrowserPool, BrowserPoolError,
+    AccountLeaseError, AccountLeaseGuard, AccountLeaseHeartbeat, AccountLeaseStore, BrowserPool,
+    BrowserPoolError,
 };
 
 const WEBDRIVER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -87,6 +91,7 @@ pub struct WebDriverFactory {
     endpoint: Url,
     engine: BrowserEngine,
     profile: BrowserProfile,
+    authenticated_profile: Option<String>,
 }
 
 /// Browser settings that are applied consistently to one fresh session.
@@ -170,6 +175,7 @@ impl WebDriverFactory {
             endpoint,
             engine,
             profile: BrowserProfile::default(),
+            authenticated_profile: None,
         }
     }
 
@@ -180,6 +186,17 @@ impl WebDriverFactory {
             profile.locale = "zh-CN".to_owned();
         }
         self.profile = profile;
+        self
+    }
+
+    /// Uses a pre-authenticated browser profile for authenticated sessions.
+    ///
+    /// The path is applied only to [`Self::open_authenticated`]. Public
+    /// sessions always use the fresh profile created by WebDriver. The browser
+    /// sidecar must have access to this path and must not share it between
+    /// concurrent browser sessions.
+    pub fn with_authenticated_profile_path(mut self, path: impl Into<String>) -> Self {
+        self.authenticated_profile = Some(path.into());
         self
     }
 
@@ -194,12 +211,11 @@ impl WebDriverFactory {
         pool: &BrowserPool,
     ) -> Result<PublicBrowserSession, WebDriverError> {
         let session = pool.open_public().await?;
-        let client = connect(self.endpoint.clone(), self.engine, &self.profile)
+        let client = connect(self.endpoint.clone(), self.engine, &self.profile, None)
             .await
             .map_err(WebDriverError::Connect)?;
-        let mut session = session.attach_client(client);
-        if let Err(error) = self.validate_environment(&session).await {
-            if let Err(cleanup_error) = session.close_client().await {
+        if let Err(error) = self.validate_environment(&client).await {
+            if let Err(cleanup_error) = close_webdriver(client).await {
                 tracing::warn!(
                     error = %cleanup_error,
                     "browser cleanup failed after environment validation error"
@@ -207,18 +223,70 @@ impl WebDriverFactory {
             }
             return Err(error);
         }
-        Ok(session)
+        Ok(session.attach_client(client))
     }
 
-    async fn validate_environment(
+    /// Opens an authenticated browser session fenced by one account lease.
+    ///
+    /// A pre-authenticated browser profile is required. The lease is acquired
+    /// before WebDriver creation and released again if session creation fails,
+    /// so a broken sidecar cannot strand account ownership until expiry.
+    pub async fn open_authenticated<R>(
         &self,
-        session: &PublicBrowserSession,
-    ) -> Result<(), WebDriverError> {
+        pool: &BrowserPool,
+        leases: R,
+        account_id: crate::domain::credentials::WeReadAccountId,
+        owner: &str,
+        lease_for: chrono::Duration,
+    ) -> Result<Option<AuthenticatedBrowserSession<R>>, WebDriverError>
+    where
+        R: AccountLeaseStore,
+    {
+        let Some(session) = pool
+            .open_authenticated(leases, account_id, owner, lease_for)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(profile_path) = self.authenticated_profile.as_deref() else {
+            let _ = session.release().await;
+            return Err(WebDriverError::Connect(
+                "authenticated browser profile is not configured".to_owned(),
+            ));
+        };
+        let client = match connect(
+            self.endpoint.clone(),
+            self.engine,
+            &self.profile,
+            Some(profile_path),
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(error) => {
+                let _ = session.release().await;
+                return Err(WebDriverError::Connect(error));
+            }
+        };
+        if let Err(error) = self.validate_environment(&client).await {
+            if let Err(cleanup_error) = close_webdriver(client).await {
+                tracing::warn!(
+                    error = %cleanup_error,
+                    "browser cleanup failed after authenticated environment validation error"
+                );
+            }
+            let _ = session.release().await;
+            return Err(error);
+        }
+        Ok(Some(session.attach_client(client)))
+    }
+
+    async fn validate_environment(&self, client: &WebDriver) -> Result<(), WebDriverError> {
         let Some(expected_timezone) = self.profile.expected_timezone else {
             return Ok(());
         };
-        let environment = session.environment().await?;
-        let canonical_expected_timezone = session.canonical_timezone(expected_timezone).await?;
+        let environment = browser_environment(client).await?;
+        let canonical_expected_timezone = canonical_timezone(client, expected_timezone).await?;
         validate_expected_environment(&canonical_expected_timezone, &environment)
     }
 }
@@ -241,8 +309,9 @@ async fn connect(
     endpoint: Url,
     engine: BrowserEngine,
     profile: &BrowserProfile,
+    authenticated_profile: Option<&str>,
 ) -> Result<WebDriver, String> {
-    let capabilities = capabilities_for(engine, profile)?;
+    let capabilities = capabilities_for(engine, profile, authenticated_profile)?;
     let driver = WebDriver::builder(endpoint.as_str(), capabilities)
         .request_timeout(WEBDRIVER_REQUEST_TIMEOUT)
         .connect()
@@ -258,18 +327,55 @@ async fn connect(
     ] {
         if let Err(error) = result {
             let message = error.to_string();
-            let _ = driver.quit().await;
+            let _ = close_webdriver(driver).await;
             return Err(message);
         }
     }
     Ok(driver)
 }
 
+async fn browser_environment(client: &WebDriver) -> Result<BrowserEnvironment, WebDriverError> {
+    let result = client
+        .execute(
+            r#"return {
+                userAgent: navigator.userAgent,
+                language: navigator.language,
+                languages: Array.from(navigator.languages || []),
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
+                webdriver: navigator.webdriver === undefined ? null : navigator.webdriver,
+                innerWidth: window.innerWidth,
+                innerHeight: window.innerHeight
+            };"#,
+            Vec::new(),
+        )
+        .await
+        .map_err(|error| WebDriverError::Command(error.to_string()))?;
+    result
+        .convert()
+        .map_err(|error| WebDriverError::Command(error.to_string()))
+}
+
+async fn canonical_timezone(client: &WebDriver, timezone: Tz) -> Result<String, WebDriverError> {
+    let result = client
+        .execute(
+            r#"return new Intl.DateTimeFormat("en-US", { timeZone: arguments[0] })
+                .resolvedOptions().timeZone;"#,
+            vec![serde_json::json!(timezone.name())],
+        )
+        .await
+        .map_err(|error| WebDriverError::Command(error.to_string()))?;
+    result
+        .convert()
+        .map_err(|error| WebDriverError::Command(error.to_string()))
+}
+
 fn capabilities_for(
     engine: BrowserEngine,
     profile: &BrowserProfile,
+    authenticated_profile: Option<&str>,
 ) -> Result<Capabilities, String> {
     validate_profile(profile)?;
+    validate_authenticated_profile(authenticated_profile)?;
     match engine {
         BrowserEngine::Chromium => {
             let mut capabilities = DesiredCapabilities::chrome();
@@ -297,6 +403,11 @@ fn capabilities_for(
                     .add_arg(argument)
                     .map_err(|error| error.to_string())?;
             }
+            if let Some(path) = authenticated_profile {
+                capabilities
+                    .add_arg(&format!("--user-data-dir={path}"))
+                    .map_err(|error| error.to_string())?;
+            }
             Ok(capabilities.into())
         }
         BrowserEngine::Firefox => {
@@ -319,6 +430,14 @@ fn capabilities_for(
             capabilities
                 .set_preferences(preferences)
                 .map_err(|error| error.to_string())?;
+            if let Some(path) = authenticated_profile {
+                capabilities
+                    .add_arg("-profile")
+                    .map_err(|error| error.to_string())?;
+                capabilities
+                    .add_arg(path)
+                    .map_err(|error| error.to_string())?;
+            }
             for argument in &profile.extra_args {
                 capabilities
                     .add_arg(argument)
@@ -362,6 +481,16 @@ fn validate_profile(profile: &BrowserProfile) -> Result<(), String> {
     }) {
         return Err(
             "extra arguments must not override controlled browser profile arguments".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_authenticated_profile(path: Option<&str>) -> Result<(), String> {
+    if path.is_some_and(|path| path.trim().is_empty() || path.chars().any(char::is_control)) {
+        return Err(
+            "authenticated browser profile path must be non-empty and free of control characters"
+                .to_owned(),
         );
     }
     Ok(())
@@ -465,27 +594,7 @@ impl PublicBrowserSession {
     /// Captures browser-visible profile values for diagnostics and health
     /// checks. It does not attempt to hide automation signals.
     pub async fn environment(&self) -> Result<BrowserEnvironment, WebDriverError> {
-        let result = self
-            .client
-            .as_ref()
-            .ok_or(WebDriverError::NotConnected)?
-            .execute(
-                r#"return {
-                    userAgent: navigator.userAgent,
-                    language: navigator.language,
-                    languages: Array.from(navigator.languages || []),
-                    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
-                    webdriver: navigator.webdriver === undefined ? null : navigator.webdriver,
-                    innerWidth: window.innerWidth,
-                    innerHeight: window.innerHeight
-                };"#,
-                Vec::new(),
-            )
-            .await
-            .map_err(|error| WebDriverError::Command(error.to_string()))?;
-        result
-            .convert()
-            .map_err(|error| WebDriverError::Command(error.to_string()))
+        browser_environment(self.client.as_ref().ok_or(WebDriverError::NotConnected)?).await
     }
 
     /// Returns the browser's canonical IANA name for a configured timezone.
@@ -494,49 +603,18 @@ impl PublicBrowserSession {
     /// keeping validation aligned with the ICU timezone database used by the
     /// sidecar instead of maintaining a second alias table in the service.
     pub async fn canonical_timezone(&self, timezone: Tz) -> Result<String, WebDriverError> {
-        let result = self
-            .client
-            .as_ref()
-            .ok_or(WebDriverError::NotConnected)?
-            .execute(
-                r#"return new Intl.DateTimeFormat("en-US", { timeZone: arguments[0] })
-                    .resolvedOptions().timeZone;"#,
-                vec![serde_json::json!(timezone.name())],
-            )
-            .await
-            .map_err(|error| WebDriverError::Command(error.to_string()))?;
-        result
-            .convert()
-            .map_err(|error| WebDriverError::Command(error.to_string()))
+        canonical_timezone(
+            self.client.as_ref().ok_or(WebDriverError::NotConnected)?,
+            timezone,
+        )
+        .await
     }
 
     pub(crate) async fn close_client(&mut self) -> Result<(), WebDriverError> {
         if let Some(client) = self.client.take() {
-            // Keep a shared handle so a timeout or error can disable
-            // Thirtyfour's synchronous Drop fallback before the owned client
-            // is released. The cleanup task is detached on timeout and may
-            // finish the remote DELETE independently of the request path.
-            let abandon_guard = client.clone();
-            let cleanup = tokio::spawn(async move { client.quit().await });
-            match tokio::time::timeout(WEBDRIVER_CLEANUP_TIMEOUT, cleanup).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(error))) => {
-                    let _ = abandon_guard.leak();
-                    return Err(WebDriverError::Command(error.to_string()));
-                }
-                Ok(Err(error)) => {
-                    let _ = abandon_guard.leak();
-                    return Err(WebDriverError::Command(format!(
-                        "browser cleanup task failed: {error}"
-                    )));
-                }
-                Err(_) => {
-                    let _ = abandon_guard.leak();
-                    return Err(WebDriverError::Command(
-                        "browser cleanup timed out".to_owned(),
-                    ));
-                }
-            }
+            close_webdriver(client)
+                .await
+                .map_err(WebDriverError::Command)?;
         }
         Ok(())
     }
@@ -564,6 +642,8 @@ where
     _permit: tokio::sync::OwnedSemaphorePermit,
     session_id: Uuid,
     lease: AccountLeaseGuard<R>,
+    lease_heartbeat: Option<AccountLeaseHeartbeat>,
+    client: Option<WebDriver>,
 }
 
 impl<R> AuthenticatedBrowserSession<R>
@@ -578,7 +658,14 @@ where
             _permit: permit,
             session_id: Uuid::new_v4(),
             lease,
+            lease_heartbeat: None,
+            client: None,
         }
+    }
+
+    fn attach_client(mut self, client: WebDriver) -> Self {
+        self.client = Some(client);
+        self
     }
 
     /// Returns a non-secret identifier useful for tracing one local session.
@@ -599,6 +686,41 @@ where
         self.lease.heartbeat(lease_for).await
     }
 
+    /// Starts the periodic lease heartbeat for a long-running authenticated
+    /// operation. The heartbeat is owned by this session and is stopped by
+    /// [`Self::release`], including when the caller forgets to stop it after
+    /// an operation error.
+    pub(crate) fn start_lease_heartbeat(
+        &mut self,
+        heartbeat_for: chrono::Duration,
+        lease_for: chrono::Duration,
+    ) -> Result<(), AccountLeaseError>
+    where
+        R: Clone + 'static,
+    {
+        if self.lease_heartbeat.is_some() {
+            return Err(AccountLeaseError::Backend(
+                "authenticated lease heartbeat is already running".to_owned(),
+            ));
+        }
+        self.lease_heartbeat = Some(self.lease.start_heartbeat(heartbeat_for, lease_for)?);
+        Ok(())
+    }
+
+    /// Stops the periodic lease heartbeat and reports a heartbeat failure.
+    pub(crate) async fn stop_lease_heartbeat(&mut self) -> Result<(), AccountLeaseError> {
+        if let Some(mut heartbeat) = self.lease_heartbeat.take() {
+            heartbeat.stop().await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Proves that no background heartbeat has lost this session's lease.
+    pub(crate) fn ensure_usable(&self) -> Result<(), AccountLeaseError> {
+        self.lease.ensure_usable()
+    }
+
     /// Proves account-lease liveness immediately before one authenticated
     /// protocol request.
     ///
@@ -616,8 +738,31 @@ where
 
     /// Releases the durable account lease and then drops local browser capacity.
     pub async fn release(self) -> Result<(), AccountLeaseError> {
-        let Self { _permit, lease, .. } = self;
-        lease.release().await
+        let Self {
+            _permit,
+            mut client,
+            lease,
+            lease_heartbeat,
+            ..
+        } = self;
+        let heartbeat_error = if let Some(mut heartbeat) = lease_heartbeat {
+            heartbeat.stop().await.err()
+        } else {
+            None
+        };
+        let cleanup_error = if let Some(client) = client.take() {
+            close_webdriver(client).await.err().map(|error| {
+                AccountLeaseError::Backend(format!("authenticated browser cleanup failed: {error}"))
+            })
+        } else {
+            None
+        };
+        let lease_result = lease.release().await;
+        match (lease_result, cleanup_error) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Some(error)) => Err(heartbeat_error.unwrap_or(error)),
+            (Ok(()), None) => heartbeat_error.map_or(Ok(()), Err),
+        }
     }
 }
 
@@ -644,10 +789,38 @@ where
     session: &'a mut AuthenticatedBrowserSession<R>,
 }
 
+/// Closes a WebDriver client without allowing Thirtyfour's synchronous Drop
+/// fallback to run on the Tokio executor after a failed or timed-out request.
+/// The cloned handle is leaked in every non-success path, which marks the
+/// remote session as abandoned while the cleanup task may still finish.
+async fn close_webdriver(client: WebDriver) -> Result<(), String> {
+    let abandon_guard = client.clone();
+    let cleanup = tokio::spawn(async move { client.quit().await });
+    match tokio::time::timeout(WEBDRIVER_CLEANUP_TIMEOUT, cleanup).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => {
+            let _ = abandon_guard.leak();
+            Err(error.to_string())
+        }
+        Ok(Err(error)) => {
+            let _ = abandon_guard.leak();
+            Err(format!("browser cleanup task failed: {error}"))
+        }
+        Err(_) => {
+            let _ = abandon_guard.leak();
+            Err("browser cleanup timed out".to_owned())
+        }
+    }
+}
+
 impl<R> AuthenticatedRequest<'_, R>
 where
     R: AccountLeaseStore,
 {
+    pub(crate) fn ensure_usable(&self) -> Result<(), AccountLeaseError> {
+        self.session.lease.ensure_usable()
+    }
+
     /// Returns the account identity whose lease was just proven live.
     pub const fn account_id(&self) -> crate::domain::credentials::WeReadAccountId {
         self.session.account_id()
@@ -657,16 +830,131 @@ where
     pub const fn session_id(&self) -> Uuid {
         self.session.session_id()
     }
+
+    /// Navigates the authenticated browser to one protocol endpoint.
+    pub(crate) async fn goto(&mut self, url: &str) -> Result<(), WebDriverError> {
+        self.session
+            .client
+            .as_ref()
+            .ok_or(WebDriverError::NotConnected)?
+            .goto(url)
+            .await
+            .map_err(|error| WebDriverError::Command(error.to_string()))
+    }
+
+    /// Reads visible body text without exposing the raw WebDriver client.
+    pub(crate) async fn body_text(&self) -> Result<String, WebDriverError> {
+        let result = self
+            .session
+            .client
+            .as_ref()
+            .ok_or(WebDriverError::NotConnected)?
+            .execute(
+                "return document.body ? document.body.innerText : document.documentElement.innerText;",
+                Vec::new(),
+            )
+            .await
+            .map_err(|error| WebDriverError::Command(error.to_string()))?;
+        result
+            .convert()
+            .map_err(|error| WebDriverError::Command(error.to_string()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::{
+        body::Bytes,
+        http::{Method, Request, Response, StatusCode},
+    };
+    use thirtyfour::{
+        prelude::{DesiredCapabilities, WebDriverError as ThirtyfourError, WebDriverResult},
+        session::http::{Body, HttpClient},
+    };
+
     use super::*;
+
+    #[derive(Debug)]
+    struct FailingQuitHttpClient;
+
+    #[async_trait::async_trait]
+    impl HttpClient for FailingQuitHttpClient {
+        async fn send(&self, request: Request<Body<'_>>) -> WebDriverResult<Response<Bytes>> {
+            if request.method() == Method::DELETE {
+                return Err(ThirtyfourError::RequestFailed("quit failed".to_owned()));
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Bytes::from_static(
+                    br#"{"value":{"sessionId":"test-session","capabilities":{}}}"#,
+                ))
+                .map_err(|error| ThirtyfourError::RequestFailed(error.to_string()))
+        }
+
+        async fn new(&self) -> Arc<dyn HttpClient> {
+            Arc::new(Self)
+        }
+    }
+
+    async fn failing_quit_driver() -> WebDriver {
+        WebDriver::builder("http://webdriver.test", DesiredCapabilities::firefox())
+            .client(FailingQuitHttpClient)
+            .connect()
+            .await
+            .expect("the fake WebDriver should accept session setup")
+    }
+
+    #[derive(Debug)]
+    struct EnvironmentHttpClient {
+        execute_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for EnvironmentHttpClient {
+        async fn send(&self, request: Request<Body<'_>>) -> WebDriverResult<Response<Bytes>> {
+            let body = if request.uri().path().ends_with("/execute/sync") {
+                if self.execute_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    br#"{"value":{"userAgent":"test-agent","language":"zh-CN","languages":["zh-CN"],"timezone":"UTC","webdriver":true,"innerWidth":1280,"innerHeight":2000}}"#.to_vec()
+                } else {
+                    br#"{"value":"Asia/Shanghai"}"#.to_vec()
+                }
+            } else if request.uri().path().ends_with("/session") {
+                br#"{"value":{"sessionId":"test-session","capabilities":{}}}"#.to_vec()
+            } else {
+                br#"{"value":null}"#.to_vec()
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Bytes::from(body))
+                .map_err(|error| ThirtyfourError::RequestFailed(error.to_string()))
+        }
+
+        async fn new(&self) -> Arc<dyn HttpClient> {
+            Arc::new(Self {
+                execute_calls: AtomicUsize::new(self.execute_calls.load(Ordering::Relaxed)),
+            })
+        }
+    }
+
+    async fn environment_driver() -> WebDriver {
+        WebDriver::builder("http://webdriver.test", DesiredCapabilities::firefox())
+            .client(EnvironmentHttpClient {
+                execute_calls: AtomicUsize::new(0),
+            })
+            .connect()
+            .await
+            .expect("the fake WebDriver should accept session setup")
+    }
 
     #[test]
     fn chromium_capabilities_request_a_headless_chrome_without_credentials() {
         let capabilities =
-            capabilities_for(BrowserEngine::Chromium, &BrowserProfile::default()).unwrap();
+            capabilities_for(BrowserEngine::Chromium, &BrowserProfile::default(), None).unwrap();
         assert_eq!(capabilities.get("browserName"), Some(&json!("chrome")));
         assert_eq!(
             capabilities
@@ -683,7 +971,7 @@ mod tests {
     #[test]
     fn firefox_capabilities_request_headless_firefox() {
         let capabilities =
-            capabilities_for(BrowserEngine::Firefox, &BrowserProfile::default()).unwrap();
+            capabilities_for(BrowserEngine::Firefox, &BrowserProfile::default(), None).unwrap();
         assert_eq!(capabilities.get("browserName"), Some(&json!("firefox")));
         assert_eq!(
             capabilities
@@ -705,7 +993,7 @@ mod tests {
             expected_timezone: Some(chrono_tz::Asia::Shanghai),
             extra_args: vec!["--disable-features=SomeFeature".to_owned()],
         };
-        let capabilities = capabilities_for(BrowserEngine::Chromium, &profile).unwrap();
+        let capabilities = capabilities_for(BrowserEngine::Chromium, &profile, None).unwrap();
         let args = capabilities
             .get("goog:chromeOptions")
             .and_then(|options| options.get("args"))
@@ -718,7 +1006,7 @@ mod tests {
         assert!(args.contains(&"--disable-features=SomeFeature"));
         assert!(!capabilities.contains_key("proxy"));
 
-        let firefox = capabilities_for(BrowserEngine::Firefox, &profile).unwrap();
+        let firefox = capabilities_for(BrowserEngine::Firefox, &profile, None).unwrap();
         assert_eq!(
             firefox
                 .get("moz:firefoxOptions")
@@ -736,6 +1024,47 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_capabilities_use_the_explicit_profile_only_for_auth_sessions() {
+        let profile = BrowserProfile::default();
+        let chromium =
+            capabilities_for(BrowserEngine::Chromium, &profile, Some("/profiles/weread")).unwrap();
+        let chromium_args = chromium
+            .get("goog:chromeOptions")
+            .and_then(|options| options.get("args"))
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(chromium_args.contains(&json!("--user-data-dir=/profiles/weread")));
+
+        let firefox =
+            capabilities_for(BrowserEngine::Firefox, &profile, Some("/profiles/weread")).unwrap();
+        let firefox_args = firefox
+            .get("moz:firefoxOptions")
+            .and_then(|options| options.get("args"))
+            .and_then(Value::as_array)
+            .unwrap();
+        let profile_position = firefox_args
+            .iter()
+            .position(|argument| argument == &json!("-profile"))
+            .expect("Firefox should receive the profile switch");
+        assert_eq!(
+            firefox_args.get(profile_position + 1),
+            Some(&json!("/profiles/weread"))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_authenticated_profile_paths_before_capability_creation() {
+        for path in ["", "   ", "profile\nwith-control"] {
+            assert!(capabilities_for(
+                BrowserEngine::Chromium,
+                &BrowserProfile::default(),
+                Some(path)
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn rejects_extra_arguments_that_override_controlled_profile_values() {
         for argument in [
             "--lang=en-US",
@@ -749,7 +1078,7 @@ mod tests {
                 extra_args: vec![argument.to_owned()],
                 ..BrowserProfile::default()
             };
-            let error = capabilities_for(BrowserEngine::Chromium, &profile)
+            let error = capabilities_for(BrowserEngine::Chromium, &profile, None)
                 .expect_err("conflicting profile argument should be rejected");
             assert!(error.contains("controlled browser profile arguments"));
         }
@@ -789,6 +1118,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_environment_validation_rejects_a_timezone_mismatch() {
+        let client = environment_driver().await;
+        let factory = WebDriverFactory::new(
+            "http://webdriver.test".parse().unwrap(),
+            BrowserEngine::Firefox,
+        )
+        .with_profile(BrowserProfile {
+            expected_timezone: Some(chrono_tz::Asia::Shanghai),
+            ..BrowserProfile::default()
+        });
+
+        assert!(matches!(
+            factory.validate_environment(&client).await,
+            Err(WebDriverError::EnvironmentMismatch {
+                field: "timezone",
+                expected,
+                actual,
+            }) if expected == "Asia/Shanghai" && actual == "UTC"
+        ));
+        let _ = close_webdriver(client).await;
+    }
+
+    #[tokio::test]
     async fn an_unconnected_pool_session_cannot_issue_browser_commands() {
         let pool = BrowserPool::new(1).unwrap();
         let session = pool.open_public().await.unwrap();
@@ -808,5 +1160,38 @@ mod tests {
             session.canonical_timezone(chrono_tz::UTC).await,
             Err(WebDriverError::NotConnected)
         ));
+    }
+
+    #[tokio::test]
+    async fn authenticated_release_releases_the_lease_when_browser_cleanup_fails() {
+        let repository = crate::persistence::repositories::account_lease_repository::
+            MemoryAccountLeaseRepository::new(chrono::Utc::now());
+        let account_id =
+            crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(1));
+        let pool = BrowserPool::new(1).unwrap();
+        let session = pool
+            .open_authenticated(
+                repository.clone(),
+                account_id,
+                "worker-a",
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .expect("the test worker should acquire the account");
+        let session = session.attach_client(failing_quit_driver().await);
+
+        let error = session
+            .release()
+            .await
+            .expect_err("cleanup failure should be reported");
+        assert!(error
+            .to_string()
+            .contains("authenticated browser cleanup failed"));
+        assert!(repository
+            .acquire(account_id, "worker-b", chrono::Duration::seconds(30),)
+            .await
+            .unwrap()
+            .is_some());
     }
 }

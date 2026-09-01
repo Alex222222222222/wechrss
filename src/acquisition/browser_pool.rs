@@ -31,9 +31,16 @@ use std::sync::{
     Arc,
 };
 
+#[cfg(test)]
+use std::time::Duration as StdDuration;
+
 use chrono::Duration;
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{watch, OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
+    time::{self, MissedTickBehavior},
+};
 
 use crate::domain::credentials::{AccountLease, AccountLeaseToken, WeReadAccountId};
 
@@ -65,7 +72,7 @@ pub enum AccountLeaseError {
 /// lease backend can implement this port. Production implementations must use
 /// their authoritative clock for expiry-sensitive operations; callers never
 /// provide a wall-clock timestamp.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait AccountLeaseStore: Send + Sync {
     /// Acquires a lease or returns `None` when another live owner holds it.
     async fn acquire(
@@ -118,6 +125,32 @@ pub struct AccountLeaseGuard<R> {
     repository: R,
     lease: AccountLease,
     cancelled: Arc<AtomicBool>,
+}
+
+/// Handle for the background heartbeat attached to one authenticated session.
+///
+/// The task stops before the session releases its durable lease. A heartbeat
+/// failure marks the shared guard unusable and is returned when the handle is
+/// stopped, so the caller cannot mistake a lost lease for a clean operation.
+pub(crate) struct AccountLeaseHeartbeat {
+    stop: watch::Sender<bool>,
+    task: JoinHandle<Result<(), AccountLeaseError>>,
+}
+
+impl AccountLeaseHeartbeat {
+    pub(crate) async fn stop(&mut self) -> Result<(), AccountLeaseError> {
+        let _ = self.stop.send(true);
+        (&mut self.task).await.map_err(|error| {
+            AccountLeaseError::Backend(format!("account lease heartbeat task failed: {error}"))
+        })?
+    }
+}
+
+impl Drop for AccountLeaseHeartbeat {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+        self.task.abort();
+    }
 }
 
 impl<R> AccountLeaseGuard<R>
@@ -196,6 +229,60 @@ where
                 Err(error)
             }
         }
+    }
+
+    /// Starts periodic authoritative-clock heartbeats for an authenticated
+    /// operation. The returned handle must be stopped before releasing the
+    /// guard; [`super::webdriver::AuthenticatedBrowserSession`] owns that
+    /// lifecycle for runtime callers.
+    pub(crate) fn start_heartbeat(
+        &self,
+        heartbeat_for: Duration,
+        lease_for: Duration,
+    ) -> Result<AccountLeaseHeartbeat, AccountLeaseError>
+    where
+        R: Clone + 'static,
+    {
+        self.ensure_usable()?;
+        if heartbeat_for <= Duration::zero()
+            || lease_for <= Duration::zero()
+            || heartbeat_for >= lease_for
+        {
+            return Err(AccountLeaseError::InvalidLeaseDuration);
+        }
+        let heartbeat_period = heartbeat_for
+            .to_std()
+            .map_err(|_| AccountLeaseError::InvalidLeaseDuration)?;
+        let repository = self.repository.clone();
+        let account_id = self.account_id();
+        let owner = self.owner().to_owned();
+        let token = self.token();
+        let cancelled = Arc::clone(&self.cancelled);
+        let (stop, mut stop_receiver) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let mut ticker =
+                time::interval_at(time::Instant::now() + heartbeat_period, heartbeat_period);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    changed = stop_receiver.changed() => {
+                        if changed.is_err() || *stop_receiver.borrow() {
+                            return Ok(());
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        if let Err(error) = repository
+                            .heartbeat(account_id, &owner, token, lease_for)
+                            .await
+                        {
+                            cancelled.store(true, Ordering::Release);
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        });
+        Ok(AccountLeaseHeartbeat { stop, task })
     }
 
     /// Releases this lease through the repository.
@@ -306,7 +393,13 @@ impl BrowserPool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
     use chrono::{DateTime, TimeZone, Utc};
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
     use super::*;
@@ -320,6 +413,61 @@ mod tests {
 
     fn account_id() -> WeReadAccountId {
         WeReadAccountId::from_uuid(Uuid::from_u128(1))
+    }
+
+    #[derive(Clone)]
+    struct CountingLeaseRepository {
+        inner: MemoryAccountLeaseRepository,
+        heartbeats: Arc<AtomicUsize>,
+        heartbeat_seen: Arc<Notify>,
+        fail_heartbeat: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AccountLeaseStore for CountingLeaseRepository {
+        async fn acquire(
+            &self,
+            account_id: WeReadAccountId,
+            owner: &str,
+            lease_for: Duration,
+        ) -> Result<Option<AccountLease>, AccountLeaseError> {
+            self.inner.acquire(account_id, owner, lease_for).await
+        }
+
+        async fn heartbeat(
+            &self,
+            account_id: WeReadAccountId,
+            owner: &str,
+            token: AccountLeaseToken,
+            lease_for: Duration,
+        ) -> Result<AccountLease, AccountLeaseError> {
+            self.heartbeats.fetch_add(1, Ordering::Relaxed);
+            self.heartbeat_seen.notify_waiters();
+            if self.fail_heartbeat {
+                return Err(AccountLeaseError::Backend("heartbeat failed".to_owned()));
+            }
+            self.inner
+                .heartbeat(account_id, owner, token, lease_for)
+                .await
+        }
+
+        async fn release(
+            &self,
+            account_id: WeReadAccountId,
+            owner: &str,
+            token: AccountLeaseToken,
+        ) -> Result<(), AccountLeaseError> {
+            self.inner.release(account_id, owner, token).await
+        }
+    }
+
+    fn counting_repository(fail_heartbeat: bool) -> CountingLeaseRepository {
+        CountingLeaseRepository {
+            inner: MemoryAccountLeaseRepository::new(at(0)),
+            heartbeats: Arc::new(AtomicUsize::new(0)),
+            heartbeat_seen: Arc::new(Notify::new()),
+            fail_heartbeat,
+        }
     }
 
     #[test]
@@ -367,6 +515,86 @@ mod tests {
             Err(AccountLeaseError::LeaseLost { .. })
         ));
         assert!(guard.is_cancelled());
+        assert!(matches!(
+            guard.ensure_usable(),
+            Err(AccountLeaseError::LeaseLost { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn background_heartbeat_renews_until_stopped() {
+        let repository = counting_repository(false);
+        let heartbeat_seen = Arc::clone(&repository.heartbeat_seen);
+        let heartbeats = Arc::clone(&repository.heartbeats);
+        let guard = AccountLeaseGuard::acquire(
+            repository.clone(),
+            account_id(),
+            "worker-a",
+            Duration::seconds(30),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let heartbeat_started = heartbeat_seen.notified();
+        let mut heartbeat = guard
+            .start_heartbeat(Duration::milliseconds(5), Duration::seconds(30))
+            .unwrap();
+
+        tokio::time::timeout(StdDuration::from_secs(1), heartbeat_started)
+            .await
+            .expect("heartbeat should run before the timeout");
+        heartbeat.stop().await.unwrap();
+        assert!(heartbeats.load(Ordering::Relaxed) >= 1);
+        guard.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_background_heartbeat_aborts_future_renewals() {
+        let repository = counting_repository(false);
+        let heartbeat_seen = Arc::clone(&repository.heartbeat_seen);
+        let heartbeats = Arc::clone(&repository.heartbeats);
+        let guard =
+            AccountLeaseGuard::acquire(repository, account_id(), "worker-a", Duration::seconds(30))
+                .await
+                .unwrap()
+                .unwrap();
+        let heartbeat_started = heartbeat_seen.notified();
+        let heartbeat = guard
+            .start_heartbeat(Duration::milliseconds(5), Duration::seconds(30))
+            .unwrap();
+
+        tokio::time::timeout(StdDuration::from_secs(1), heartbeat_started)
+            .await
+            .expect("heartbeat should run before the timeout");
+        let count_at_drop = heartbeats.load(Ordering::Relaxed);
+        drop(heartbeat);
+        tokio::time::sleep(StdDuration::from_millis(30)).await;
+
+        assert_eq!(heartbeats.load(Ordering::Relaxed), count_at_drop);
+        guard.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_background_heartbeat_cancels_the_guard() {
+        let repository = counting_repository(true);
+        let heartbeat_seen = Arc::clone(&repository.heartbeat_seen);
+        let guard =
+            AccountLeaseGuard::acquire(repository, account_id(), "worker-a", Duration::seconds(30))
+                .await
+                .unwrap()
+                .unwrap();
+        let heartbeat_started = heartbeat_seen.notified();
+        let mut heartbeat = guard
+            .start_heartbeat(Duration::milliseconds(5), Duration::seconds(30))
+            .unwrap();
+
+        tokio::time::timeout(StdDuration::from_secs(1), heartbeat_started)
+            .await
+            .expect("failed heartbeat should run before the timeout");
+        assert!(matches!(
+            heartbeat.stop().await,
+            Err(AccountLeaseError::Backend(message)) if message == "heartbeat failed"
+        ));
         assert!(matches!(
             guard.ensure_usable(),
             Err(AccountLeaseError::LeaseLost { .. })

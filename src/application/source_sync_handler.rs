@@ -8,9 +8,9 @@
 //! sync-run completion, optional feed-rebuild enqueue, and fenced job outcome
 //! commit together through [`UnitOfWorkFactory`].
 //!
-//! This is intentionally an adapter-friendly slice. Runtime composition still
-//! has to provide the real authenticated WeRead transport and browser pool,
-//! but tests and future transports can implement the small acquisition port
+//! Runtime composition supplies the authenticated WeRead transport, browser
+//! pool, and lease-backed session lifecycle through the concrete acquisition
+//! adapter, while tests and future transports can implement the small port
 //! without coupling this workflow to WebDriver details.
 
 use chrono::{DateTime, Duration, Utc};
@@ -28,6 +28,7 @@ use crate::{
     },
     domain::{
         job::JobType,
+        pacing::QuietHours,
         source::{SchedulingGate, Source, SourceId},
         sync::{NewSyncRun, SyncOutcome, SyncRunCompletion, SyncStats},
     },
@@ -68,6 +69,7 @@ pub trait SourceSyncAcquirer: Send + Sync {
 pub struct SourceSyncJobHandlerConfig {
     retry_after: Duration,
     failure_cooldown: Duration,
+    quiet_hours: Option<QuietHours>,
 }
 
 impl SourceSyncJobHandlerConfig {
@@ -85,7 +87,14 @@ impl SourceSyncJobHandlerConfig {
         Ok(Self {
             retry_after,
             failure_cooldown,
+            quiet_hours: None,
         })
+    }
+
+    /// Adds the local quiet-hours policy checked before upstream acquisition.
+    pub const fn with_quiet_hours(mut self, quiet_hours: Option<QuietHours>) -> Self {
+        self.quiet_hours = quiet_hours;
+        self
     }
 
     /// Returns the delay before a retryable queue failure is retried.
@@ -96,6 +105,11 @@ impl SourceSyncJobHandlerConfig {
     /// Returns the source cooldown applied to retryable failures.
     pub const fn failure_cooldown(self) -> Duration {
         self.failure_cooldown
+    }
+
+    /// Returns the optional local quiet-hours policy.
+    pub const fn quiet_hours(self) -> Option<QuietHours> {
+        self.quiet_hours
     }
 }
 
@@ -188,6 +202,28 @@ where
         worker_now: DateTime<Utc>,
     ) -> Result<(), SourceSyncExecutionError> {
         let source_id = validate_lease(lease).map_err(SourceSyncExecutionError::BeforeRun)?;
+        let started_at = self
+            .dependencies
+            .unit_of_work
+            .database_now()
+            .await
+            .map_err(|_| {
+                SourceSyncExecutionError::BeforeRun(retry_execution(
+                    worker_now,
+                    self.config.retry_after(),
+                ))
+            })?;
+        if let Some(quiet_hours) = self.config.quiet_hours() {
+            if quiet_hours.is_quiet_at(started_at) {
+                let resume_at = quiet_hours
+                    .next_allowed_at(started_at)
+                    .or_else(|| started_at.checked_add_signed(self.config.retry_after()))
+                    .unwrap_or(started_at);
+                return Err(SourceSyncExecutionError::BeforeRun(
+                    JobExecution::Deferred { resume_at },
+                ));
+            }
+        }
         let source = self
             .dependencies
             .sources
@@ -205,17 +241,6 @@ where
                 })
             })?;
 
-        let started_at = self
-            .dependencies
-            .unit_of_work
-            .database_now()
-            .await
-            .map_err(|_| {
-                SourceSyncExecutionError::BeforeRun(retry_execution(
-                    worker_now,
-                    self.config.retry_after(),
-                ))
-            })?;
         let run_id = uuid::Uuid::new_v4();
         self.start_run(run_id, source_id, lease.job.id(), started_at)
             .await
