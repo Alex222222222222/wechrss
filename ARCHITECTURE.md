@@ -59,11 +59,11 @@ The current and target contracts must not be confused:
 
 | Area | Executable now | Target contract and implementation gate |
 | --- | --- | --- |
-| Runtime | `RuntimeSupervisor` consumes the validated `RuntimePlan`, opens the shared PostgreSQL pool, applies SQLx migrations, binds the selected API, and supervises scheduler, feed-rebuild, and configuration-gated authenticated source-sync loops with graceful shutdown; an injected refresh transport also enables account-expiry scheduling | QR/login exchange and browser health remain future work; API liveness/readiness and single-admin routes are executable |
+| Runtime | `RuntimeSupervisor` consumes the validated `RuntimePlan`, opens the shared PostgreSQL pool, applies SQLx migrations, binds the selected API, and supervises scheduler, feed-rebuild, and account-selection-at-job-time source-sync loops with graceful shutdown; an injected refresh transport also enables account-expiry scheduling | QR/login exchange and browser health remain future work; API liveness/readiness and single-admin routes are executable |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, type-aware feed-rebuild/source-sync dispatch, lease-fenced credential-refresh dispatch when a transport is injected, and shutdown-aware heartbeat/outcome execution | Article-backfill dispatch, plus removal of compatibility `now` parameters, remain future work |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, public RSS URL, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint; the supervisor consumes the parsed role and policy values | QR-login configuration remains future work |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, feed-build leases, and encrypted WeRead account credential records with optimistic versions | QR-login state and remaining transaction-scoped views are design-only |
-| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, authenticated WeRead article-list transport through a pre-authenticated profile and account lease, source-sync finalization through an injected acquisition port, feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, public tokenized feed route, API liveness/readiness routes, and single-admin source/panel routes | Login/QR exchange and browser health remain future work |
+| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, authenticated WeRead article-list transport through an admin-enrolled cookie and account lease, source-sync finalization through an injected acquisition port, feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, public tokenized feed route, API liveness/readiness routes, and single-admin source/panel routes | Login/QR exchange and browser health remain future work |
 | Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, and external-image reporting through ArchiveService | Asset persistence and URL rewriting remain future work |
 
 Environment variables in this document are parsed into `AppConfig`, and
@@ -88,15 +88,15 @@ startup errors; unrelated environment names are ignored.
 
 The first runtime is a modular monolith, but each process has an explicit role
 set: `api`, `scheduler`, `worker`, or `all`. The supervisor accepts scheduler
-and source-sync worker execution when the WeRead account identity is
-configured; it uses an optional pre-authenticated profile or an encrypted
-cookie enrolled through the admin panel. Otherwise scheduler startup fails closed and
-workers remain feed-rebuild-only, preventing the scheduler from creating work
-no worker can execute. Kubernetes may scale API
+and source-sync worker execution before a WeRead account is configured; each
+job selects an encrypted cookie enrolled through the admin panel. Without a usable account, the job records a
+warning and a scheduled failure, then the source is reconsidered on its next
+due interval. Kubernetes may scale API
 and worker processes independently
 so RSS traffic does not implicitly increase upstream-fetch concurrency. The
-current feed-rebuild worker is database-only; a browser sidecar becomes
-required when browser-backed source synchronization is enabled.
+current feed-rebuild worker is database-only; a browser sidecar is required
+for worker processes because source synchronization is composed before an
+account is enrolled and selects credentials when a job runs.
 PostgreSQL is the coordination point, so multiple instances can run at the
 same time without executing the same active job.
 
@@ -812,7 +812,7 @@ DATABASE_POOL_MIN_CONNECTIONS / DATABASE_POOL_MAX_CONNECTIONS
 WEBDRIVER_URL / BROWSER_ENGINE / WORKER_CONCURRENCY
 BROWSER_USER_AGENT / BROWSER_LOCALE / BROWSER_VIEWPORT_WIDTH /
 BROWSER_VIEWPORT_HEIGHT / BROWSER_EXTRA_ARGS /
-BROWSER_AUTHENTICATED_PROFILE / WEREAD_ACCOUNT_ID / WEREAD_ARTICLE_LIST_URL
+WEREAD_ACCOUNT_ID / WEREAD_ARTICLE_LIST_URL
 APP_INSTANCE_ID / HTTP_BIND / HTTP_PORT
 APP_ROLES
 APP_TIMEZONE / QUIET_HOURS_START / QUIET_HOURS_END
@@ -859,14 +859,14 @@ real-browser diagnostic verifies the value rather than trying to change the
 sidecar's operating-system timezone.
 Extra arguments cannot override controlled locale, User-Agent, viewport,
 headless, or profile settings, including Chromium `--user-data-dir` and
-Firefox `-profile`; public sessions therefore cannot opt into a persistent
-credential-bearing browser profile through this setting.
+Firefox `-profile`; browser sessions therefore cannot opt into a persistent
+browser profile through this setting.
 
-`WEREAD_ACCOUNT_ID` is required to compose authenticated source synchronization.
-`BROWSER_AUTHENTICATED_PROFILE` is optional: when supplied, the profile is
-pre-authenticated and is used only by the WeRead article-list adapter; when
-omitted, the adapter injects the encrypted cookie header enrolled through the
-admin panel. `WEREAD_ARTICLE_LIST_URL` defaults to
+`WEREAD_ACCOUNT_ID` is optional. When supplied, it is the default
+panel-enrolled account. When omitted, source-sync selects an enabled,
+unexpired account enrolled through the admin panel from PostgreSQL for each
+job. The adapter injects the encrypted cookie header enrolled through the
+admin panel into a fresh authenticated browser session. `WEREAD_ARTICLE_LIST_URL` defaults to
 `https://i.weread.qq.com/web/mp/articles` and is accepted only as that exact
 HTTPS endpoint without credentials, fragments, or a non-default port. Runtime
 source-sync listing holds the account lease through its authenticated request,
@@ -896,9 +896,10 @@ arguments. It intentionally does not inject that JavaScript or claim to hide
 continue to classify verification pages as a terminal upstream result.
 
 `APP_ROLES` is a validated set containing `api`, `scheduler`, and/or `worker`;
-`all` expands to all three. Scheduler and source-sync worker startup require
-the authenticated profile/account pair; without it, scheduler startup is
-rejected and workers claim feed-rebuild jobs only. Worker concurrency is
+`all` expands to all three. Scheduler and source-sync worker startup do not
+require an enrolled account. Source-sync selects an active
+enrolled account when each job runs; without one, the job records a warning and
+waits for the source's next due interval. Worker concurrency is
 configured independently from API replica count. `RSS_FEED_URL` is an optional
 validated public HTTP(S) URL for generated RSS channel links and is required
 when the worker role is enabled. `ASSET_ARCHIVE_BACKEND` is the enum `disabled | local | s3`
@@ -1043,7 +1044,7 @@ than add more empty module shells. Work proceeds in this order:
    explicit worker outcomes.
 4. Build role-aware runtime composition and integrate the worker loop and
    heartbeat cancellation. The supervisor now covers the API, scheduler,
-   database-only feed-rebuild, and configuration-gated authenticated
+   database-only feed-rebuild, and account-selection-at-job-time authenticated
    source-sync worker paths. Degraded browser health behavior remains gated on
    the future readiness boundary.
 5. Complete the acquisition slice with fresh-profile creation and browser
@@ -1133,19 +1134,21 @@ role selection and metrics. When a refresh transport is injected, each pass
 also selects active accounts nearing expiry and inserts a deduplicated
 `credential_refresh` job; this maintenance pass is not suppressed by source
 quiet hours. It must call this boundary rather than reimplement source or
-account selection. `RuntimeSupervisor` composes the scheduler only when the
-authenticated source-sync adapter is configured, and dispatches feed-rebuild,
+account selection. `RuntimeSupervisor` composes the scheduler and source-sync
+worker before an account is configured, and dispatches feed-rebuild,
 source-sync, and transport-backed credential-refresh jobs through one
-type-aware worker handler.
+type-aware worker handler. A source-sync job with no usable account records a
+warning, completes as a scheduled failure, and is reconsidered on the source's
+next due interval; later admin-panel enrollment is therefore observed without
+a restart.
 
 The remaining tree intentionally contains no interactive login/credential
 exchange. Durable credential persistence and non-interactive refresh are
 executable, and the authenticated admin panel can provision accounts through a
 CSRF-protected route while returning only non-secret status metadata. Active
 accounts can be scheduled for refresh when a transport is injected. Concrete
-source-sync acquisition/runtime composition is executable from either a
-pre-authenticated browser profile or an admin-enrolled encrypted cookie
-header. Binary asset
+source-sync acquisition/runtime composition uses an admin-enrolled encrypted
+cookie header. Binary asset
 persistence, and URL rewriting remain documentation-only; the pure
 archive sanitizer and `ArchiveService` are executable. Acquisition now
 contains executable identity resolution, capability/session ports, local

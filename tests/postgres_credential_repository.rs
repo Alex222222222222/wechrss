@@ -12,6 +12,9 @@ use werrss::{
         AuthRefreshOutcome, AuthService, AuthServiceConfig, AuthServiceDependencies,
         CredentialProvision, CredentialRefresher, RefreshedCredentials, RingCredentialCipher,
     },
+    application::source_sync_acquirer::{
+        CredentialRepositoryAccountSelector, WeReadAccountSelector,
+    },
     domain::credentials::{WeReadAccountId, WeReadCredentials},
     persistence::repositories::account_lease_repository::{
         AccountLeaseStore, PostgresAccountLeaseRepository,
@@ -26,6 +29,55 @@ fn at(seconds: i64) -> chrono::DateTime<Utc> {
 
 fn account_id() -> WeReadAccountId {
     WeReadAccountId::from_uuid(Uuid::new_v4())
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn account_selection_ignores_expired_and_disabled_accounts(pool: PgPool) {
+    let repository = PostgresCredentialRepository::new(pool.clone());
+    let expired = account_id();
+    let disabled = account_id();
+    let usable = account_id();
+    repository
+        .insert(
+            expired,
+            "expired",
+            b"expired-ciphertext",
+            Utc::now() - chrono::Duration::seconds(1),
+        )
+        .await
+        .expect("expired account should be inserted");
+    repository
+        .insert(
+            disabled,
+            "disabled",
+            b"disabled-ciphertext",
+            Utc::now() + chrono::Duration::hours(1),
+        )
+        .await
+        .expect("disabled account should be inserted");
+    sqlx::query("UPDATE weread_accounts SET disabled = TRUE WHERE account_id = $1")
+        .bind(disabled.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("account should be disabled");
+    repository
+        .insert(
+            usable,
+            "usable",
+            b"usable-ciphertext",
+            Utc::now() + chrono::Duration::hours(1),
+        )
+        .await
+        .expect("usable account should be inserted");
+
+    let selector = CredentialRepositoryAccountSelector::new(repository);
+    assert_eq!(selector.select_account(None).await.unwrap(), Some(usable));
+    assert_eq!(selector.select_account(Some(expired)).await.unwrap(), None);
+    assert_eq!(selector.select_account(Some(disabled)).await.unwrap(), None);
+    assert_eq!(
+        selector.select_account(Some(usable)).await.unwrap(),
+        Some(usable)
+    );
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]

@@ -12,9 +12,9 @@
 > transport can be injected into the runtime worker; QR/login exchange and
 > browser health checks remain unfinished. The single-admin API and panel are
 > available when explicitly enabled. API
-> liveness/readiness endpoints are available. Source
-> synchronization requires a WeRead account ID and uses the enrolled cookie
-> header when no pre-authenticated browser profile is configured.
+> liveness/readiness endpoints are available. Source synchronization uses the
+> enrolled cookie header for every authenticated WeRead request; the account ID
+> is optional because accounts can be selected from the admin-enrolled records.
 
 When browser-backed source synchronization is enabled, its worker and browser
 sidecar must use the same IANA timezone for quiet-hours decisions and
@@ -73,7 +73,7 @@ environment; do not put credentials in a Dockerfile, image layer, or committed
 configuration file. The image contains the application and timezone/CA data,
 but browser-backed source synchronization still requires the separately
 configured WebDriver sidecar described below. Its authenticated session can
-come from an admin-enrolled cookie header or the compatibility profile.
+come from the admin-enrolled cookie header.
 
 The public feeds, health endpoints, and optional admin panel share the API
 listener. Set its host and port with `HTTP_BIND` and `HTTP_PORT`:
@@ -89,11 +89,12 @@ non-zero port. There is no separate admin listener. For an IPv6 bind, provide
 the raw address (for example, `::1`); the application formats the socket
 address correctly before binding.
 
-The API role is executable by itself. The scheduler role and source-sync worker
-dispatch require the authenticated settings below; without them, a worker
-remains feed-rebuild-only and scheduler startup fails closed rather than
-creating jobs that no worker can execute. `APP_ROLES=all` therefore requires
-the same settings.
+The API role is executable by itself. Scheduler startup does not require a
+WeRead account: source-sync workers are composed even before enrollment, and a
+source-sync job records a warning and a scheduled failure when no usable
+account exists. The source is then considered again on its next scheduling
+interval. `APP_ROLES=all` can therefore start before the administrator fills
+the WeRead authentication form.
 `RSS_FEED_URL` must be set to the public HTTP(S) URL that generated RSS
 channels should advertise. Browser-session capacity and worker replica count
 must be intentional; increasing API replicas for RSS traffic must not
@@ -101,25 +102,29 @@ automatically increase upstream fetch concurrency.
 
 ### Authenticated WeRead source synchronization
 
-Set the account ID and endpoint to enable source-sync acquisition. A browser
-profile is optional when the account was enrolled through the admin panel:
+The endpoint is always configured for source-sync acquisition. An account ID
+is optional when using an admin-enrolled account:
 
 ```text
-WEREAD_ACCOUNT_ID=<stable-account-uuid>
 WEREAD_ARTICLE_LIST_URL=https://i.weread.qq.com/web/mp/articles
 ```
 
-When `BROWSER_AUTHENTICATED_PROFILE` is set, the profile must already contain
-an authorized WeRead session and must be mounted into the browser sidecar at
-the configured path. Otherwise, enroll the cookie header from the admin panel;
-the runtime injects it into a fresh authenticated browser session. Both paths
-hold a PostgreSQL account lease while the authenticated request is active and
-release it before opening a clean public session for article content. Neither
-path sends authentication material to public WeChat pages. The article-list
+`WEREAD_ACCOUNT_ID` remains available as the default panel-enrolled account.
+When it is unset, each source-sync job
+selects a non-disabled, unexpired account from PostgreSQL; a source-specific
+account relationship takes precedence. If no usable account is enrolled, the
+job fails with a warning and the source is left for its next scheduling
+interval. Enroll or replace credentials later from the protected admin panel;
+the running worker observes the account on a subsequent job without a restart.
+
+Enroll the cookie header from the admin panel; the runtime injects it into a
+fresh authenticated browser session. The runtime holds a PostgreSQL account
+lease while the authenticated request is active and releases it before
+opening a clean public session for article content. Authentication material is
+never sent to public WeChat pages. The article-list
 URL is restricted by configuration validation to the exact HTTPS
 `i.weread.qq.com/web/mp/articles` endpoint without credentials, fragments, or
-a non-default port. If `WEREAD_ACCOUNT_ID` is missing, source-sync composition
-is disabled and scheduler startup is rejected.
+a non-default port.
 
 The admin panel provides the non-interactive credential enrollment flow: after
 signing in at `/admin/login`, copy the complete `Cookie` request-header value
@@ -150,10 +155,10 @@ CREDENTIAL_ENCRYPTION_KEY
 ```
 
 The sample deliberately leaves the Secret out of the repository. It uses
-`APP_ROLES=api` so the deployment is safe to start without a configured
-authenticated WeRead profile; add the browser, WeRead, worker, and scheduler
-settings from the environment-variable reference before selecting additional
-roles. Pin the Firefox image to an image digest for production, and replace
+`APP_ROLES=api` so the deployment is safe to start without configured WeRead
+credentials; add the browser, WeRead, worker, and scheduler settings from the
+environment-variable reference before selecting additional roles. Pin the
+Firefox image to an image digest for production, and replace
 either image reference when deploying a fork or a different release:
 
 ```sh
@@ -233,10 +238,9 @@ readiness diagnostic that reports its configured timezone and the browser
 session should verify the browser-visible timezone during session setup.
 
 The WebDriver port remains Pod-internal. NetworkPolicy should prevent external
-clients from reaching it. Browser profile and asset storage require persistent
-volumes only when session persistence or local asset storage is selected.
-Public article extraction uses a clean ephemeral profile and never reuses the
-authenticated account profile.
+clients from reaching it. Asset storage requires persistent volumes only when
+local asset storage is selected. Public article extraction uses a clean
+ephemeral profile and never receives account credentials.
 
 API readiness is exposed at `/api/ready` and requires PostgreSQL; it does not
 fail solely because WebDriver is unavailable, allowing persisted RSS feeds to

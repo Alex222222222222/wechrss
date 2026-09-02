@@ -264,6 +264,12 @@ where
         {
             Ok(references) => references,
             Err(error) => {
+                if matches!(error, SyncAcquisitionError::NoAccountEnrolled) {
+                    tracing::warn!(
+                        source_id = %context.source.id(),
+                        "source synchronization skipped; no usable WeRead account is enrolled"
+                    );
+                }
                 return Err(SourceSyncExecutionError::AfterRun {
                     context: Box::new(context),
                     failure: classify_acquisition_error(&error),

@@ -5,10 +5,9 @@
 //! PostgreSQL pool, builds only the selected adapters, and supervises the API,
 //! scheduler, and executable feed-rebuild/source-sync worker loops.
 //!
-//! Authenticated source work is constructed when a WeRead account identity is
-//! configured. It uses either a pre-authenticated browser profile or an
-//! encrypted cookie enrolled through the admin panel. QR login remains
-//! intentionally deferred.
+//! Authenticated source work is constructed for worker roles and resolves a
+//! usable WeRead account at job time and injects the encrypted cookie enrolled
+//! through the admin panel. QR login remains intentionally deferred.
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration as StdDuration};
 
@@ -71,6 +70,7 @@ use super::{
     source_sync_acquirer::{
         BrowserSourceSyncAcquirer, BrowserSourceSyncAcquirerConfig,
         BrowserSourceSyncAcquirerConfigError, BrowserSourceSyncAcquirerDependencies,
+        CredentialRepositoryAccountSelector,
     },
     source_sync_handler::{
         SourceSyncJobHandler, SourceSyncJobHandlerConfig, SourceSyncJobHandlerConfigError,
@@ -94,6 +94,7 @@ type SourceSyncHandler = SourceSyncJobHandler<
         PostgresAccountLeaseRepository,
         BrowserWeReadAdapter,
         WebDriverArticlePageFetcher,
+        CredentialRepositoryAccountSelector<PostgresCredentialRepository>,
     >,
 >;
 
@@ -282,9 +283,6 @@ impl RuntimeSupervisor {
 
     fn validated_plan(config: &AppConfig) -> Result<RuntimePlan, RuntimeSupervisorError> {
         let plan = RuntimePlan::from_config(config).map_err(RuntimeSupervisorError::Plan)?;
-        if plan.component(AppRole::Scheduler).is_some() && !config.weread_source_sync_configured() {
-            return Err(RuntimeSupervisorError::SourceSyncNotConfigured);
-        }
         if plan.component(AppRole::Worker).is_some() && config.rss_feed_url.is_none() {
             return Err(RuntimeSupervisorError::FeedUrlNotConfigured);
         }
@@ -578,10 +576,6 @@ impl RuntimeSupervisor {
         &self,
         worker_index: u32,
     ) -> Result<SourceSyncHandler, RuntimeSupervisorError> {
-        let account_id = self
-            .config
-            .weread_account_id
-            .ok_or(RuntimeSupervisorError::SourceSyncNotConfigured)?;
         let browser_profile = BrowserProfile {
             user_agent: self.config.browser_user_agent.clone(),
             viewport: BrowserViewport::new(
@@ -592,30 +586,25 @@ impl RuntimeSupervisor {
             expected_timezone: Some(self.config.timezone),
             extra_args: self.config.browser_extra_args.clone(),
         };
-        let mut webdriver = WebDriverFactory::new(
+        let webdriver = WebDriverFactory::new(
             self.config.webdriver_url.clone(),
             self.config.browser_engine,
         )
         .with_profile(browser_profile);
-        if let Some(profile_path) = self.config.browser_authenticated_profile.as_deref() {
-            webdriver = webdriver.with_authenticated_profile_path(profile_path);
-        }
         let acquisition_config = BrowserSourceSyncAcquirerConfig::new(
-            account_id,
+            self.config.weread_account_id,
             format!("{}-source-worker", self.config.instance_id),
             chrono_duration(self.config.account_lease, "ACCOUNT_LEASE_SECONDS")?,
             chrono_duration(self.config.account_heartbeat, "ACCOUNT_HEARTBEAT_SECONDS")?,
         )
         .map_err(RuntimeSupervisorError::SourceSyncAcquirerConfig)?;
         let pacing = PacingController::from_entropy(self.config.pacing);
-        let mut weread = BrowserWeReadAdapter::new(self.config.weread_article_list_url.clone())
+        let weread = BrowserWeReadAdapter::new(self.config.weread_article_list_url.clone())
             .map_err(RuntimeSupervisorError::WeReadEndpoint)?
-            .with_pacing(pacing.clone());
-        if self.config.browser_authenticated_profile.is_none() {
-            weread = weread.with_credential_provider(Arc::new(RuntimeWeReadCredentialProvider {
+            .with_pacing(pacing.clone())
+            .with_credential_provider(Arc::new(RuntimeWeReadCredentialProvider {
                 auth: self.build_auth_service()?,
             }));
-        }
         let acquirer = BrowserSourceSyncAcquirer::new(
             BrowserSourceSyncAcquirerDependencies {
                 browser_pool: self
@@ -627,6 +616,9 @@ impl RuntimeSupervisor {
                 weread,
                 article_pages: WebDriverArticlePageFetcher::new(self.config.timezone)
                     .with_pacing(pacing),
+                account_selector: CredentialRepositoryAccountSelector::new(
+                    PostgresCredentialRepository::new(self.pool.clone()),
+                ),
             },
             acquisition_config,
             worker_index,
@@ -760,9 +752,8 @@ pub enum RuntimeSupervisorError {
     /// Administrative authentication could not be constructed.
     #[error(transparent)]
     AdminAuth(#[from] crate::web::auth::AuthConfigError),
-    /// Scheduler and source-sync workers require authenticated acquisition
-    /// settings so queued source work is executable.
-    #[error("authenticated WeRead source-sync settings are required for the scheduler role")]
+    /// The source-sync handler could not be configured.
+    #[error("source-sync handler could not be configured")]
     SourceSyncNotConfigured,
     /// Feed workers must not publish a placeholder channel URL.
     #[error("RSS_FEED_URL is required when the worker role is enabled")]
@@ -900,10 +891,6 @@ mod tests {
                 "https://feeds.example.test/werrss.xml".to_owned(),
             ),
             (
-                "BROWSER_AUTHENTICATED_PROFILE".to_owned(),
-                "/profiles/weread".to_owned(),
-            ),
-            (
                 "WEREAD_ACCOUNT_ID".to_owned(),
                 "00000000-0000-0000-0000-000000000001".to_owned(),
             ),
@@ -1013,15 +1000,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_requires_authenticated_source_sync_configuration() {
+    async fn scheduler_starts_without_an_enrolled_weread_account() {
+        let supervisor = RuntimeSupervisor::new(config("scheduler"), lazy_pool())
+            .expect("scheduler startup must not depend on account enrollment");
         assert!(matches!(
-            RuntimeSupervisor::new(config("scheduler"), lazy_pool()),
-            Err(RuntimeSupervisorError::SourceSyncNotConfigured)
+            supervisor.plan().component(AppRole::Scheduler),
+            Some(RuntimeComponent::Scheduler(_))
         ));
-        assert!(matches!(
-            RuntimeSupervisor::new(config("all"), lazy_pool()),
-            Err(RuntimeSupervisorError::SourceSyncNotConfigured)
-        ));
+    }
+
+    #[tokio::test]
+    async fn all_roles_start_without_an_enrolled_weread_account() {
+        let supervisor = RuntimeSupervisor::new(config("all"), lazy_pool())
+            .expect("all roles must wait for account enrollment at job time");
+        assert!(supervisor.plan().component(AppRole::Scheduler).is_some());
+        assert!(supervisor.plan().component(AppRole::Worker).is_some());
     }
 
     #[tokio::test]
@@ -1046,11 +1039,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn panel_enrolled_accounts_allow_source_sync_without_a_profile() {
-        let mut config = authenticated_config("all");
-        config.browser_authenticated_profile = None;
-        let supervisor = RuntimeSupervisor::new(config, lazy_pool())
-            .expect("an enrolled-account runtime should not require a profile");
+    async fn panel_enrolled_accounts_allow_source_sync() {
+        let supervisor = RuntimeSupervisor::new(authenticated_config("all"), lazy_pool())
+            .expect("an enrolled-account runtime should use panel credentials");
         let RuntimeComponent::Worker(plan) = supervisor
             .plan()
             .component(AppRole::Worker)
@@ -1061,7 +1052,7 @@ mod tests {
 
         supervisor
             .build_worker(plan, 0)
-            .expect("cookie-backed source-sync worker should be constructible");
+            .expect("panel-credential source-sync worker should be constructible");
     }
 
     #[tokio::test]

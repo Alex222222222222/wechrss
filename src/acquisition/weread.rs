@@ -115,6 +115,9 @@ pub enum WeReadAdapterError {
     /// could be parsed.
     #[error("WeRead browser operation failed: {0}")]
     Browser(String),
+    /// No admin-enrolled credential provider was configured for the request.
+    #[error("WeRead credential provider is not configured")]
+    CredentialProviderNotConfigured,
     /// A response omitted the stable identity needed for idempotent storage.
     #[error("WeRead article review_id must not be empty")]
     InvalidReviewId,
@@ -403,8 +406,7 @@ impl BrowserWeReadAdapter {
         self
     }
 
-    /// Uses encrypted credentials supplied by the application boundary. When
-    /// absent, the adapter retains the legacy pre-authenticated-profile mode.
+    /// Uses encrypted credentials supplied by the application boundary.
     pub fn with_credential_provider(mut self, provider: Arc<dyn WeReadCredentialProvider>) -> Self {
         self.credential_provider = Some(provider);
         self
@@ -427,26 +429,28 @@ where
     ) -> Result<Vec<WeReadArticleReference>, WeReadAdapterError> {
         let endpoint = article_list_endpoint(&self.endpoint, book_id)?;
         request.ensure_usable().map_err(WeReadAdapterError::from)?;
-        if let Some(provider) = &self.credential_provider {
-            let credentials = provider
-                .credentials(request.account_id())
-                .await
-                .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
-            let cookie = credentials.web_cookie().ok_or_else(|| {
-                WeReadAdapterError::Browser(
-                    "stored WeRead credentials do not contain a web cookie".to_owned(),
-                )
-            })?;
-            request
-                .goto("https://i.weread.qq.com/")
-                .await
-                .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
-            request
-                .install_cookie_header(cookie)
-                .await
-                .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
-            request.ensure_usable().map_err(WeReadAdapterError::from)?;
-        }
+        let provider = self
+            .credential_provider
+            .as_ref()
+            .ok_or(WeReadAdapterError::CredentialProviderNotConfigured)?;
+        let credentials = provider
+            .credentials(request.account_id())
+            .await
+            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+        let cookie = credentials.web_cookie().ok_or_else(|| {
+            WeReadAdapterError::Browser(
+                "stored WeRead credentials do not contain a web cookie".to_owned(),
+            )
+        })?;
+        request
+            .goto("https://i.weread.qq.com/")
+            .await
+            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+        request
+            .install_cookie_header(cookie)
+            .await
+            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+        request.ensure_usable().map_err(WeReadAdapterError::from)?;
         if let Some(pacing) = &self.pacing {
             pacing.wait(crate::domain::pacing::DelayKind::Request).await;
         }

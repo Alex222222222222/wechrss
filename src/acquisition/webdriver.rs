@@ -20,9 +20,9 @@
 //! exposes only safe navigation, current-URL, source, bounded scrolling, close,
 //! and environment diagnostic operations to sibling acquisition code. It does
 //! not expose cookies, storage, raw protocol commands, or an authenticated
-//! session. Authenticated sessions may use an explicitly configured,
-//! pre-authenticated browser profile; that profile is never accepted by the
-//! public-session path. The factory asks the browser's `Intl` implementation to
+//! session. Authenticated sessions receive credentials from the WeRead adapter
+//! through the admin-enrolled credential provider. The factory asks the
+//! browser's `Intl` implementation to
 //! canonicalize the configured IANA timezone and compares that result with the
 //! browser diagnostic when the profile declares an expected timezone; public
 //! article pacing and bounded scroll execution are coordinated by
@@ -91,7 +91,6 @@ pub struct WebDriverFactory {
     endpoint: Url,
     engine: BrowserEngine,
     profile: BrowserProfile,
-    authenticated_profile: Option<String>,
 }
 
 /// Browser settings that are applied consistently to one fresh session.
@@ -175,7 +174,6 @@ impl WebDriverFactory {
             endpoint,
             engine,
             profile: BrowserProfile::default(),
-            authenticated_profile: None,
         }
     }
 
@@ -186,17 +184,6 @@ impl WebDriverFactory {
             profile.locale = "zh-CN".to_owned();
         }
         self.profile = profile;
-        self
-    }
-
-    /// Uses a pre-authenticated browser profile for authenticated sessions.
-    ///
-    /// The path is applied only to [`Self::open_authenticated`]. Public
-    /// sessions always use the fresh profile created by WebDriver. The browser
-    /// sidecar must have access to this path and must not share it between
-    /// concurrent browser sessions.
-    pub fn with_authenticated_profile_path(mut self, path: impl Into<String>) -> Self {
-        self.authenticated_profile = Some(path.into());
         self
     }
 
@@ -211,7 +198,7 @@ impl WebDriverFactory {
         pool: &BrowserPool,
     ) -> Result<PublicBrowserSession, WebDriverError> {
         let session = pool.open_public().await?;
-        let client = connect(self.endpoint.clone(), self.engine, &self.profile, None)
+        let client = connect(self.endpoint.clone(), self.engine, &self.profile)
             .await
             .map_err(WebDriverError::Connect)?;
         if let Err(error) = self.validate_environment(&client).await {
@@ -228,10 +215,10 @@ impl WebDriverFactory {
 
     /// Opens an authenticated browser session fenced by one account lease.
     ///
-    /// A pre-authenticated browser profile or a cookie injected by the
-    /// authenticated protocol adapter is used. The lease is acquired before
-    /// WebDriver creation and released again if session creation fails, so a
-    /// broken sidecar cannot strand account ownership until expiry.
+    /// The authenticated protocol adapter injects the account cookie after
+    /// the session is created. The lease is acquired before WebDriver creation
+    /// and released again if session creation fails, so a broken sidecar cannot
+    /// strand account ownership until expiry.
     pub async fn open_authenticated<R>(
         &self,
         pool: &BrowserPool,
@@ -249,14 +236,7 @@ impl WebDriverFactory {
         else {
             return Ok(None);
         };
-        let client = match connect(
-            self.endpoint.clone(),
-            self.engine,
-            &self.profile,
-            self.authenticated_profile.as_deref(),
-        )
-        .await
-        {
+        let client = match connect(self.endpoint.clone(), self.engine, &self.profile).await {
             Ok(client) => client,
             Err(error) => {
                 let _ = session.release().await;
@@ -304,9 +284,8 @@ async fn connect(
     endpoint: Url,
     engine: BrowserEngine,
     profile: &BrowserProfile,
-    authenticated_profile: Option<&str>,
 ) -> Result<WebDriver, String> {
-    let capabilities = capabilities_for(engine, profile, authenticated_profile)?;
+    let capabilities = capabilities_for(engine, profile)?;
     let driver = WebDriver::builder(endpoint.as_str(), capabilities)
         .request_timeout(WEBDRIVER_REQUEST_TIMEOUT)
         .connect()
@@ -367,10 +346,8 @@ async fn canonical_timezone(client: &WebDriver, timezone: Tz) -> Result<String, 
 fn capabilities_for(
     engine: BrowserEngine,
     profile: &BrowserProfile,
-    authenticated_profile: Option<&str>,
 ) -> Result<Capabilities, String> {
     validate_profile(profile)?;
-    validate_authenticated_profile(authenticated_profile)?;
     match engine {
         BrowserEngine::Chromium => {
             let mut capabilities = DesiredCapabilities::chrome();
@@ -398,11 +375,6 @@ fn capabilities_for(
                     .add_arg(argument)
                     .map_err(|error| error.to_string())?;
             }
-            if let Some(path) = authenticated_profile {
-                capabilities
-                    .add_arg(&format!("--user-data-dir={path}"))
-                    .map_err(|error| error.to_string())?;
-            }
             Ok(capabilities.into())
         }
         BrowserEngine::Firefox => {
@@ -425,14 +397,6 @@ fn capabilities_for(
             capabilities
                 .set_preferences(preferences)
                 .map_err(|error| error.to_string())?;
-            if let Some(path) = authenticated_profile {
-                capabilities
-                    .add_arg("-profile")
-                    .map_err(|error| error.to_string())?;
-                capabilities
-                    .add_arg(path)
-                    .map_err(|error| error.to_string())?;
-            }
             for argument in &profile.extra_args {
                 capabilities
                     .add_arg(argument)
@@ -476,16 +440,6 @@ fn validate_profile(profile: &BrowserProfile) -> Result<(), String> {
     }) {
         return Err(
             "extra arguments must not override controlled browser profile arguments".to_owned(),
-        );
-    }
-    Ok(())
-}
-
-fn validate_authenticated_profile(path: Option<&str>) -> Result<(), String> {
-    if path.is_some_and(|path| path.trim().is_empty() || path.chars().any(char::is_control)) {
-        return Err(
-            "authenticated browser profile path must be non-empty and free of control characters"
-                .to_owned(),
         );
     }
     Ok(())
@@ -980,7 +934,7 @@ mod tests {
     #[test]
     fn chromium_capabilities_request_a_headless_chrome_without_credentials() {
         let capabilities =
-            capabilities_for(BrowserEngine::Chromium, &BrowserProfile::default(), None).unwrap();
+            capabilities_for(BrowserEngine::Chromium, &BrowserProfile::default()).unwrap();
         assert_eq!(capabilities.get("browserName"), Some(&json!("chrome")));
         assert_eq!(
             capabilities
@@ -997,7 +951,7 @@ mod tests {
     #[test]
     fn firefox_capabilities_request_headless_firefox() {
         let capabilities =
-            capabilities_for(BrowserEngine::Firefox, &BrowserProfile::default(), None).unwrap();
+            capabilities_for(BrowserEngine::Firefox, &BrowserProfile::default()).unwrap();
         assert_eq!(capabilities.get("browserName"), Some(&json!("firefox")));
         assert_eq!(
             capabilities
@@ -1019,7 +973,7 @@ mod tests {
             expected_timezone: Some(chrono_tz::Asia::Shanghai),
             extra_args: vec!["--disable-features=SomeFeature".to_owned()],
         };
-        let capabilities = capabilities_for(BrowserEngine::Chromium, &profile, None).unwrap();
+        let capabilities = capabilities_for(BrowserEngine::Chromium, &profile).unwrap();
         let args = capabilities
             .get("goog:chromeOptions")
             .and_then(|options| options.get("args"))
@@ -1032,7 +986,7 @@ mod tests {
         assert!(args.contains(&"--disable-features=SomeFeature"));
         assert!(!capabilities.contains_key("proxy"));
 
-        let firefox = capabilities_for(BrowserEngine::Firefox, &profile, None).unwrap();
+        let firefox = capabilities_for(BrowserEngine::Firefox, &profile).unwrap();
         assert_eq!(
             firefox
                 .get("moz:firefoxOptions")
@@ -1050,47 +1004,6 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_capabilities_use_the_explicit_profile_only_for_auth_sessions() {
-        let profile = BrowserProfile::default();
-        let chromium =
-            capabilities_for(BrowserEngine::Chromium, &profile, Some("/profiles/weread")).unwrap();
-        let chromium_args = chromium
-            .get("goog:chromeOptions")
-            .and_then(|options| options.get("args"))
-            .and_then(Value::as_array)
-            .unwrap();
-        assert!(chromium_args.contains(&json!("--user-data-dir=/profiles/weread")));
-
-        let firefox =
-            capabilities_for(BrowserEngine::Firefox, &profile, Some("/profiles/weread")).unwrap();
-        let firefox_args = firefox
-            .get("moz:firefoxOptions")
-            .and_then(|options| options.get("args"))
-            .and_then(Value::as_array)
-            .unwrap();
-        let profile_position = firefox_args
-            .iter()
-            .position(|argument| argument == &json!("-profile"))
-            .expect("Firefox should receive the profile switch");
-        assert_eq!(
-            firefox_args.get(profile_position + 1),
-            Some(&json!("/profiles/weread"))
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_authenticated_profile_paths_before_capability_creation() {
-        for path in ["", "   ", "profile\nwith-control"] {
-            assert!(capabilities_for(
-                BrowserEngine::Chromium,
-                &BrowserProfile::default(),
-                Some(path)
-            )
-            .is_err());
-        }
-    }
-
-    #[test]
     fn rejects_extra_arguments_that_override_controlled_profile_values() {
         for argument in [
             "--lang=en-US",
@@ -1104,7 +1017,7 @@ mod tests {
                 extra_args: vec![argument.to_owned()],
                 ..BrowserProfile::default()
             };
-            let error = capabilities_for(BrowserEngine::Chromium, &profile, None)
+            let error = capabilities_for(BrowserEngine::Chromium, &profile)
                 .expect_err("conflicting profile argument should be rejected");
             assert!(error.contains("controlled browser profile arguments"));
         }

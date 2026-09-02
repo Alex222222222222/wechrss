@@ -7,11 +7,13 @@
 //! authenticated list request, then releases both before each public article
 //! is fetched with a clean browser session.
 //!
-//! Authentication may use an explicitly pre-authenticated browser profile or
-//! an encrypted cookie header injected by the application authentication
-//! boundary. Login and QR exchange remain outside this first runtime slice.
-//! Lease contention is reported as a retryable acquisition failure, and a lost
-//! lease is never followed by another upstream request.
+//! Authentication uses an encrypted cookie header injected by the application
+//! authentication boundary. The account is selected at job time from the
+//! source relationship or the enabled account records, so admin-panel
+//! enrollment does not require a process restart. Login and QR exchange remain
+//! outside this first runtime slice. Lease contention is reported as a
+//! retryable acquisition failure, and a lost lease is never followed by
+//! another upstream request.
 
 use chrono::Duration;
 
@@ -23,13 +25,83 @@ use crate::{
         weread::{WeReadAdapter, WeReadAdapterError, WeReadArticleReference},
     },
     domain::{credentials::WeReadAccountId, source::Source},
+    persistence::repositories::credential_repository::CredentialRepository,
 };
 
 use super::{source_sync_handler::SourceSyncAcquirer, sync_service::SyncAcquisitionError};
 
+/// Resolves the account to use for one source-sync request.
+///
+/// A requested account comes from the source relationship when present. When
+/// it is absent, implementations may select any enabled, usable account from
+/// their durable store. Selection happens immediately before browser work so
+/// accounts enrolled through the admin panel become available without a
+/// process restart.
+#[async_trait::async_trait]
+pub trait WeReadAccountSelector: Send + Sync {
+    /// Returns a usable account, or `None` when no account is currently
+    /// enrolled and enabled.
+    async fn select_account(
+        &self,
+        requested: Option<WeReadAccountId>,
+    ) -> Result<Option<WeReadAccountId>, WeReadAdapterError>;
+}
+
+/// PostgreSQL- or memory-backed account selector for runtime source jobs.
+#[derive(Clone)]
+pub struct CredentialRepositoryAccountSelector<R> {
+    accounts: R,
+}
+
+impl<R> CredentialRepositoryAccountSelector<R> {
+    /// Creates a selector backed by the supplied credential repository.
+    pub const fn new(accounts: R) -> Self {
+        Self { accounts }
+    }
+}
+
+#[async_trait::async_trait]
+impl<R> WeReadAccountSelector for CredentialRepositoryAccountSelector<R>
+where
+    R: CredentialRepository + Clone,
+{
+    async fn select_account(
+        &self,
+        requested: Option<WeReadAccountId>,
+    ) -> Result<Option<WeReadAccountId>, WeReadAdapterError> {
+        let now = self
+            .accounts
+            .database_now()
+            .await
+            .map_err(|error| WeReadAdapterError::LeaseBackend(error.to_string()))?;
+        let record = match requested {
+            Some(account_id) => self
+                .accounts
+                .find(account_id)
+                .await
+                .map_err(|error| WeReadAdapterError::LeaseBackend(error.to_string()))?,
+            None => self
+                .accounts
+                .list()
+                .await
+                .map_err(|error| WeReadAdapterError::LeaseBackend(error.to_string()))?
+                .into_iter()
+                .find(|record| {
+                    !record.account().disabled() && record.account().access_expires_at() > now
+                }),
+        };
+
+        Ok(record
+            .filter(|record| {
+                !record.account().disabled() && record.account().access_expires_at() > now
+            })
+            .map(|record| record.account().account_id()))
+    }
+}
+
 /// Dependencies for the concrete source-sync acquisition adapter.
 #[derive(Clone)]
-pub struct BrowserSourceSyncAcquirerDependencies<R, W, A> {
+pub struct BrowserSourceSyncAcquirerDependencies<R, W, A, S> {
     /// Process-local browser capacity shared by worker tasks.
     pub browser_pool: BrowserPool,
     /// WebDriver connection and browser-profile policy.
@@ -40,26 +112,30 @@ pub struct BrowserSourceSyncAcquirerDependencies<R, W, A> {
     pub weread: W,
     /// Credential-free public article-page fetcher.
     pub article_pages: A,
+    /// Durable account selector used when the source has no fixed account.
+    pub account_selector: S,
 }
 
 /// Runtime policy for authenticated source synchronization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserSourceSyncAcquirerConfig {
-    account_id: WeReadAccountId,
+    account_id: Option<WeReadAccountId>,
     owner: String,
     lease_for: Duration,
     heartbeat_for: Duration,
 }
 
 impl BrowserSourceSyncAcquirerConfig {
-    /// Creates a policy for the configured default WeRead account.
+    /// Creates a policy with an optional environment-configured default
+    /// account. When it is absent, the account selector is consulted for each
+    /// source-sync job.
     pub fn new(
-        account_id: WeReadAccountId,
+        account_id: Option<WeReadAccountId>,
         owner: impl Into<String>,
         lease_for: Duration,
         heartbeat_for: Duration,
     ) -> Result<Self, BrowserSourceSyncAcquirerConfigError> {
-        if account_id.as_uuid().is_nil() {
+        if account_id.is_some_and(|account_id| account_id.as_uuid().is_nil()) {
             return Err(BrowserSourceSyncAcquirerConfigError::InvalidAccountId);
         }
         let owner = owner.into();
@@ -81,7 +157,7 @@ impl BrowserSourceSyncAcquirerConfig {
     }
 
     /// Returns the default account used when a source has no account override.
-    pub const fn account_id(&self) -> WeReadAccountId {
+    pub const fn account_id(&self) -> Option<WeReadAccountId> {
         self.account_id
     }
 
@@ -120,18 +196,18 @@ pub enum BrowserSourceSyncAcquirerConfigError {
 
 /// Thirtyfour-backed source-sync acquisition implementation.
 #[derive(Clone)]
-pub struct BrowserSourceSyncAcquirer<R, W, A> {
-    dependencies: BrowserSourceSyncAcquirerDependencies<R, W, A>,
+pub struct BrowserSourceSyncAcquirer<R, W, A, S> {
+    dependencies: BrowserSourceSyncAcquirerDependencies<R, W, A, S>,
     config: BrowserSourceSyncAcquirerConfig,
     worker_index: u32,
 }
 
-impl<R, W, A> BrowserSourceSyncAcquirer<R, W, A> {
+impl<R, W, A, S> BrowserSourceSyncAcquirer<R, W, A, S> {
     /// Creates one worker-local adapter. The browser pool and lease store may
     /// be cloned into other workers; the durable account lease serializes use
-    /// of the configured account across them.
+    /// of the selected account across them.
     pub fn new(
-        dependencies: BrowserSourceSyncAcquirerDependencies<R, W, A>,
+        dependencies: BrowserSourceSyncAcquirerDependencies<R, W, A, S>,
         config: BrowserSourceSyncAcquirerConfig,
         worker_index: u32,
     ) -> Self {
@@ -143,28 +219,39 @@ impl<R, W, A> BrowserSourceSyncAcquirer<R, W, A> {
     }
 }
 
-impl<R, W, A> SourceSyncAcquirer for BrowserSourceSyncAcquirer<R, W, A>
+impl<R, W, A, S> SourceSyncAcquirer for BrowserSourceSyncAcquirer<R, W, A, S>
 where
     R: AccountLeaseStore + Clone + 'static,
     W: WeReadAdapter<R>,
     A: ArticlePageFetcher,
+    S: WeReadAccountSelector,
 {
     async fn list_article_references(
         &self,
         source: &Source,
     ) -> Result<Vec<WeReadArticleReference>, SyncAcquisitionError> {
-        let account_id = source.account_id().unwrap_or(self.config.account_id());
-        if source
-            .account_id()
-            .is_some_and(|source_account| source_account != self.config.account_id())
-        {
-            return Err(SyncAcquisitionError::WeRead(
-                WeReadAdapterError::LeaseBackend(
-                    "source account is not available in the configured authenticated profile"
-                        .to_owned(),
-                ),
-            ));
-        }
+        let account_id = match self.config.account_id() {
+            Some(configured) => {
+                if source
+                    .account_id()
+                    .is_some_and(|source_account| source_account != configured)
+                {
+                    return Err(SyncAcquisitionError::WeRead(
+                        WeReadAdapterError::LeaseBackend(
+                            "source account is not available in the configured account".to_owned(),
+                        ),
+                    ));
+                }
+                configured
+            }
+            None => self
+                .dependencies
+                .account_selector
+                .select_account(source.account_id())
+                .await
+                .map_err(SyncAcquisitionError::WeRead)?
+                .ok_or(SyncAcquisitionError::NoAccountEnrolled)?,
+        };
         let owner = self.config.owner_for(self.worker_index);
         let session = self
             .dependencies
@@ -265,7 +352,10 @@ mod tests {
         },
         config::BrowserEngine,
         domain::source::{NewSource, Source},
-        persistence::repositories::account_lease_repository::MemoryAccountLeaseRepository,
+        persistence::repositories::{
+            account_lease_repository::MemoryAccountLeaseRepository,
+            credential_repository::{CredentialRepository, MemoryCredentialRepository},
+        },
     };
     use uuid::Uuid;
 
@@ -308,13 +398,30 @@ mod tests {
         }
     }
 
-    fn acquirer(
+    #[derive(Clone)]
+    struct StaticAccountSelector {
+        account_id: Option<WeReadAccountId>,
+    }
+
+    #[async_trait::async_trait]
+    impl WeReadAccountSelector for StaticAccountSelector {
+        async fn select_account(
+            &self,
+            requested: Option<WeReadAccountId>,
+        ) -> Result<Option<WeReadAccountId>, WeReadAdapterError> {
+            Ok(requested.or(self.account_id))
+        }
+    }
+
+    fn acquirer_with_account_and_selector(
         repository: MemoryAccountLeaseRepository,
-        account_id: WeReadAccountId,
+        account_id: Option<WeReadAccountId>,
+        selected_account_id: Option<WeReadAccountId>,
     ) -> BrowserSourceSyncAcquirer<
         MemoryAccountLeaseRepository,
         UnusedWeReadAdapter,
         UnusedArticlePageFetcher,
+        StaticAccountSelector,
     > {
         let config = BrowserSourceSyncAcquirerConfig::new(
             account_id,
@@ -335,17 +442,32 @@ mod tests {
                 account_leases: repository,
                 weread: UnusedWeReadAdapter,
                 article_pages: UnusedArticlePageFetcher,
+                account_selector: StaticAccountSelector {
+                    account_id: selected_account_id,
+                },
             },
             config,
             0,
         )
     }
 
+    fn acquirer(
+        repository: MemoryAccountLeaseRepository,
+        account_id: WeReadAccountId,
+    ) -> BrowserSourceSyncAcquirer<
+        MemoryAccountLeaseRepository,
+        UnusedWeReadAdapter,
+        UnusedArticlePageFetcher,
+        StaticAccountSelector,
+    > {
+        acquirer_with_account_and_selector(repository, Some(account_id), Some(account_id))
+    }
+
     #[test]
     fn rejects_invalid_lease_policies_before_browser_work() {
         assert_eq!(
             BrowserSourceSyncAcquirerConfig::new(
-                WeReadAccountId::from_uuid(Uuid::nil()),
+                Some(WeReadAccountId::from_uuid(Uuid::nil())),
                 "worker",
                 Duration::seconds(30),
                 Duration::seconds(5),
@@ -354,7 +476,7 @@ mod tests {
         );
         assert_eq!(
             BrowserSourceSyncAcquirerConfig::new(
-                account_id(),
+                Some(account_id()),
                 " ",
                 Duration::seconds(30),
                 Duration::seconds(5),
@@ -363,7 +485,7 @@ mod tests {
         );
         assert_eq!(
             BrowserSourceSyncAcquirerConfig::new(
-                account_id(),
+                Some(account_id()),
                 "worker",
                 Duration::seconds(5),
                 Duration::seconds(5),
@@ -375,7 +497,7 @@ mod tests {
     #[test]
     fn derives_distinct_worker_lease_owners() {
         let config = BrowserSourceSyncAcquirerConfig::new(
-            account_id(),
+            Some(account_id()),
             "instance-source-worker",
             Duration::seconds(30),
             Duration::seconds(5),
@@ -405,6 +527,75 @@ mod tests {
                 WeReadAdapterError::LeaseBackend(message)
             )) if message.contains("already in use")
         ));
+    }
+
+    #[tokio::test]
+    async fn no_enrolled_account_fails_before_opening_authenticated_browser_work() {
+        let result = acquirer_with_account_and_selector(
+            MemoryAccountLeaseRepository::new(chrono::Utc::now()),
+            None,
+            None,
+        )
+        .list_article_references(&source(None))
+        .await;
+
+        assert_eq!(result, Err(SyncAcquisitionError::NoAccountEnrolled));
+    }
+
+    #[tokio::test]
+    async fn selects_the_source_account_from_the_durable_account_selector() {
+        let selected = account_id();
+        let repository = MemoryAccountLeaseRepository::new(chrono::Utc::now());
+        let _held = repository
+            .acquire(selected, "another-worker", Duration::seconds(30))
+            .await
+            .unwrap()
+            .expect("the competing worker should acquire the selected account");
+
+        let result = acquirer_with_account_and_selector(repository, None, Some(selected))
+            .list_article_references(&source(None))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SyncAcquisitionError::WeRead(
+                WeReadAdapterError::LeaseBackend(message)
+            )) if message.contains("already in use")
+        ));
+    }
+
+    #[tokio::test]
+    async fn selects_the_first_unexpired_enrolled_account_and_honors_overrides() {
+        let now = chrono::Utc::now();
+        let expired = WeReadAccountId::from_uuid(Uuid::from_u128(2));
+        let enrolled = account_id();
+        let repository = MemoryCredentialRepository::new(now);
+        repository
+            .insert(
+                expired,
+                "expired",
+                b"expired-ciphertext",
+                now - chrono::Duration::seconds(1),
+            )
+            .await
+            .unwrap();
+        repository
+            .insert(
+                enrolled,
+                "enrolled",
+                b"enrolled-ciphertext",
+                now + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+
+        let selector = CredentialRepositoryAccountSelector::new(repository);
+        assert_eq!(selector.select_account(None).await.unwrap(), Some(enrolled));
+        assert_eq!(selector.select_account(Some(expired)).await.unwrap(), None);
+        assert_eq!(
+            selector.select_account(Some(enrolled)).await.unwrap(),
+            Some(enrolled)
+        );
     }
 
     #[tokio::test]

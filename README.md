@@ -87,7 +87,7 @@ keys in a secret manager or an ignored local environment file.
 | `DATABASE_URL` | **Required** | PostgreSQL connection URL, including any SQLx-supported SSL, certificate, and authentication query parameters. It is passed through to SQLx and never logged. |
 | `DATABASE_POOL_MIN_CONNECTIONS` | `1` | Minimum number of PostgreSQL connections kept in the pool. It must not exceed the maximum. |
 | `DATABASE_POOL_MAX_CONNECTIONS` | `10` | Maximum number of PostgreSQL connections. It must be greater than zero. |
-| `APP_ROLES` | `api` | Comma-separated roles: `api`, `scheduler`, and/or `worker`; `all` enables every role. Scheduler/source-sync and worker configuration is validated according to the selected roles. |
+| `APP_ROLES` | `api` | Comma-separated roles: `api`, `scheduler`, and/or `worker`; `all` enables every role. Scheduler startup does not require an enrolled WeRead account; source-sync jobs wait for the next scheduling pass when no usable account exists. |
 | `APP_INSTANCE_ID` | Generated UUID | Stable instance identity used for distributed job leases. Set a distinct value for each long-lived replica; an ID is generated for local use when omitted. |
 | `HTTP_BIND` | `0.0.0.0` | Host or IP address for the shared feed, health, and optional admin listener. IPv6 addresses may be supplied without brackets. |
 | `HTTP_PORT` | `8080` | Shared HTTP listener port. It must be between `1` and `65535`. |
@@ -105,9 +105,8 @@ keys in a secret manager or an ignored local environment file.
 | `BROWSER_LOCALE` | `zh-CN` | Locale passed to the browser profile. It must be a non-empty locale token without whitespace. |
 | `BROWSER_VIEWPORT_WIDTH` | `1280` | Browser viewport width in CSS pixels. Valid range: `1`–`8192`. |
 | `BROWSER_VIEWPORT_HEIGHT` | `2000` | Browser viewport height in CSS pixels. Valid range: `1`–`8192`. |
-| `BROWSER_EXTRA_ARGS` | Empty | Optional whitespace-separated browser arguments. At most 32 arguments are accepted, each must begin with `-`, and controlled profile arguments such as User-Agent, window size, profile path, and headless mode cannot be overridden. |
-| `BROWSER_AUTHENTICATED_PROFILE` | Unset | Optional path to a pre-authenticated browser profile used for the authenticated WeRead list request. When omitted, source synchronization loads the encrypted cookie header enrolled in the admin panel. |
-| `WEREAD_ACCOUNT_ID` | Unset | Stable WeRead account UUID associated with authenticated source synchronization. It is required for scheduler/source-sync roles and can be copied from the admin enrollment response. |
+| `BROWSER_EXTRA_ARGS` | Empty | Optional whitespace-separated browser arguments. At most 32 arguments are accepted, each must begin with `-`, and controlled browser arguments such as User-Agent, window size, persistent-profile paths, and headless mode cannot be overridden. |
+| `WEREAD_ACCOUNT_ID` | Unset | Optional stable WeRead account UUID used as the default panel-enrolled account. When unset, source-sync selects an enabled, unexpired account enrolled through the admin panel from PostgreSQL for each job. |
 | `WEREAD_ARTICLE_LIST_URL` | `https://i.weread.qq.com/web/mp/articles` | Exact HTTPS WeRead article-list endpoint. Credentials, fragments, and non-default ports are rejected. |
 
 ### Workers, jobs, and leases
@@ -203,18 +202,22 @@ than a commitment:
    availability and timezone mismatches separately from API liveness and
    PostgreSQL readiness, and prevent browser jobs from being claimed while the
    browser sidecar is unhealthy.
-2. **Add QR-code login.** Implement the bounded, single-use login-attempt
+2. **Normalize application logs.** Define a consistent structured event and
+   severity vocabulary across API, scheduler, worker, browser, and persistence
+   paths; redact sensitive values and make correlation identifiers predictable
+   for operators and log aggregation tools.
+3. **Add QR-code login.** Implement the bounded, single-use login-attempt
    lifecycle and interactive confirmation flow so operators do not need to
-   supply a pre-authenticated browser profile. This remains deferred after the
+   supply credentials manually. This remains deferred after the
    first release.
-3. **Add missed-article repair/backfill jobs.** Queue and process articles
+4. **Add missed-article repair/backfill jobs.** Queue and process articles
    missed during synchronization with bounded retries and deduplication. This
    improves recovery after partial upstream failures but is not required for
    the first release.
-4. **Persist archived assets and rewrite feed URLs.** Store approved media in
+5. **Persist archived assets and rewrite feed URLs.** Store approved media in
    local or object storage so archived articles can remain useful when
    upstream assets change or disappear.
-5. **Evaluate PGMQ as a queue transport optimization.** The current custom
+6. **Evaluate PGMQ as a queue transport optimization.** The current custom
    `jobs` table remains the version-one transport; PGMQ can be evaluated later
    if queue throughput or operational overhead becomes a demonstrated
    bottleneck.
@@ -264,12 +267,17 @@ A deployment-specific
 `CredentialRefresher` can be injected into `RuntimeSupervisor`; that enables
 `credential_refresh` jobs in the worker plan and makes the runtime scheduler
 enqueue one deduplicated refresh job for each active account within the
-refresh window. When `BROWSER_AUTHENTICATED_PROFILE` is omitted, the
-browser-backed source-sync runtime loads the enrolled cookie header through
-`AuthService` and injects it into a fresh authenticated browser session. A
-pre-authenticated profile remains available as a compatibility option. See
+refresh window. The browser-backed source-sync runtime always loads the
+enrolled cookie header through `AuthService` and injects it into a fresh
+authenticated browser session. See
 [`AuthService`](src/application/auth_service.rs) and the
 [authentication architecture](ARCHITECTURE.md#source-scheduling-and-account-leases).
+
+Scheduler and worker roles can start before any WeRead account is enrolled.
+When a due source-sync job finds no enabled, unexpired account, it records a
+warning and a scheduled failure; the source is reconsidered on its next due
+interval. Enrolling or replacing credentials in the admin panel makes the
+account available to later jobs without restarting the worker.
 
 ### Single-admin panel and API
 

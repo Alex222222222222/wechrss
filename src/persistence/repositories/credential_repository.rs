@@ -93,6 +93,10 @@ pub trait CredentialRepository: Send + Sync {
     /// Samples the authoritative persistence clock.
     async fn database_now(&self) -> Result<DateTime<Utc>, CredentialRepositoryError>;
 
+    /// Lists enabled accounts in deterministic order for runtime account
+    /// selection. Implementations must not return disabled accounts.
+    async fn list(&self) -> Result<Vec<CredentialRecord>, CredentialRepositoryError>;
+
     /// Loads one account and its encrypted credential payload.
     async fn find(
         &self,
@@ -144,6 +148,18 @@ impl CredentialRepository for PostgresCredentialRepository {
             .fetch_one(&self.pool)
             .await
             .map_err(storage_error)
+    }
+
+    async fn list(&self) -> Result<Vec<CredentialRecord>, CredentialRepositoryError> {
+        sqlx::query(
+            "SELECT account_id, display_name, credentials_ciphertext, access_expires_at, credential_version, disabled FROM weread_accounts WHERE NOT disabled ORDER BY access_expires_at ASC, account_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .into_iter()
+        .map(decode_record)
+        .collect()
     }
 
     async fn find(
@@ -371,6 +387,25 @@ impl MemoryCredentialRepository {
 impl CredentialRepository for MemoryCredentialRepository {
     async fn database_now(&self) -> Result<DateTime<Utc>, CredentialRepositoryError> {
         Ok(self.state.lock().await.now)
+    }
+
+    async fn list(&self) -> Result<Vec<CredentialRecord>, CredentialRepositoryError> {
+        let mut records: Vec<_> = self
+            .state
+            .lock()
+            .await
+            .records
+            .values()
+            .filter(|record| !record.account().disabled())
+            .cloned()
+            .collect();
+        records.sort_by_key(|record| {
+            (
+                record.account().access_expires_at(),
+                record.account().account_id().as_uuid(),
+            )
+        });
+        Ok(records)
     }
 
     async fn find(

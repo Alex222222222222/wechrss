@@ -63,6 +63,9 @@ use crate::{
 /// protocol or browser details to the synchronization domain.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SyncAcquisitionError {
+    /// No enabled account was available for the source-sync request.
+    #[error("no usable WeRead account is enrolled")]
+    NoAccountEnrolled,
     /// An authenticated WeRead list or account operation failed.
     #[error(transparent)]
     WeRead(#[from] WeReadAdapterError),
@@ -111,6 +114,11 @@ impl ClassifiedSyncFailure {
 /// Converts an acquisition boundary error to a secret-free sync-run result.
 pub fn classify_acquisition_error(error: &SyncAcquisitionError) -> ClassifiedSyncFailure {
     let (outcome, class, message) = match error {
+        SyncAcquisitionError::NoAccountEnrolled => (
+            SyncOutcome::Failed,
+            SyncFailureClass::Permanent,
+            "no usable WeRead account is enrolled",
+        ),
         SyncAcquisitionError::WeRead(WeReadAdapterError::AuthenticationExpired { .. }) => (
             SyncOutcome::AuthenticationRequired,
             SyncFailureClass::AuthenticationExpired,
@@ -126,6 +134,11 @@ pub fn classify_acquisition_error(error: &SyncAcquisitionError) -> ClassifiedSyn
             SyncOutcome::Failed,
             SyncFailureClass::Permanent,
             "WeRead article identity was invalid",
+        ),
+        SyncAcquisitionError::WeRead(WeReadAdapterError::CredentialProviderNotConfigured) => (
+            SyncOutcome::Failed,
+            SyncFailureClass::Permanent,
+            "WeRead authentication configuration is incomplete",
         ),
         SyncAcquisitionError::ArticlePage(ArticlePageError::UnsafeRedirect)
         | SyncAcquisitionError::ArticlePage(ArticlePageError::VerificationRequired) => (
@@ -414,6 +427,12 @@ mod tests {
     fn classifies_failures_without_retaining_upstream_details() {
         let cases = [
             (
+                SyncAcquisitionError::NoAccountEnrolled,
+                SyncOutcome::Failed,
+                SyncFailureClass::Permanent,
+                "no usable WeRead account is enrolled",
+            ),
+            (
                 SyncAcquisitionError::WeRead(WeReadAdapterError::AuthenticationExpired {
                     code: -2012,
                 }),
@@ -432,6 +451,12 @@ mod tests {
                 SyncOutcome::Failed,
                 SyncFailureClass::Permanent,
                 "WeRead article identity was invalid",
+            ),
+            (
+                SyncAcquisitionError::WeRead(WeReadAdapterError::CredentialProviderNotConfigured),
+                SyncOutcome::Failed,
+                SyncFailureClass::Permanent,
+                "WeRead authentication configuration is incomplete",
             ),
             (
                 SyncAcquisitionError::ArticlePage(ArticlePageError::Browser(

@@ -43,10 +43,6 @@ fn config() -> AppConfig {
             "https://feeds.example.test/werrss.xml".to_owned(),
         ),
         (
-            "BROWSER_AUTHENTICATED_PROFILE".to_owned(),
-            "/profiles/weread".to_owned(),
-        ),
-        (
             "WEREAD_ACCOUNT_ID".to_owned(),
             "00000000-0000-0000-0000-000000000001".to_owned(),
         ),

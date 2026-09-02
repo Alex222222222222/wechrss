@@ -826,6 +826,10 @@ mod tests {
             self.0.database_now().await
         }
 
+        async fn list(&self) -> Result<Vec<CredentialRecord>, CredentialRepositoryError> {
+            self.0.list().await
+        }
+
         async fn find(
             &self,
             account_id: WeReadAccountId,
