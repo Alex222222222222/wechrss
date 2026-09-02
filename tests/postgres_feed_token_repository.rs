@@ -1,7 +1,7 @@
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     application::feed_token_service::{FeedTokenService, FeedTokenServiceError},
     domain::source::{NewSource, SourceId, VerifiedWechatArticleUrl},
     persistence::{
@@ -13,7 +13,7 @@ use wechrss::{
     },
 };
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_feed_tokens_issue_rotate_revoke_and_cascade(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     insert_source(&pool, source_id).await;
@@ -75,7 +75,7 @@ async fn postgres_feed_tokens_issue_rotate_revoke_and_cascade(pool: PgPool) {
     assert_eq!(remaining, 0);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_feed_tokens_reject_missing_and_nil_sources_without_lookup_leaks(pool: PgPool) {
     let repository = PostgresFeedTokenRepository::new(pool);
     let service = FeedTokenService::new(repository);
@@ -112,7 +112,7 @@ async fn insert_source(pool: &PgPool, source_id: SourceId) {
         sync_interval: Duration::hours(1),
         rss_item_limit: 20,
         account_id: None,
-        scheduling_gate: wechrss::domain::source::SchedulingGate::Ready,
+        scheduling_gate: werrss::domain::source::SchedulingGate::Ready,
         next_fetch_at: Utc::now(),
         priority: 0,
         max_attempts: 3,

@@ -1,6 +1,6 @@
 use chrono::DateTime;
 use serde_json::json;
-use wechrss::acquisition::weread::{parse_article_list_payload, WeReadAdapterError};
+use werrss::acquisition::weread::{parse_article_list_payload, WeReadAdapterError};
 
 #[test]
 fn public_parser_handles_current_and_legacy_payloads_consistently() {

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     application::{
         feed_rebuild_handler::{FeedRebuildJobHandler, FeedRebuildJobHandlerConfig},
         feed_rebuild_service::{
@@ -32,7 +32,7 @@ use wechrss::{
     },
 };
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn rebuild_renders_normalized_articles_and_releases_the_build_lease(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -52,7 +52,7 @@ async fn rebuild_renders_normalized_articles_and_releases_the_build_lease(pool: 
     assert_eq!(
         result,
         FeedRebuildOutcome::Published {
-            feed_revision: wechrss::domain::source::FeedRevision::zero()
+            feed_revision: werrss::domain::source::FeedRevision::zero()
         }
     );
 
@@ -91,7 +91,7 @@ async fn rebuild_renders_normalized_articles_and_releases_the_build_lease(pool: 
     assert_eq!(lease_count, 0);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn rebuild_for_claimed_job_completes_cache_and_job_in_one_unit_of_work(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -132,7 +132,7 @@ async fn rebuild_for_claimed_job_completes_cache_and_job_in_one_unit_of_work(poo
             .await
             .expect("feed rebuild should complete its claimed job"),
         FeedRebuildOutcome::Published {
-            feed_revision: wechrss::domain::source::FeedRevision::zero()
+            feed_revision: werrss::domain::source::FeedRevision::zero()
         }
     );
 
@@ -141,7 +141,7 @@ async fn rebuild_for_claimed_job_completes_cache_and_job_in_one_unit_of_work(poo
         .await
         .expect("job lookup should succeed")
         .expect("completed job should remain");
-    assert_eq!(job.status(), wechrss::domain::job::JobStatus::Succeeded);
+    assert_eq!(job.status(), werrss::domain::job::JobStatus::Succeeded);
     assert_eq!(job.claim_count(), 1);
     assert_eq!(job.failure_count(), 0);
     assert!(PostgresFeedCacheRepository::new(pool)
@@ -151,7 +151,7 @@ async fn rebuild_for_claimed_job_completes_cache_and_job_in_one_unit_of_work(poo
         .is_some());
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn feed_rebuild_handler_completes_cache_and_job_without_double_completion(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -216,7 +216,7 @@ async fn feed_rebuild_handler_completes_cache_and_job_without_double_completion(
     };
     assert_eq!(job.id(), job_id);
     assert_eq!(outcome, JobExecution::Committed);
-    assert_eq!(job.status(), wechrss::domain::job::JobStatus::Succeeded);
+    assert_eq!(job.status(), werrss::domain::job::JobStatus::Succeeded);
     let cache = PostgresFeedCacheRepository::new(pool)
         .get(source_id)
         .await
@@ -225,7 +225,7 @@ async fn feed_rebuild_handler_completes_cache_and_job_without_double_completion(
     assert!(String::from_utf8_lossy(cache.cache().xml_bytes()).contains("Handler article"));
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn feed_rebuild_handler_permanently_fails_when_source_is_missing(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -270,7 +270,7 @@ async fn feed_rebuild_handler_permanently_fails_when_source_is_missing(pool: PgP
     else {
         panic!("missing source job should be claimed")
     };
-    assert_eq!(job.status(), wechrss::domain::job::JobStatus::Failed);
+    assert_eq!(job.status(), werrss::domain::job::JobStatus::Failed);
     assert_eq!(job.failure_count(), 0);
     assert_eq!(
         outcome,
@@ -280,7 +280,7 @@ async fn feed_rebuild_handler_permanently_fails_when_source_is_missing(pool: PgP
     );
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn rebuild_reports_an_active_builder_without_reading_or_publishing(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -307,7 +307,7 @@ async fn rebuild_reports_an_active_builder_without_reading_or_publishing(pool: P
     );
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn rebuild_releases_the_lease_when_the_source_disappears(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());

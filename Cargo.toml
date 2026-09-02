@@ -1,5 +1,5 @@
 [package]
-name = "wechrss"
+name = "werrss"
 version = "0.1.0"
 edition = "2021"
 description = "Architecture skeleton for a browser-driven WeChat public-account RSS service"

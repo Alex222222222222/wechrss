@@ -11,7 +11,7 @@ use std::{
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::json;
 use tokio::sync::{watch, Mutex};
-use wechrss::{
+use werrss::{
     application::{
         job_service::{JobService, JobServiceConfig},
         worker::{

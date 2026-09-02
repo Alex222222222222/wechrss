@@ -1,7 +1,7 @@
 use chrono::{TimeZone, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     domain::{
         source::{NewSource, SchedulingGate, SourceId, VerifiedWechatArticleUrl},
         sync::{
@@ -20,7 +20,7 @@ use wechrss::{
     },
 };
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn sync_run_start_finish_and_history_round_trip(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -57,7 +57,7 @@ async fn sync_run_start_finish_and_history_round_trip(pool: PgPool) {
                     archived_assets: 0,
                 },
                 failure: None,
-                feed_revision: Some(wechrss::domain::source::FeedRevision::from_u64(2)),
+                feed_revision: Some(werrss::domain::source::FeedRevision::from_u64(2)),
             },
         )
         .await
@@ -85,7 +85,7 @@ async fn sync_run_start_finish_and_history_round_trip(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn sync_run_start_is_idempotent_after_a_committed_retry(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -134,7 +134,7 @@ async fn sync_run_start_is_idempotent_after_a_committed_retry(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn sync_run_start_rejects_reusing_id_for_another_source(pool: PgPool) {
     let first_source_id = SourceId::from_uuid(Uuid::new_v4());
     let second_source_id = SourceId::from_uuid(Uuid::new_v4());
@@ -183,7 +183,7 @@ async fn sync_run_start_rejects_reusing_id_for_another_source(pool: PgPool) {
         .expect("conflicting transaction should roll back");
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn sync_run_failure_is_classified_and_cannot_finish_twice(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -223,7 +223,7 @@ async fn sync_run_failure_is_classified_and_cannot_finish_twice(pool: PgPool) {
     assert!(matches!(
         second_finish,
         Err(SyncRunRepositoryError::Domain(
-            wechrss::domain::sync::SyncError::AlreadyFinished
+            werrss::domain::sync::SyncError::AlreadyFinished
         ))
     ));
     unit_of_work
@@ -232,7 +232,7 @@ async fn sync_run_failure_is_classified_and_cannot_finish_twice(pool: PgPool) {
         .expect("first completion should remain committed");
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn sync_run_rejects_missing_source_and_invalid_history_limit(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -263,7 +263,7 @@ async fn sync_run_rejects_missing_source_and_invalid_history_limit(pool: PgPool)
     ));
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn sync_run_completion_rolls_back_with_the_unit_of_work(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -307,7 +307,7 @@ async fn sync_run_completion_rolls_back_with_the_unit_of_work(pool: PgPool) {
         .is_none());
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn sync_run_schema_rejects_unknown_failure_classes(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -329,7 +329,7 @@ async fn sync_run_schema_rejects_unknown_failure_classes(pool: PgPool) {
     ));
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn sync_run_schema_rejects_incompatible_failure_classes(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());

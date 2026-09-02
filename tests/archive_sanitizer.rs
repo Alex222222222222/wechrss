@@ -1,6 +1,6 @@
 //! Integration coverage for the public archive-sanitization boundary.
 
-use wechrss::archive::sanitizer::HtmlSanitizer;
+use werrss::archive::sanitizer::HtmlSanitizer;
 
 #[test]
 fn sanitized_content_is_safe_to_pass_to_rss_and_reports_external_images() {

@@ -1,4 +1,4 @@
-//! Public module map for the WechRss Rust implementation.
+//! Public module map for the Werrss Rust implementation.
 //!
 //! This crate is being implemented incrementally. The module declarations
 //! establish dependency direction; configuration, pacing, durable job and

@@ -47,7 +47,7 @@ environment source instead of maintaining separate values for the application
 and sidecar. Secrets such as database URLs and encryption keys belong in a
 Kubernetes Secret.
 
-## WechRss application image
+## Werrss application image
 
 The release image is published to GHCR by `.github/workflows/container.yml`
 when a semantic-version tag such as `v0.1.0` is pushed. Pull the versioned
@@ -60,7 +60,7 @@ docker pull ghcr.io/<owner>/<repository>:v0.1.0
 For a local build, run this from the repository root:
 
 ```sh
-docker build --tag wechrss:local .
+docker build --tag werrss:local .
 ```
 
 The image listens on port `8080` by default and runs as an unprivileged user.
@@ -117,6 +117,29 @@ composition is disabled and scheduler startup is rejected.
 
 ## Kubernetes
 
+### Sample application deployment
+
+`k8s/sample/deployment.yaml` is a portable API-only example. It runs the
+published release image as a non-root user, exposes a ClusterIP Service, and
+uses `/api/health` for liveness and `/api/ready` for PostgreSQL-backed
+readiness. Before applying it, create the referenced `werrss-runtime` Secret
+with at least these keys using your secret-management process:
+
+```text
+DATABASE_URL
+CREDENTIAL_ENCRYPTION_KEY
+```
+
+The sample deliberately leaves the Secret out of the repository. It also uses
+`APP_ROLES=api`; add the browser, WeRead, worker, and scheduler settings from
+the environment-variable reference before selecting additional roles. Replace
+the image reference if deploying a fork or a different release:
+
+```sh
+kubectl apply -f k8s/sample/deployment.yaml
+kubectl rollout status deployment/werrss --timeout=180s
+```
+
 ### Development PostgreSQL in Kubernetes
 
 The repository's development PostgreSQL manifest is
@@ -131,12 +154,12 @@ namespaced workload:
 
 ```sh
 kubectl create namespace dev
-kubectl -n dev create secret generic wechrss-postgres-dev \
-  --from-literal=POSTGRES_DB=wechrss \
-  --from-literal=POSTGRES_USER=wechrss \
-  --from-literal=POSTGRES_PASSWORD=wechrss-dev-only
+kubectl -n dev create secret generic werrss-postgres-dev \
+  --from-literal=POSTGRES_DB=werrss \
+  --from-literal=POSTGRES_USER=werrss \
+  --from-literal=POSTGRES_PASSWORD=werrss-dev-only
 kubectl apply -f k8s/dev/postgres.yaml
-kubectl -n dev rollout status deployment/wechrss-postgres-dev --timeout=180s
+kubectl -n dev rollout status deployment/werrss-postgres-dev --timeout=180s
 ```
 
 If the namespace or Secret already exists, use the idempotent forms below;
@@ -144,13 +167,13 @@ the Secret command does not print the password:
 
 ```sh
 kubectl get namespace dev >/dev/null 2>&1 || kubectl create namespace dev
-kubectl -n dev create secret generic wechrss-postgres-dev \
-  --from-literal=POSTGRES_DB=wechrss \
-  --from-literal=POSTGRES_USER=wechrss \
-  --from-literal=POSTGRES_PASSWORD=wechrss-dev-only \
+kubectl -n dev create secret generic werrss-postgres-dev \
+  --from-literal=POSTGRES_DB=werrss \
+  --from-literal=POSTGRES_USER=werrss \
+  --from-literal=POSTGRES_PASSWORD=werrss-dev-only \
   --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f k8s/dev/postgres.yaml
-kubectl -n dev rollout status deployment/wechrss-postgres-dev --timeout=180s
+kubectl -n dev rollout status deployment/werrss-postgres-dev --timeout=180s
 ```
 
 Port-forward only the `dev` Service to a local port and run the SQLx test
@@ -159,8 +182,8 @@ harness. `DATABASE_URL` must point to the administrative database connection;
 in migrations automatically:
 
 ```sh
-kubectl -n dev port-forward service/wechrss-postgres-dev 55432:5432
-DATABASE_URL='postgresql://wechrss:wechrss-dev-only@127.0.0.1:55432/wechrss' \
+kubectl -n dev port-forward service/werrss-postgres-dev 55432:5432
+DATABASE_URL='postgresql://werrss:werrss-dev-only@127.0.0.1:55432/werrss' \
   cargo test --locked --test postgres_job_repository -- --nocapture
 ```
 
@@ -168,7 +191,7 @@ Remove the development-only resources when testing is complete:
 
 ```sh
 kubectl -n dev delete -f k8s/dev/postgres.yaml
-kubectl -n dev delete secret wechrss-postgres-dev
+kubectl -n dev delete secret werrss-postgres-dev
 ```
 
 Delete the namespace only if it was created solely for this test and contains

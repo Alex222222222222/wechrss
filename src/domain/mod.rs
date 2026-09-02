@@ -1,4 +1,4 @@
-//! Domain layer containing storage-independent WechRss business concepts.
+//! Domain layer containing storage-independent Werrss business concepts.
 //!
 //! These modules define the vocabulary shared by application services,
 //! acquisition adapters, repositories, and the RSS renderer. They must remain

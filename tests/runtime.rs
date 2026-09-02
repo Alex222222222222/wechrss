@@ -1,6 +1,6 @@
 //! Integration coverage for configuration-to-role runtime composition.
 
-use wechrss::{
+use werrss::{
     application::runtime::{RuntimeComponent, RuntimePlan, RuntimePlanError},
     config::{AppConfig, AppRole, AppRoles},
     domain::job::JobType,

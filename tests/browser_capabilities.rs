@@ -5,7 +5,7 @@ use std::sync::{
 
 use chrono::Utc;
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     acquisition::{
         article_page::{
             ArticlePageError, ArticlePageFetcher, ExtractedArticlePage, WebDriverArticlePageFetcher,

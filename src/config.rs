@@ -752,7 +752,7 @@ impl AppConfig {
             instance_id: raw
                 .app_instance_id
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| format!("wechrss-{}", Uuid::new_v4())),
+                .unwrap_or_else(|| format!("werrss-{}", Uuid::new_v4())),
             http_bind,
             http_port,
             timezone,
@@ -1304,7 +1304,7 @@ mod tests {
 
     fn valid_environment() -> Vec<(String, String)> {
         vec![
-            ("DATABASE_URL", "postgres://user:password@db/wechrss"),
+            ("DATABASE_URL", "postgres://user:password@db/werrss"),
             ("CREDENTIAL_ENCRYPTION_KEY", "test-encryption-key"),
             ("WEBDRIVER_URL", "http://webdriver:4444"),
             ("DATABASE_POOL_MIN_CONNECTIONS", "2"),
@@ -1491,7 +1491,7 @@ mod tests {
         let environment = replace_environment(
             valid_environment(),
             "DATABASE_URL",
-            "http://db.example/wechrss",
+            "http://db.example/werrss",
         );
 
         assert!(matches!(
@@ -1561,13 +1561,13 @@ mod tests {
         let environment = replace_environment(
             valid_environment(),
             "RSS_FEED_URL",
-            " https://feeds.example.test/wechrss.xml?source=public ",
+            " https://feeds.example.test/werrss.xml?source=public ",
         );
 
         let config = AppConfig::from_env_iter(environment).unwrap();
         assert_eq!(
             config.rss_feed_url.as_ref().map(Url::as_str),
-            Some("https://feeds.example.test/wechrss.xml?source=public")
+            Some("https://feeds.example.test/werrss.xml?source=public")
         );
     }
 
@@ -1779,12 +1779,12 @@ mod tests {
             replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "local");
         environment.push((
             "ASSET_ARCHIVE_LOCAL_PATH".to_owned(),
-            " /var/lib/wechrss/assets ".to_owned(),
+            " /var/lib/werrss/assets ".to_owned(),
         ));
         let config = AppConfig::from_env_iter(environment).unwrap();
         assert!(matches!(
             config.asset_archive,
-            AssetArchiveConfig::Local { ref path } if path == "/var/lib/wechrss/assets"
+            AssetArchiveConfig::Local { ref path } if path == "/var/lib/werrss/assets"
         ));
 
         let mut environment =
@@ -1794,7 +1794,7 @@ mod tests {
                 "ASSET_ARCHIVE_S3_ENDPOINT".to_owned(),
                 "https://objects.example.test".to_owned(),
             ),
-            ("ASSET_ARCHIVE_S3_BUCKET".to_owned(), "wechrss".to_owned()),
+            ("ASSET_ARCHIVE_S3_BUCKET".to_owned(), "werrss".to_owned()),
             ("ASSET_ARCHIVE_S3_REGION".to_owned(), "us-east-1".to_owned()),
             (
                 "ASSET_ARCHIVE_S3_ACCESS_KEY".to_owned(),
@@ -1817,7 +1817,7 @@ mod tests {
                 "ASSET_ARCHIVE_S3_ENDPOINT".to_owned(),
                 "https://user:password@objects.example.test".to_owned(),
             ),
-            ("ASSET_ARCHIVE_S3_BUCKET".to_owned(), "wechrss".to_owned()),
+            ("ASSET_ARCHIVE_S3_BUCKET".to_owned(), "werrss".to_owned()),
             ("ASSET_ARCHIVE_S3_REGION".to_owned(), "us-east-1".to_owned()),
             (
                 "ASSET_ARCHIVE_S3_ACCESS_KEY".to_owned(),
@@ -1930,8 +1930,8 @@ mod tests {
         let second = AppConfig::from_env_iter(valid_environment()).unwrap();
 
         assert_ne!(first.instance_id, second.instance_id);
-        assert!(first.instance_id.starts_with("wechrss-"));
-        assert!(second.instance_id.starts_with("wechrss-"));
+        assert!(first.instance_id.starts_with("werrss-"));
+        assert!(second.instance_id.starts_with("werrss-"));
     }
 
     #[test]
@@ -2071,7 +2071,7 @@ mod tests {
             .chain([
                 (
                     "BROWSER_AUTHENTICATED_PROFILE".to_owned(),
-                    "/var/lib/wechrss/weread-profile".to_owned(),
+                    "/var/lib/werrss/weread-profile".to_owned(),
                 ),
                 (
                     "WEREAD_ACCOUNT_ID".to_owned(),
@@ -2088,7 +2088,7 @@ mod tests {
         assert!(config.weread_source_sync_configured());
         assert_eq!(
             config.browser_authenticated_profile.as_deref(),
-            Some("/var/lib/wechrss/weread-profile")
+            Some("/var/lib/werrss/weread-profile")
         );
         assert_eq!(
             config.weread_account_id.unwrap().as_uuid().to_string(),
@@ -2105,7 +2105,7 @@ mod tests {
         let profile_only = replace_environment(
             valid_environment(),
             "BROWSER_AUTHENTICATED_PROFILE",
-            "/var/lib/wechrss/profile",
+            "/var/lib/werrss/profile",
         );
         assert!(matches!(
             AppConfig::from_env_iter(profile_only),

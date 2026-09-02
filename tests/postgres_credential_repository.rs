@@ -3,11 +3,11 @@ use secrecy::SecretString;
 use sqlx::PgPool;
 use tokio::time::{sleep, timeout, Duration};
 use uuid::Uuid;
-use wechrss::persistence::repositories::credential_repository::{
+use werrss::persistence::repositories::credential_repository::{
     CredentialReplacement, CredentialRepository, CredentialRepositoryError,
     PostgresCredentialRepository,
 };
-use wechrss::{
+use werrss::{
     application::auth_service::{
         AuthRefreshOutcome, AuthService, AuthServiceConfig, AuthServiceDependencies,
         CredentialProvision, CredentialRefresher, RefreshedCredentials, RingCredentialCipher,
@@ -28,7 +28,7 @@ fn account_id() -> WeReadAccountId {
     WeReadAccountId::from_uuid(Uuid::new_v4())
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn encrypted_account_rows_support_versioned_replacement(pool: PgPool) {
     let repository = PostgresCredentialRepository::new(pool.clone());
     let leases = PostgresAccountLeaseRepository::new(pool.clone());
@@ -86,7 +86,7 @@ async fn encrypted_account_rows_support_versioned_replacement(pool: PgPool) {
         .expect("test lease should be released");
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn credential_replacement_rejects_a_stale_account_lease(pool: PgPool) {
     let repository = PostgresCredentialRepository::new(pool.clone());
     let leases = PostgresAccountLeaseRepository::new(pool.clone());
@@ -143,7 +143,7 @@ async fn credential_replacement_rejects_a_stale_account_lease(pool: PgPool) {
         .expect("current lease should be released");
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn credential_replacement_waits_for_the_live_lease_row_lock(pool: PgPool) {
     let repository = PostgresCredentialRepository::new(pool.clone());
     let leases = PostgresAccountLeaseRepository::new(pool.clone());
@@ -222,7 +222,7 @@ impl CredentialRefresher for TestRefresher {
         &self,
         _account_id: WeReadAccountId,
         refresh_token: &str,
-    ) -> Result<RefreshedCredentials, wechrss::application::auth_service::CredentialRefreshError>
+    ) -> Result<RefreshedCredentials, werrss::application::auth_service::CredentialRefreshError>
     {
         assert_eq!(refresh_token, "refresh-v1");
         RefreshedCredentials::new(
@@ -230,11 +230,11 @@ impl CredentialRefresher for TestRefresher {
             Some("refresh-v2".to_owned()),
             Utc::now() + chrono::Duration::hours(1),
         )
-        .map_err(|_| wechrss::application::auth_service::CredentialRefreshError::InvalidResponse)
+        .map_err(|_| werrss::application::auth_service::CredentialRefreshError::InvalidResponse)
     }
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn auth_refresh_round_trips_through_postgres_without_plaintext_storage(pool: PgPool) {
     let repository = PostgresCredentialRepository::new(pool.clone());
     let account_id = account_id();

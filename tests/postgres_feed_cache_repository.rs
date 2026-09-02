@@ -1,7 +1,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     application::feed_service::{
         FeedDelivery, FeedRebuildJobConfig, FeedRebuildStatus, FeedRequest, FeedService,
         FeedServiceConfig, PostgresFeedRebuildQueue,
@@ -22,7 +22,7 @@ use wechrss::{
     rss::renderer::{RenderArticle, RenderFeedInput, RssRenderer},
 };
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_feed_cache_publishes_and_reads_through_unit_of_work(pool: PgPool) {
     let source_id = insert_source(&pool, 1).await;
     let lease_repository = PostgresFeedBuildLeaseRepository::new(pool.clone());
@@ -114,7 +114,7 @@ async fn postgres_feed_cache_publishes_and_reads_through_unit_of_work(pool: PgPo
     assert_eq!(cache.cache().xml_bytes(), b"<rss><channel/></rss>");
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn rendered_feed_candidate_publishes_through_fenced_cache_path(pool: PgPool) {
     let source_id = insert_source(&pool, 1).await;
     let generated_at = Utc::now() - chrono::Duration::seconds(1);
@@ -156,7 +156,7 @@ async fn rendered_feed_candidate_publishes_through_fenced_cache_path(pool: PgPoo
     assert_eq!(cache.cache().generated_at(), generated_at);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn feed_service_serves_stale_cache_and_deduplicates_rebuild_jobs(pool: PgPool) {
     let source_id = insert_source(&pool, 1).await;
     let lease_repository = PostgresFeedBuildLeaseRepository::new(pool.clone());
@@ -184,7 +184,7 @@ async fn feed_service_serves_stale_cache_and_deduplicates_rebuild_jobs(pool: PgP
     assert!(matches!(
         first,
         FeedDelivery::Cached {
-            status: wechrss::application::feed_service::FeedCacheStatus::Stale,
+            status: werrss::application::feed_service::FeedCacheStatus::Stale,
             rebuild: FeedRebuildStatus::Enqueued,
             cache,
         } if cache.xml_bytes() == b"stale-feed"
@@ -225,7 +225,7 @@ async fn feed_service_serves_stale_cache_and_deduplicates_rebuild_jobs(pool: PgP
     assert_eq!(created_at, updated_at);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_feed_cache_rejects_older_candidates_and_releases_on_revision_conflict(
     pool: PgPool,
 ) {
@@ -302,7 +302,7 @@ async fn postgres_feed_cache_rejects_older_candidates_and_releases_on_revision_c
     assert_eq!(count_build_leases(&pool, source_id).await, 0);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_feed_cache_rejects_stale_owner_and_rolls_back_publication(pool: PgPool) {
     let source_id = insert_source(&pool, 1).await;
     let lease_repository = PostgresFeedBuildLeaseRepository::new(pool.clone());
@@ -331,7 +331,7 @@ async fn postgres_feed_cache_rejects_stale_owner_and_rolls_back_publication(pool
         .expect_err("stale owner must not publish");
     assert!(matches!(
         error,
-        wechrss::persistence::repositories::feed_cache_repository::FeedCacheRepositoryError::LeaseLost { source_id: lost }
+        werrss::persistence::repositories::feed_cache_repository::FeedCacheRepositoryError::LeaseLost { source_id: lost }
             if lost == source_id
     ));
     unit_of_work

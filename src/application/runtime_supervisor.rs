@@ -815,7 +815,7 @@ mod tests {
             ("WORKER_CONCURRENCY".to_owned(), "2".to_owned()),
             (
                 "RSS_FEED_URL".to_owned(),
-                "https://feeds.example.test/wechrss.xml".to_owned(),
+                "https://feeds.example.test/werrss.xml".to_owned(),
             ),
         ])
         .expect("test configuration should be valid")
@@ -839,7 +839,7 @@ mod tests {
             ("WORKER_CONCURRENCY".to_owned(), "2".to_owned()),
             (
                 "RSS_FEED_URL".to_owned(),
-                "https://feeds.example.test/wechrss.xml".to_owned(),
+                "https://feeds.example.test/werrss.xml".to_owned(),
             ),
             (
                 "BROWSER_AUTHENTICATED_PROFILE".to_owned(),
@@ -1002,7 +1002,7 @@ mod tests {
             .expect("configured feed URL should produce rebuild settings");
         assert_eq!(
             rebuild_config.feed_url(),
-            "https://feeds.example.test/wechrss.xml"
+            "https://feeds.example.test/werrss.xml"
         );
     }
 

@@ -19,7 +19,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const SESSION_COOKIE: &str = "wechrss_admin_session";
+const SESSION_COOKIE: &str = "werrss_admin_session";
 const SESSION_TTL: Duration = Duration::hours(12);
 const RATE_LIMIT_WINDOW: Duration = Duration::minutes(1);
 const RATE_LIMIT_FAILURES: u32 = 5;
@@ -234,7 +234,7 @@ impl AdminAuthenticator {
 
     /// Returns a `Set-Cookie` value that removes the current session.
     pub fn clear_cookie() -> &'static str {
-        "wechrss_admin_session=; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=0"
+        "werrss_admin_session=; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=0"
     }
 
     fn encode(&self, session: &AdminSession) -> Result<String, AuthError> {
@@ -310,7 +310,7 @@ mod tests {
         let mut tampered = cookie.clone();
         tampered.replace_range(0..1, if &tampered[0..1] == "e" { "f" } else { "e" });
         assert_eq!(
-            auth.authenticate_cookie(Some(&format!("wechrss_admin_session={tampered}")), now),
+            auth.authenticate_cookie(Some(&format!("werrss_admin_session={tampered}")), now),
             Err(AuthError::InvalidSession)
         );
     }
@@ -322,7 +322,7 @@ mod tests {
         let (session, cookie) = auth.login("admin", "correct horse", "client", now).unwrap();
         assert_eq!(
             auth.authenticate_cookie(
-                Some(&format!("wechrss_admin_session={cookie}")),
+                Some(&format!("werrss_admin_session={cookie}")),
                 now + SESSION_TTL
             ),
             Err(AuthError::InvalidSession)

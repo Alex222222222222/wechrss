@@ -1,14 +1,14 @@
 use chrono::Duration;
 use sqlx::PgPool;
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     domain::credentials::WeReadAccountId,
     persistence::repositories::account_lease_repository::{
         AccountLeaseError, AccountLeaseRepository, PostgresAccountLeaseRepository,
     },
 };
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_account_lease_serializes_owners_and_supports_fenced_takeover(pool: PgPool) {
     let repository = PostgresAccountLeaseRepository::new(pool.clone());
     let account_id = WeReadAccountId::from_uuid(Uuid::new_v4());

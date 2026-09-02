@@ -6,7 +6,7 @@ use axum::{
 };
 use sqlx::PgPool;
 use tower::ServiceExt;
-use wechrss::{application::runtime_supervisor::RuntimeSupervisor, config::AppConfig};
+use werrss::{application::runtime_supervisor::RuntimeSupervisor, config::AppConfig};
 
 fn config() -> AppConfig {
     AppConfig::from_env_iter([
@@ -27,7 +27,7 @@ fn config() -> AppConfig {
     .expect("test configuration should be valid")
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn supervisor_wires_the_public_route_to_real_postgres_adapters(pool: PgPool) {
     let supervisor = RuntimeSupervisor::new(config(), pool).expect("supervisor should compose");
     let router = supervisor

@@ -2,7 +2,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     domain::job::{JobStatus, JobType, LeaseToken, NewJob},
     persistence::repositories::job_repository::{
         EnqueueResult, ExpiredJobRecovery, JobOutcome, JobOutcomeTransaction, JobQueue,
@@ -37,7 +37,7 @@ fn spec(key: String, max_attempts: u32, run_after: i64) -> NewJob {
     spec_with_type(JobType::SourceSync, key, max_attempts, run_after)
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_immediate_enqueue_uses_database_clock_for_due_and_audit_timestamps(pool: PgPool) {
     let repository = PostgresJobRepository::new(pool.clone());
     let future = Utc::now() + Duration::days(365);
@@ -74,7 +74,7 @@ async fn postgres_immediate_enqueue_uses_database_clock_for_due_and_audit_timest
     assert_eq!(created_at, updated_at);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_repository_enforces_claims_fencing_recovery_and_transactions(pool: PgPool) {
     let repository_a = PostgresJobRepository::new(pool.clone());
     let repository_b = PostgresJobRepository::new(pool.clone());
@@ -125,7 +125,7 @@ async fn postgres_repository_enforces_claims_fencing_recovery_and_transactions(p
         matches!(
             wrong_token_result.as_ref(),
             Err(JobRepositoryError::Domain(
-                wechrss::domain::job::JobError::LeaseTokenMismatch
+                werrss::domain::job::JobError::LeaseTokenMismatch
             ))
         ),
         "unexpected stale-token result: {wrong_token_result:?}"
@@ -357,7 +357,7 @@ async fn postgres_repository_enforces_claims_fencing_recovery_and_transactions(p
     assert_eq!(source_lease.job.job_type(), JobType::SourceSync);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_split_ports_keep_fenced_outcome_in_unit_of_work(pool: PgPool) {
     let repository = PostgresJobRepository::new(pool.clone());
     let job_id = match JobQueue::enqueue(

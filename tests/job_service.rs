@@ -3,7 +3,7 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::json;
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     application::job_service::{JobService, JobServiceConfig, JobServiceError},
     domain::job::{JobError, JobStatus, JobType, NewJob},
     persistence::repositories::job_repository::{

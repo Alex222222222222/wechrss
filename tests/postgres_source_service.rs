@@ -2,14 +2,14 @@ use chrono::{Duration, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     application::source_service::{SourceService, SourceServiceError},
     domain::source::{NewSource, SchedulingGate, SourceId, VerifiedWechatArticleUrl},
     persistence::repositories::source_repository::SourceRepositoryError,
     persistence::unit_of_work::UnitOfWorkFactory,
 };
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn source_service_atomically_creates_source_and_initial_job(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let service = service(&pool);
@@ -65,7 +65,7 @@ async fn source_service_atomically_creates_source_and_initial_job(pool: PgPool) 
     );
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn source_service_does_not_enqueue_for_disabled_or_blocked_sources(pool: PgPool) {
     let service = service(&pool);
     let disabled_id = SourceId::from_uuid(Uuid::new_v4());
@@ -97,7 +97,7 @@ async fn source_service_does_not_enqueue_for_disabled_or_blocked_sources(pool: P
     assert_eq!(job_count, 0);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn source_service_operator_changes_preserve_feed_revision(pool: PgPool) {
     let service = service(&pool);
     let source_id = SourceId::from_uuid(Uuid::new_v4());
@@ -121,7 +121,7 @@ async fn source_service_operator_changes_preserve_feed_revision(pool: PgPool) {
     assert_eq!(gated.feed_revision(), created.feed_revision());
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn source_service_duplicate_identity_does_not_leave_a_partial_source_or_job(pool: PgPool) {
     let service = service(&pool);
     let first_id = SourceId::from_uuid(Uuid::new_v4());
@@ -138,7 +138,7 @@ async fn source_service_duplicate_identity_does_not_leave_a_partial_source_or_jo
     assert!(matches!(
         error,
         SourceServiceError::Source(
-            wechrss::persistence::repositories::source_repository::SourceRepositoryError::BookIdConflict { ref book_id }
+            werrss::persistence::repositories::source_repository::SourceRepositoryError::BookIdConflict { ref book_id }
         ) if book_id == "book-service-duplicate"
     ));
 
@@ -156,7 +156,7 @@ async fn source_service_duplicate_identity_does_not_leave_a_partial_source_or_jo
     assert_eq!(job_count, 0);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn source_service_rolls_back_invalid_source_input(pool: PgPool) {
     let service = service(&pool);
     let source_id = SourceId::from_uuid(Uuid::nil());
@@ -168,7 +168,7 @@ async fn source_service_rolls_back_invalid_source_input(pool: PgPool) {
     assert!(matches!(
         error,
         SourceServiceError::Source(SourceRepositoryError::Domain(
-            wechrss::domain::source::SourceError::InvalidId
+            werrss::domain::source::SourceError::InvalidId
         ))
     ));
 
@@ -186,7 +186,7 @@ async fn source_service_rolls_back_invalid_source_input(pool: PgPool) {
     assert_eq!(job_count, 0);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn source_service_operator_changes_report_missing_sources(pool: PgPool) {
     let service = service(&pool);
     let source_id = SourceId::from_uuid(Uuid::new_v4());
@@ -214,7 +214,7 @@ async fn source_service_operator_changes_report_missing_sources(pool: PgPool) {
 
 fn service(pool: &PgPool) -> SourceService {
     SourceService::new(
-        wechrss::persistence::repositories::source_repository::PostgresSourceRepository::new(
+        werrss::persistence::repositories::source_repository::PostgresSourceRepository::new(
             pool.clone(),
         ),
         UnitOfWorkFactory::new(pool.clone()),

@@ -12,7 +12,7 @@ use secrecy::SecretString;
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     application::{
         feed_service::{
             FeedRebuildJobConfig, FeedService, FeedServiceConfig, PostgresFeedRebuildQueue,
@@ -38,7 +38,7 @@ use wechrss::{
     web::{admin::admin_router, api::feed_router, auth::AdminAuthenticator},
 };
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool) {
     let app = admin_app(&pool);
     let login = app
@@ -99,7 +99,7 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
             .to_vec(),
     )
     .expect("admin page should be UTF-8");
-    assert!(page_body.contains("WechRss admin"));
+    assert!(page_body.contains("Werrss admin"));
     assert!(!page_body.contains("correct horse"));
 
     let sources = app
@@ -230,7 +230,7 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
     assert_eq!(invalid_history.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn feed_route_serves_xml_and_honors_conditional_requests(pool: PgPool) {
     let source_id = insert_source(&pool).await;
     publish_cache(&pool, source_id).await;
@@ -288,7 +288,7 @@ async fn feed_route_serves_xml_and_honors_conditional_requests(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn health_routes_report_liveness_and_database_readiness(pool: PgPool) {
     let app = router(&pool);
 
@@ -326,7 +326,7 @@ async fn health_routes_report_liveness_and_database_readiness(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn readiness_returns_service_unavailable_when_database_is_closed(pool: PgPool) {
     let app = router(&pool);
     pool.close().await;
@@ -351,7 +351,7 @@ async fn readiness_returns_service_unavailable_when_database_is_closed(pool: PgP
     );
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn feed_route_does_not_enumerate_invalid_unknown_or_revoked_tokens(pool: PgPool) {
     let source_id = insert_source(&pool).await;
     let token_service = FeedTokenService::new(PostgresFeedTokenRepository::new(pool.clone()));
@@ -359,7 +359,7 @@ async fn feed_route_does_not_enumerate_invalid_unknown_or_revoked_tokens(pool: P
         .issue(source_id)
         .await
         .expect("feed token should be issued");
-    let unknown = wechrss::domain::feed_token::FeedToken::generate();
+    let unknown = werrss::domain::feed_token::FeedToken::generate();
     let app = router(&pool);
 
     let invalid_status = status(&app, "/feeds/not-a-token.xml").await;
@@ -375,7 +375,7 @@ async fn feed_route_does_not_enumerate_invalid_unknown_or_revoked_tokens(pool: P
     assert_eq!(revoked_status, StatusCode::NOT_FOUND);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn feed_route_rejects_non_xml_and_nested_paths(pool: PgPool) {
     let source_id = insert_source(&pool).await;
     let token = FeedTokenService::new(PostgresFeedTokenRepository::new(pool.clone()))
@@ -399,7 +399,7 @@ async fn feed_route_rejects_non_xml_and_nested_paths(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn feed_route_returns_retry_after_for_a_cache_miss(pool: PgPool) {
     let source_id = insert_source(&pool).await;
     let token = FeedTokenService::new(PostgresFeedTokenRepository::new(pool.clone()))

@@ -16,7 +16,7 @@ use std::{env, time::Duration};
 
 use chrono_tz::Asia::Shanghai;
 use url::Url;
-use wechrss::{
+use werrss::{
     acquisition::{
         article_page::{ArticlePageFetcher, WebDriverArticlePageFetcher},
         browser_pool::BrowserPool,
@@ -110,7 +110,7 @@ async fn fetches_a_real_public_article_without_credentials() {
                 .as_str()
                 .starts_with("https://mp.weixin.qq.com/s/"));
         }
-        Err(wechrss::acquisition::article_page::ArticlePageError::VerificationRequired) => {
+        Err(werrss::acquisition::article_page::ArticlePageError::VerificationRequired) => {
             eprintln!("WeChat requested environment verification for the public fixture");
         }
         Err(error) => panic!("public article fetch failed unexpectedly: {error}"),

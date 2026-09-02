@@ -7,7 +7,7 @@ use std::sync::{
 
 use chrono::Duration;
 use tokio::sync::watch;
-use wechrss::{
+use werrss::{
     application::scheduler::{Scheduler, SchedulerConfig, SchedulerLoopConfig, SchedulerLoopStats},
     persistence::repositories::scheduler_repository::{
         SchedulerPass, SchedulerRepository, SchedulerRepositoryError,
@@ -27,7 +27,7 @@ impl SchedulerRepository for ShutdownRepository {
         &self,
         _limit: usize,
         _reservation_for: Duration,
-        _quiet_hours: Option<wechrss::domain::pacing::QuietHours>,
+        _quiet_hours: Option<werrss::domain::pacing::QuietHours>,
     ) -> Result<SchedulerPass, SchedulerRepositoryError> {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         if self.fail_first && call == 1 {

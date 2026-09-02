@@ -1,7 +1,7 @@
 //! Integration coverage for the article archive application boundary.
 
 use sha2::{Digest, Sha256};
-use wechrss::application::archive_service::ArchiveService;
+use werrss::application::archive_service::ArchiveService;
 
 #[test]
 fn archive_service_returns_persistable_content_and_a_matching_hash() {

@@ -1,7 +1,7 @@
 use chrono::{Duration, TimeZone, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     domain::source::{FeedRevision, NewSource, SchedulingGate, SourceId, VerifiedWechatArticleUrl},
     persistence::{
         repositories::source_repository::{
@@ -12,7 +12,7 @@ use wechrss::{
     },
 };
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_source_can_be_created_read_and_lookup_by_book_id(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let source = source_spec(source_id, "book-create");
@@ -68,7 +68,7 @@ async fn postgres_source_can_be_created_read_and_lookup_by_book_id(pool: PgPool)
         .expect("duplicate transaction should roll back");
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_source_mutations_share_revision_and_schedule_transaction(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -134,7 +134,7 @@ async fn postgres_source_mutations_share_revision_and_schedule_transaction(pool:
     assert_eq!(persisted.feed_revision(), FeedRevision::from_u64(1));
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_source_revision_compare_and_swap_and_rollback_are_enforced(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());

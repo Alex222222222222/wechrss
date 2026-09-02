@@ -1,6 +1,6 @@
 //! Integration coverage for the public identity-resolution boundary.
 
-use wechrss::{
+use werrss::{
     acquisition::identity::{
         decode_biz, extract_identity_from_html, resolve_from_url, IdentityError, IdentityMethod,
     },

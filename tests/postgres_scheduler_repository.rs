@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     domain::credentials::WeReadAccountId,
     domain::pacing::QuietHours,
     domain::source::{SchedulingGate, SourceId},
@@ -12,7 +12,7 @@ use wechrss::{
     },
 };
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_scheduler_claims_disjoint_batches_across_replicas(pool: PgPool) {
     let source_ids = [
         insert_source(&pool, true, SchedulingGate::Ready, 4).await,
@@ -70,7 +70,7 @@ async fn postgres_scheduler_claims_disjoint_batches_across_replicas(pool: PgPool
     assert_eq!(distinct_dedupe_keys, 4);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_scheduler_has_a_due_time_leading_partial_index(pool: PgPool) {
     let index_definition: String = sqlx::query_scalar(
         "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'sources_due_idx'",
@@ -83,7 +83,7 @@ async fn postgres_scheduler_has_a_due_time_leading_partial_index(pool: PgPool) {
     assert!(index_definition.contains("WHERE (enabled AND (scheduling_gate = 'ready'::text))"));
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_scheduler_filters_gates_and_active_jobs(pool: PgPool) {
     let eligible = insert_source(&pool, true, SchedulingGate::Ready, 10).await;
     let disabled = insert_source(&pool, false, SchedulingGate::Ready, 9).await;
@@ -126,7 +126,7 @@ async fn postgres_scheduler_filters_gates_and_active_jobs(pool: PgPool) {
     }
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_scheduler_reservation_and_active_dedupe_survive_repeated_passes(pool: PgPool) {
     let source_id = insert_source(&pool, true, SchedulingGate::Ready, 1).await;
     let repository = PostgresSchedulerRepository::new(pool.clone());
@@ -176,7 +176,7 @@ async fn postgres_scheduler_reservation_and_active_dedupe_survive_repeated_passe
     assert_ne!(rescheduled[0].job_id(), first[0].job_id());
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_scheduler_uses_database_clock_for_quiet_hours(pool: PgPool) {
     let database_now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(&pool)
@@ -203,7 +203,7 @@ async fn postgres_scheduler_uses_database_clock_for_quiet_hours(pool: PgPool) {
     assert_eq!(job_count, 0);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_scheduler_rolls_back_prior_inserts_when_a_source_is_invalid(pool: PgPool) {
     let valid = insert_source(&pool, true, SchedulingGate::Ready, 2).await;
     let invalid = insert_source(&pool, true, SchedulingGate::Ready, 1).await;
@@ -238,7 +238,7 @@ async fn postgres_scheduler_rolls_back_prior_inserts_when_a_source_is_invalid(po
     assert_eq!(reservation_count, 0);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_scheduler_enqueues_due_credential_refreshes_and_deduplicates(pool: PgPool) {
     let due = WeReadAccountId::from_uuid(Uuid::new_v4());
     let disabled = WeReadAccountId::from_uuid(Uuid::new_v4());

@@ -2,7 +2,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     application::{
         job_service::{JobService, JobServiceConfig},
         worker::{JobExecution, JobHandler, Worker, WorkerConfig, WorkerRun},
@@ -24,7 +24,7 @@ impl JobHandler for FixedHandler {
     }
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn worker_commits_success_through_the_shared_unit_of_work(pool: PgPool) {
     let queue = PostgresJobRepository::new(pool.clone());
     let job_id = enqueue_job(&queue, "shared-uow-success").await;
@@ -56,7 +56,7 @@ async fn worker_commits_success_through_the_shared_unit_of_work(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn worker_defers_through_the_shared_unit_of_work_without_spending_failure_budget(
     pool: PgPool,
 ) {
@@ -84,7 +84,7 @@ async fn worker_defers_through_the_shared_unit_of_work_without_spending_failure_
     assert_eq!(job.run_after(), resume_at);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn worker_retries_through_the_shared_unit_of_work_and_records_failure_state(pool: PgPool) {
     let queue = PostgresJobRepository::new(pool.clone());
     let job_id = enqueue_job(&queue, "shared-uow-retry").await;

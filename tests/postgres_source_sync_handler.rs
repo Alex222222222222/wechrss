@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use chrono::{Duration, TimeZone, Utc};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     acquisition::{
         article_page::{ArticlePageError, ExtractedArticlePage},
         weread::{WeReadAdapterError, WeReadArticleReference},
@@ -59,7 +59,7 @@ impl FakeAcquirer {
 impl SourceSyncAcquirer for FakeAcquirer {
     async fn list_article_references(
         &self,
-        _source: &wechrss::domain::source::Source,
+        _source: &werrss::domain::source::Source,
     ) -> Result<Vec<WeReadArticleReference>, SyncAcquisitionError> {
         if self.authentication_error {
             Err(SyncAcquisitionError::WeRead(
@@ -103,7 +103,7 @@ impl SourceSyncAcquirer for FakeAcquirer {
     }
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn source_sync_commits_article_run_schedule_and_feed_rebuild(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -167,7 +167,7 @@ async fn source_sync_commits_article_run_schedule_and_feed_rebuild(pool: PgPool)
     assert_eq!(run.get::<i64, _>("archived_assets"), 0);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn source_sync_defers_before_upstream_work_during_quiet_hours(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -219,7 +219,7 @@ async fn source_sync_defers_before_upstream_work_during_quiet_hours(pool: PgPool
     );
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn source_sync_retry_commits_cooldown_and_retryable_run_atomically(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -279,7 +279,7 @@ async fn source_sync_retry_commits_cooldown_and_retryable_run_atomically(pool: P
     assert_eq!(article_count, 0);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn authentication_failure_gates_the_source_and_does_not_retry_the_job(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -318,7 +318,7 @@ async fn authentication_failure_gates_the_source_and_does_not_retry_the_job(pool
     assert_eq!(job_status, "failed");
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn blocked_public_acquisition_gates_the_source_and_does_not_retry_the_job(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -385,7 +385,7 @@ fn handler(
             articles: PostgresArticleRepository::new(pool.clone()),
             unit_of_work: UnitOfWorkFactory::new(pool),
             acquirer,
-            sync_service: wechrss::application::sync_service::SyncService::new(),
+            sync_service: werrss::application::sync_service::SyncService::new(),
         },
         config,
     )
@@ -430,10 +430,8 @@ async fn enqueue_source_sync(pool: &PgPool, source_id: SourceId) -> Uuid {
         .await
         .unwrap();
     match job {
-        wechrss::persistence::repositories::job_repository::EnqueueResult::Inserted(job) => {
-            job.id()
-        }
-        wechrss::persistence::repositories::job_repository::EnqueueResult::AlreadyActive {
+        werrss::persistence::repositories::job_repository::EnqueueResult::Inserted(job) => job.id(),
+        werrss::persistence::repositories::job_repository::EnqueueResult::AlreadyActive {
             job_id,
         } => job_id,
     }

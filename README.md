@@ -1,6 +1,6 @@
-# WechRss
+# Werrss
 
-WechRss is a learning and experimentation project for exploring asynchronous
+Werrss is a learning and experimentation project for exploring asynchronous
 RSS generation, durable synchronization, and browser-based acquisition
 boundaries.
 

@@ -12,8 +12,8 @@ use super::auth::AdminSession;
 pub fn login_page() -> Html<&'static str> {
     Html(
         r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WechRss admin login</title></head>
-<body><main><h1>WechRss admin</h1><form id="login"><label>Username <input name="username" autocomplete="username" required></label><label>Password <input name="password" type="password" autocomplete="current-password" required></label><button>Sign in</button><p id="error" role="alert"></p></form></main>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Werrss admin login</title></head>
+<body><main><h1>Werrss admin</h1><form id="login"><label>Username <input name="username" autocomplete="username" required></label><label>Password <input name="password" type="password" autocomplete="current-password" required></label><button>Sign in</button><p id="error" role="alert"></p></form></main>
 <script>document.querySelector('#login').addEventListener('submit',async event=>{event.preventDefault();const form=new FormData(event.target);const response=await fetch('/api/admin/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:form.get('username'),password:form.get('password')})});if(response.ok){location='/admin'}else{document.querySelector('#error').textContent='Sign-in failed; check the credentials or try again later.'}});</script></body></html>"#,
     )
 }
@@ -24,8 +24,8 @@ pub fn admin_page(session: &AdminSession) -> Html<String> {
     let csrf = escape_html(session.csrf_token());
     let csrf_json = serde_json::to_string(&csrf).expect("escaped CSRF token should serialize");
     let template = r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WechRss admin</title></head>
-<body><main><h1>WechRss admin</h1><p>Signed in as <strong>__USERNAME__</strong></p><button id="logout">Sign out</button><h2>Sources</h2><p id="error" role="alert"></p><ul id="sources"></ul><h2>Add source</h2><form id="create"><label>Book ID <input name="book_id" required></label><label>Name <input name="display_name" required></label><label>Article URL <input name="article_url" type="url" required></label><label>WeRead account ID <input name="account_id" type="text"></label><button>Add source</button></form></main>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Werrss admin</title></head>
+<body><main><h1>Werrss admin</h1><p>Signed in as <strong>__USERNAME__</strong></p><button id="logout">Sign out</button><h2>Sources</h2><p id="error" role="alert"></p><ul id="sources"></ul><h2>Add source</h2><form id="create"><label>Book ID <input name="book_id" required></label><label>Name <input name="display_name" required></label><label>Article URL <input name="article_url" type="url" required></label><label>WeRead account ID <input name="account_id" type="text"></label><button>Add source</button></form></main>
 <script>
 const csrf=__CSRF__;const headers={'content-type':'application/json','x-csrf-token':csrf};const list=document.querySelector('#sources');const error=document.querySelector('#error');
 async function request(path,options={}){return fetch(path,{...options,headers:{...headers,...(options.headers||{})}})}

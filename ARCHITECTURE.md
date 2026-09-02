@@ -1,7 +1,7 @@
-# WechRss Rust Architecture
+# Werrss Rust Architecture
 
 This document describes the planned Rust implementation of the existing
-`wechrss-main` Python service. The current Rust tree remains intentionally
+`werrss-main` Python service. The current Rust tree remains intentionally
 incremental: it defines boundaries and ownership, with the domain/configuration
 policies and the first PostgreSQL job/cache-persistence slices implemented
 while interactive login remains unimplemented. Administrative HTTP behavior
@@ -366,15 +366,15 @@ tests should connect through the same `DATABASE_URL` path used in Kubernetes.
 Create a named volume and start a development-only PostgreSQL instance:
 
 ```sh
-docker volume create wechrss-postgres-dev-data
+docker volume create werrss-postgres-dev-data
 docker run --detach \
-  --name wechrss-postgres-dev \
-  --env POSTGRES_USER=wechrss \
-  --env POSTGRES_PASSWORD=wechrss-dev-only \
-  --env POSTGRES_DB=wechrss \
+  --name werrss-postgres-dev \
+  --env POSTGRES_USER=werrss \
+  --env POSTGRES_PASSWORD=werrss-dev-only \
+  --env POSTGRES_DB=werrss \
   --publish 5432:5432 \
-  --volume wechrss-postgres-dev-data:/var/lib/postgresql/data \
-  --health-cmd='pg_isready -U wechrss -d wechrss' \
+  --volume werrss-postgres-dev-data:/var/lib/postgresql/data \
+  --health-cmd='pg_isready -U werrss -d werrss' \
   --health-interval=2s \
   --health-timeout=5s \
   --health-retries=15 \
@@ -384,14 +384,14 @@ docker run --detach \
 Wait until the container reports healthy before starting the application:
 
 ```sh
-docker inspect --format '{{.State.Health.Status}}' wechrss-postgres-dev
+docker inspect --format '{{.State.Health.Status}}' werrss-postgres-dev
 ```
 
 For local development, configure the process with environment variables. The
 password below is intentionally a development-only example:
 
 ```sh
-export DATABASE_URL='postgresql://wechrss:wechrss-dev-only@127.0.0.1:5432/wechrss'
+export DATABASE_URL='postgresql://werrss:werrss-dev-only@127.0.0.1:5432/werrss'
 export DATABASE_POOL_MIN_CONNECTIONS=1
 export DATABASE_POOL_MAX_CONNECTIONS=5
 ```
@@ -407,16 +407,16 @@ The container can be stopped and restarted without losing data because the
 named volume is separate from the container:
 
 ```sh
-docker stop wechrss-postgres-dev
-docker start wechrss-postgres-dev
+docker stop werrss-postgres-dev
+docker start werrss-postgres-dev
 ```
 
 When the local database is no longer needed, remove the container and, only if
 the development data is disposable, remove its volume too:
 
 ```sh
-docker rm --force wechrss-postgres-dev
-docker volume rm wechrss-postgres-dev-data
+docker rm --force werrss-postgres-dev
+docker volume rm werrss-postgres-dev-data
 ```
 
 The current implementation includes the source scheduling/revision fence,
@@ -431,7 +431,7 @@ database and applies the application's embedded migrator automatically. Set
 `DATABASE_URL` to a PostgreSQL administrative connection and run it with:
 
 ```sh
-export DATABASE_URL='postgresql://wechrss:wechrss-dev-only@127.0.0.1:5432/wechrss'
+export DATABASE_URL='postgresql://werrss:werrss-dev-only@127.0.0.1:5432/werrss'
 cargo test --locked --test postgres_job_repository -- --nocapture
 ```
 

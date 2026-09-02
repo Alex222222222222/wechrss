@@ -8,7 +8,7 @@ use std::sync::{
 use chrono::Duration;
 use sqlx::PgPool;
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     application::{
         runtime::RuntimeComponent,
         runtime_supervisor::{RuntimeJobHandler, RuntimeSupervisor},
@@ -40,7 +40,7 @@ fn config() -> AppConfig {
         ("WORKER_CONCURRENCY".to_owned(), "16".to_owned()),
         (
             "RSS_FEED_URL".to_owned(),
-            "https://feeds.example.test/wechrss.xml".to_owned(),
+            "https://feeds.example.test/werrss.xml".to_owned(),
         ),
         (
             "BROWSER_AUTHENTICATED_PROFILE".to_owned(),
@@ -54,14 +54,14 @@ fn config() -> AppConfig {
     .expect("test configuration should be valid")
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn scheduler_output_is_claimable_by_the_configured_runtime_dispatch(pool: PgPool) {
     let source_id = insert_due_source(&pool).await;
     let supervisor = RuntimeSupervisor::new(config(), pool.clone())
         .expect("configured scheduler and worker should compose");
     let RuntimeComponent::Worker(worker_plan) = supervisor
         .plan()
-        .component(wechrss::config::AppRole::Worker)
+        .component(werrss::config::AppRole::Worker)
         .expect("worker plan should exist")
     else {
         panic!("all roles should include a worker plan")
@@ -90,7 +90,7 @@ async fn scheduler_output_is_claimable_by_the_configured_runtime_dispatch(pool: 
         .expect("scheduled source-sync work should be claimable");
     assert_eq!(
         lease.job.job_type(),
-        wechrss::domain::job::JobType::SourceSync
+        werrss::domain::job::JobType::SourceSync
     );
 
     let source_calls = Arc::new(AtomicUsize::new(0));

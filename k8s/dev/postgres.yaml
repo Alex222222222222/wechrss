@@ -1,11 +1,11 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: wechrss-postgres-dev
+  name: werrss-postgres-dev
   namespace: dev
   labels:
-    app.kubernetes.io/name: wechrss-postgres
-    app.kubernetes.io/part-of: wechrss
+    app.kubernetes.io/name: werrss-postgres
+    app.kubernetes.io/part-of: werrss
     app.kubernetes.io/component: development-database
 spec:
   replicas: 1
@@ -13,13 +13,13 @@ spec:
     type: Recreate
   selector:
     matchLabels:
-      app.kubernetes.io/name: wechrss-postgres
-      app.kubernetes.io/part-of: wechrss
+      app.kubernetes.io/name: werrss-postgres
+      app.kubernetes.io/part-of: werrss
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: wechrss-postgres
-        app.kubernetes.io/part-of: wechrss
+        app.kubernetes.io/name: werrss-postgres
+        app.kubernetes.io/part-of: werrss
         app.kubernetes.io/component: development-database
     spec:
       terminationGracePeriodSeconds: 30
@@ -29,7 +29,7 @@ spec:
           imagePullPolicy: IfNotPresent
           envFrom:
             - secretRef:
-                name: wechrss-postgres-dev
+                name: werrss-postgres-dev
           ports:
             - name: postgres
               containerPort: 5432
@@ -71,17 +71,17 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: wechrss-postgres-dev
+  name: werrss-postgres-dev
   namespace: dev
   labels:
-    app.kubernetes.io/name: wechrss-postgres
-    app.kubernetes.io/part-of: wechrss
+    app.kubernetes.io/name: werrss-postgres
+    app.kubernetes.io/part-of: werrss
     app.kubernetes.io/component: development-database
 spec:
   type: ClusterIP
   selector:
-    app.kubernetes.io/name: wechrss-postgres
-    app.kubernetes.io/part-of: wechrss
+    app.kubernetes.io/name: werrss-postgres
+    app.kubernetes.io/part-of: werrss
   ports:
     - name: postgres
       port: 5432

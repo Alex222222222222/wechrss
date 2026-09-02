@@ -1,6 +1,6 @@
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     acquisition::{
         article_page::{ArticlePageError, ExtractedArticlePage},
         weread::{WeReadAdapterError, WeReadArticleReference},
@@ -93,7 +93,7 @@ fn integration_preparation_rejects_missing_required_identity_or_version() {
             Utc.timestamp_opt(1_700_000_100, 0).single().unwrap(),
         ),
         Err(SyncServiceError::Article(
-            wechrss::domain::article::ArticleError::EmptyReviewId
+            werrss::domain::article::ArticleError::EmptyReviewId
         ))
     );
 
@@ -106,7 +106,7 @@ fn integration_preparation_rejects_missing_required_identity_or_version() {
             Utc.timestamp_opt(1_700_000_100, 0).single().unwrap(),
         ),
         Err(SyncServiceError::Article(
-            wechrss::domain::article::ArticleError::InvalidObservationVersion
+            werrss::domain::article::ArticleError::InvalidObservationVersion
         ))
     );
 }

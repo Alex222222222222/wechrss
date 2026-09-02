@@ -1,7 +1,7 @@
 use chrono::{Duration, TimeZone, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
-use wechrss::{
+use werrss::{
     domain::{
         article::{ArticleObservationVersion, NewArticle},
         source::{NewSource, SchedulingGate, SourceId, VerifiedWechatArticleUrl},
@@ -18,7 +18,7 @@ use wechrss::{
     },
 };
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_articles_upsert_idempotently_and_list_in_feed_order(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -123,7 +123,7 @@ async fn postgres_articles_upsert_idempotently_and_list_in_feed_order(pool: PgPo
     ));
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_allocates_observation_versions_from_a_shared_sequence(pool: PgPool) {
     let repository = PostgresArticleRepository::new(pool);
     let first = repository
@@ -138,7 +138,7 @@ async fn postgres_allocates_observation_versions_from_a_shared_sequence(pool: Pg
     assert_eq!(first.as_u64() + 1, second.as_u64());
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn article_change_and_source_revision_commit_as_one_unit(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -153,7 +153,7 @@ async fn article_change_and_source_revision_commit_as_one_unit(pool: PgPool) {
     assert!(result.feed_visible_change());
     let revision = unit_of_work
         .source()
-        .bump_feed_revision(source_id, wechrss::domain::source::FeedRevision::zero())
+        .bump_feed_revision(source_id, werrss::domain::source::FeedRevision::zero())
         .await
         .expect("source revision should advance");
     assert_eq!(revision.as_u64(), 1);
@@ -169,7 +169,7 @@ async fn article_change_and_source_revision_commit_as_one_unit(pool: PgPool) {
         .expect("article lookup should succeed")
         .is_some());
     let source =
-        wechrss::persistence::repositories::source_repository::PostgresSourceRepository::new(pool)
+        werrss::persistence::repositories::source_repository::PostgresSourceRepository::new(pool)
             .find(source_id)
             .await
             .expect("source lookup should succeed")
@@ -177,7 +177,7 @@ async fn article_change_and_source_revision_commit_as_one_unit(pool: PgPool) {
     assert_eq!(source.feed_revision().as_u64(), 1);
 }
 
-#[sqlx::test(migrator = "wechrss::persistence::postgres::MIGRATOR")]
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn article_upsert_rolls_back_with_the_unit_of_work(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
@@ -238,7 +238,7 @@ async fn create_source(factory: &UnitOfWorkFactory, source_id: SourceId) {
 async fn upsert_article(
     factory: &UnitOfWorkFactory,
     article: NewArticle,
-) -> wechrss::domain::article::ArticleUpsertResult {
+) -> werrss::domain::article::ArticleUpsertResult {
     let mut unit_of_work = factory.begin().await.expect("unit of work should begin");
     let result = unit_of_work
         .articles()
