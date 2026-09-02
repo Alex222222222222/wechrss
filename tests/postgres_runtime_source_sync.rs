@@ -39,7 +39,7 @@ fn config() -> AppConfig {
         ),
         ("WORKER_CONCURRENCY".to_owned(), "16".to_owned()),
         (
-            "RSS_FEED_URL".to_owned(),
+            "SERVER_ROOT_URL".to_owned(),
             "https://feeds.example.test/werrss.xml".to_owned(),
         ),
         (

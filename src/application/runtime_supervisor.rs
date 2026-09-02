@@ -283,8 +283,8 @@ impl RuntimeSupervisor {
 
     fn validated_plan(config: &AppConfig) -> Result<RuntimePlan, RuntimeSupervisorError> {
         let plan = RuntimePlan::from_config(config).map_err(RuntimeSupervisorError::Plan)?;
-        if plan.component(AppRole::Worker).is_some() && config.rss_feed_url.is_none() {
-            return Err(RuntimeSupervisorError::FeedUrlNotConfigured);
+        if plan.component(AppRole::Worker).is_some() && config.server_root_url.is_none() {
+            return Err(RuntimeSupervisorError::ServerRootUrlNotConfigured);
         }
         Ok(plan)
     }
@@ -671,9 +671,9 @@ impl RuntimeSupervisor {
     ) -> Result<FeedRebuildConfig, RuntimeSupervisorError> {
         let feed_url = self
             .config
-            .rss_feed_url
+            .server_root_url
             .as_ref()
-            .ok_or(RuntimeSupervisorError::FeedUrlNotConfigured)?;
+            .ok_or(RuntimeSupervisorError::ServerRootUrlNotConfigured)?;
         FeedRebuildConfig::new(
             lease_for,
             cache_ttl,
@@ -756,8 +756,8 @@ pub enum RuntimeSupervisorError {
     #[error("source-sync handler could not be configured")]
     SourceSyncNotConfigured,
     /// Feed workers must not publish a placeholder channel URL.
-    #[error("RSS_FEED_URL is required when the worker role is enabled")]
-    FeedUrlNotConfigured,
+    #[error("SERVER_ROOT_URL is required when the worker role is enabled")]
+    ServerRootUrlNotConfigured,
     /// PostgreSQL could not be reached.
     #[error("database connection failed")]
     DatabaseConnection(#[source] sqlx::Error),
@@ -863,7 +863,7 @@ mod tests {
             ),
             ("WORKER_CONCURRENCY".to_owned(), "2".to_owned()),
             (
-                "RSS_FEED_URL".to_owned(),
+                "SERVER_ROOT_URL".to_owned(),
                 "https://feeds.example.test/werrss.xml".to_owned(),
             ),
         ])
@@ -887,7 +887,7 @@ mod tests {
             ),
             ("WORKER_CONCURRENCY".to_owned(), "2".to_owned()),
             (
-                "RSS_FEED_URL".to_owned(),
+                "SERVER_ROOT_URL".to_owned(),
                 "https://feeds.example.test/werrss.xml".to_owned(),
             ),
             (
@@ -1058,10 +1058,10 @@ mod tests {
     #[tokio::test]
     async fn worker_requires_and_uses_the_configured_feed_url() {
         let mut missing_url_config = config("worker");
-        missing_url_config.rss_feed_url = None;
+        missing_url_config.server_root_url = None;
         assert!(matches!(
             RuntimeSupervisor::new(missing_url_config, lazy_pool()),
-            Err(RuntimeSupervisorError::FeedUrlNotConfigured)
+            Err(RuntimeSupervisorError::ServerRootUrlNotConfigured)
         ));
 
         let supervisor = RuntimeSupervisor::new(config("worker"), lazy_pool()).unwrap();

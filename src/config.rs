@@ -26,7 +26,7 @@
 //! ACCOUNT_LEASE_SECONDS / ACCOUNT_HEARTBEAT_SECONDS
 //! SOURCE_FAILURE_COOLDOWN_SECONDS
 //! RSS_CACHE_TTL_SECONDS / RSS_STALE_WHILE_REVALIDATE_SECONDS /
-//! RSS_CACHE_MISS_WAIT_MS / RSS_FEED_URL
+//! RSS_CACHE_MISS_WAIT_MS / SERVER_ROOT_URL
 //! FEED_BUILD_LEASE_SECONDS / FEED_BUILD_HEARTBEAT_SECONDS
 //! PACING_* / SCROLL_*
 //! ASSET_ARCHIVE_BACKEND / ASSET_ARCHIVE_LOCAL_PATH /
@@ -118,7 +118,7 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "RSS_CACHE_TTL_SECONDS",
     "RSS_STALE_WHILE_REVALIDATE_SECONDS",
     "RSS_CACHE_MISS_WAIT_MS",
-    "RSS_FEED_URL",
+    "SERVER_ROOT_URL",
     "FEED_BUILD_LEASE_SECONDS",
     "FEED_BUILD_HEARTBEAT_SECONDS",
     "PACING_REQUEST_MEAN_MS",
@@ -404,7 +404,7 @@ pub struct AppConfig {
     /// Optional canonical public URL written to generated RSS channel links.
     /// A feed worker requires this value because no placeholder URL is safe to
     /// publish.
-    pub rss_feed_url: Option<Url>,
+    pub server_root_url: Option<Url>,
     /// Duration for which one feed rebuild may hold its distributed lease.
     pub feed_build_lease: Duration,
     /// Maximum interval between feed-build lease heartbeats.
@@ -629,7 +629,7 @@ impl AppConfig {
             "RSS_CACHE_MISS_WAIT_MS",
             MAX_CACHE_MISS_WAIT_MS,
         )?;
-        let rss_feed_url = parse_optional_http_url(raw.rss_feed_url, "RSS_FEED_URL")?;
+        let server_root_url = parse_optional_http_url(raw.server_root_url, "SERVER_ROOT_URL")?;
 
         let feed_build_lease_seconds = positive_u64(
             raw.feed_build_lease_seconds.unwrap_or(600),
@@ -752,7 +752,7 @@ impl AppConfig {
             rss_cache_ttl: Duration::from_secs(rss_cache_seconds),
             rss_stale_while_revalidate: Duration::from_secs(rss_stale_while_revalidate_seconds),
             rss_cache_miss_wait: Duration::from_millis(rss_cache_miss_wait_ms),
-            rss_feed_url,
+            server_root_url,
             feed_build_lease: Duration::from_secs(feed_build_lease_seconds),
             feed_build_heartbeat: Duration::from_secs(feed_build_heartbeat_seconds),
             pacing,
@@ -807,7 +807,7 @@ struct RawConfig {
     rss_cache_ttl_seconds: Option<u64>,
     rss_stale_while_revalidate_seconds: Option<u64>,
     rss_cache_miss_wait_ms: Option<u64>,
-    rss_feed_url: Option<String>,
+    server_root_url: Option<String>,
     feed_build_lease_seconds: Option<u64>,
     feed_build_heartbeat_seconds: Option<u64>,
     pacing_request_mean_ms: Option<f64>,
@@ -1345,7 +1345,7 @@ mod tests {
         assert_eq!(config.rss_cache_ttl, Duration::from_secs(1_800));
         assert_eq!(config.rss_stale_while_revalidate, Duration::from_secs(60));
         assert_eq!(config.rss_cache_miss_wait, Duration::from_secs(5));
-        assert!(config.rss_feed_url.is_none());
+        assert!(config.server_root_url.is_none());
         assert_eq!(config.feed_build_lease, Duration::from_secs(600));
         assert_eq!(config.feed_build_heartbeat, Duration::from_secs(60));
         assert!(matches!(config.asset_archive, AssetArchiveConfig::Disabled));
@@ -1527,13 +1527,13 @@ mod tests {
     fn parses_and_validates_the_optional_public_feed_url() {
         let environment = replace_environment(
             valid_environment(),
-            "RSS_FEED_URL",
+            "SERVER_ROOT_URL",
             " https://feeds.example.test/werrss.xml?source=public ",
         );
 
         let config = AppConfig::from_env_iter(environment).unwrap();
         assert_eq!(
-            config.rss_feed_url.as_ref().map(Url::as_str),
+            config.server_root_url.as_ref().map(Url::as_str),
             Some("https://feeds.example.test/werrss.xml?source=public")
         );
     }
@@ -1546,11 +1546,11 @@ mod tests {
             "http://",
             "https://user:password@feeds.example.test/feed.xml",
         ] {
-            let environment = replace_environment(valid_environment(), "RSS_FEED_URL", value);
+            let environment = replace_environment(valid_environment(), "SERVER_ROOT_URL", value);
             let result = AppConfig::from_env_iter(environment);
             match result {
                 Err(ConfigError::InvalidValue {
-                    variable: "RSS_FEED_URL",
+                    variable: "SERVER_ROOT_URL",
                     ..
                 }) => {}
                 other => panic!("unexpected result for {value:?}: {other:?}"),

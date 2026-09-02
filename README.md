@@ -135,7 +135,7 @@ sync.
 | `RSS_CACHE_TTL_SECONDS` | `1800` | Freshness period for a persisted RSS document. It must be positive. |
 | `RSS_STALE_WHILE_REVALIDATE_SECONDS` | `60` | Additional period during which stale RSS may be served while a rebuild is requested. It may be zero and is capped at 24 hours. |
 | `RSS_CACHE_MISS_WAIT_MS` | `5000` | Bounded wait associated with a cache miss before retry advice is returned. Valid range: `1`–`60000` milliseconds. |
-| `RSS_FEED_URL` | Unset | Public HTTP(S) URL advertised in generated RSS channel links. It is required when the worker role is enabled. |
+| `SERVER_ROOT_URL` | Unset | Public HTTP(S) root URL used to build generated RSS channel links. It is required when the worker role is enabled. |
 | `FEED_BUILD_LEASE_SECONDS` | `600` | Duration of a distributed feed-build lease. It must exceed its heartbeat interval. |
 | `FEED_BUILD_HEARTBEAT_SECONDS` | `60` | Maximum interval between feed-build lease heartbeats. It must be less than `FEED_BUILD_LEASE_SECONDS`. |
 
@@ -223,8 +223,8 @@ than a commitment:
    bottleneck.
 
 The release image is built by `.github/workflows/container.yml`. Push a
-semantic-version tag such as `v0.1.3` to build and publish
-`ghcr.io/<owner>/<repository>:v0.1.3` and `:latest`; branch and pull-request
+semantic-version tag such as `v0.1.4` to build and publish
+`ghcr.io/<owner>/<repository>:v0.1.4` and `:latest`; branch and pull-request
 builds validate the Dockerfile without publishing. The image expects the same
 environment variables described in [DEPLOYMENT.md](DEPLOYMENT.md), including
 `DATABASE_URL`; no credentials are baked into the image.

@@ -54,11 +54,11 @@ Kubernetes Secret.
 ## Werrss application image
 
 The release image is published to GHCR by `.github/workflows/container.yml`
-when a semantic-version tag such as `v0.1.3` is pushed. Pull the versioned
+when a semantic-version tag such as `v0.1.4` is pushed. Pull the versioned
 image with:
 
 ```sh
-docker pull ghcr.io/<owner>/<repository>:v0.1.3
+docker pull ghcr.io/<owner>/<repository>:v0.1.4
 ```
 
 For a local build, run this from the repository root:
@@ -95,8 +95,8 @@ source-sync job records a warning and a scheduled failure when no usable
 account exists. The source is then considered again on its next scheduling
 interval. `APP_ROLES=all` can therefore start before the administrator fills
 the WeRead authentication form.
-`RSS_FEED_URL` must be set to the public HTTP(S) URL that generated RSS
-channels should advertise. Browser-session capacity and worker replica count
+`SERVER_ROOT_URL` must be set to the public HTTP(S) root URL that generated RSS
+channels should use. Browser-session capacity and worker replica count
 must be intentional; increasing API replicas for RSS traffic must not
 automatically increase upstream fetch concurrency.
 

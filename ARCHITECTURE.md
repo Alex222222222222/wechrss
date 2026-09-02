@@ -821,7 +821,7 @@ JOB_MAX_ATTEMPTS
 ACCOUNT_LEASE_SECONDS / ACCOUNT_HEARTBEAT_SECONDS
 SOURCE_FAILURE_COOLDOWN_SECONDS
 RSS_CACHE_TTL_SECONDS / RSS_STALE_WHILE_REVALIDATE_SECONDS /
-RSS_CACHE_MISS_WAIT_MS / RSS_FEED_URL
+RSS_CACHE_MISS_WAIT_MS / SERVER_ROOT_URL
 FEED_BUILD_LEASE_SECONDS / FEED_BUILD_HEARTBEAT_SECONDS
 PACING_* / SCROLL_*
 ASSET_ARCHIVE_BACKEND / ASSET_ARCHIVE_LOCAL_PATH /
@@ -833,7 +833,7 @@ CREDENTIAL_ENCRYPTION_KEY
 ```
 
 `APP_TIMEZONE` is an IANA timezone name and defaults to `UTC`. `APP_ROLES`
-defaults to `api`; worker startup additionally requires `RSS_FEED_URL`.
+defaults to `api`; worker startup additionally requires `SERVER_ROOT_URL`.
 `APP_INSTANCE_ID` may be omitted for local use; the loader then generates a
 random per-process UUID so application replicas do not share job-lease
 ownership. `WORKER_CONCURRENCY` defaults to `1`, and account/feed-build
@@ -900,7 +900,7 @@ continue to classify verification pages as a terminal upstream result.
 require an enrolled account. Source-sync selects an active
 enrolled account when each job runs; without one, the job records a warning and
 waits for the source's next due interval. Worker concurrency is
-configured independently from API replica count. `RSS_FEED_URL` is an optional
+configured independently from API replica count. `SERVER_ROOT_URL` is an optional
 validated public HTTP(S) URL for generated RSS channel links and is required
 when the worker role is enabled. `ASSET_ARCHIVE_BACKEND` is the enum `disabled | local | s3`
 and defaults to `disabled`; local paths or object-store credentials are
