@@ -15,7 +15,8 @@
 //! retryable acquisition failure, and a lost lease is never followed by
 //! another upstream request.
 
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
+use rand::seq::IteratorRandom;
 
 use crate::{
     acquisition::{
@@ -25,7 +26,7 @@ use crate::{
         weread::{WeReadAdapter, WeReadAdapterError, WeReadArticleReference},
     },
     domain::{credentials::WeReadAccountId, source::Source},
-    persistence::repositories::credential_repository::CredentialRepository,
+    persistence::repositories::credential_repository::{CredentialRecord, CredentialRepository},
 };
 
 use super::{source_sync_handler::SourceSyncAcquirer, sync_service::SyncAcquisitionError};
@@ -33,14 +34,15 @@ use super::{source_sync_handler::SourceSyncAcquirer, sync_service::SyncAcquisiti
 /// Resolves the account to use for one source-sync request.
 ///
 /// A requested account comes from the source relationship when present. When
-/// it is absent, implementations may select any enabled, usable account from
+/// it is absent, implementations select a random enabled, usable account from
 /// their durable store. Selection happens immediately before browser work so
 /// accounts enrolled through the admin panel become available without a
 /// process restart.
 #[async_trait::async_trait]
 pub trait WeReadAccountSelector: Send + Sync {
-    /// Returns a usable account, or `None` when no account is currently
-    /// enrolled and enabled.
+    /// Returns the requested usable account, a random usable account when no
+    /// account was requested, or `None` when no account is currently enrolled
+    /// and enabled.
     async fn select_account(
         &self,
         requested: Option<WeReadAccountId>,
@@ -80,15 +82,14 @@ where
                 .find(account_id)
                 .await
                 .map_err(|error| WeReadAdapterError::LeaseBackend(error.to_string()))?,
-            None => self
-                .accounts
-                .list()
-                .await
-                .map_err(|error| WeReadAdapterError::LeaseBackend(error.to_string()))?
-                .into_iter()
-                .find(|record| {
-                    !record.account().disabled() && record.account().access_expires_at() > now
-                }),
+            None => {
+                let records = self
+                    .accounts
+                    .list()
+                    .await
+                    .map_err(|error| WeReadAdapterError::LeaseBackend(error.to_string()))?;
+                return Ok(choose_random_usable_account(records, now, &mut rand::rng()));
+            }
         };
 
         Ok(record
@@ -97,6 +98,18 @@ where
             })
             .map(|record| record.account().account_id()))
     }
+}
+
+fn choose_random_usable_account<R: rand::Rng + ?Sized>(
+    records: Vec<CredentialRecord>,
+    now: DateTime<Utc>,
+    rng: &mut R,
+) -> Option<WeReadAccountId> {
+    records
+        .into_iter()
+        .filter(|record| !record.account().disabled() && record.account().access_expires_at() > now)
+        .map(|record| record.account().account_id())
+        .choose(rng)
 }
 
 /// Dependencies for the concrete source-sync acquisition adapter.
@@ -565,10 +578,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selects_the_first_unexpired_enrolled_account_and_honors_overrides() {
+    async fn selects_a_random_unexpired_enrolled_account_and_honors_overrides() {
         let now = chrono::Utc::now();
         let expired = WeReadAccountId::from_uuid(Uuid::from_u128(2));
         let enrolled = account_id();
+        let another_enrolled = WeReadAccountId::from_uuid(Uuid::from_u128(3));
         let repository = MemoryCredentialRepository::new(now);
         repository
             .insert(
@@ -588,13 +602,88 @@ mod tests {
             )
             .await
             .unwrap();
+        repository
+            .insert(
+                another_enrolled,
+                "another enrolled",
+                b"another-enrolled-ciphertext",
+                now + chrono::Duration::hours(2),
+            )
+            .await
+            .unwrap();
 
         let selector = CredentialRepositoryAccountSelector::new(repository);
-        assert_eq!(selector.select_account(None).await.unwrap(), Some(enrolled));
+        assert!(matches!(
+            selector.select_account(None).await.unwrap(),
+            Some(selected) if selected == enrolled || selected == another_enrolled
+        ));
         assert_eq!(selector.select_account(Some(expired)).await.unwrap(), None);
         assert_eq!(
             selector.select_account(Some(enrolled)).await.unwrap(),
             Some(enrolled)
+        );
+    }
+
+    #[tokio::test]
+    async fn random_selection_skips_expired_accounts_and_returns_none_when_all_are_expired() {
+        use std::{collections::HashSet, iter::FromIterator};
+
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let now = chrono::Utc::now();
+        let expired = WeReadAccountId::from_uuid(Uuid::from_u128(2));
+        let enrolled = account_id();
+        let another_enrolled = WeReadAccountId::from_uuid(Uuid::from_u128(3));
+        let repository = MemoryCredentialRepository::new(now);
+        repository
+            .insert(
+                expired,
+                "expired",
+                b"expired-ciphertext",
+                now - chrono::Duration::seconds(1),
+            )
+            .await
+            .unwrap();
+        repository
+            .insert(
+                enrolled,
+                "enrolled",
+                b"enrolled-ciphertext",
+                now + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        repository
+            .insert(
+                another_enrolled,
+                "another enrolled",
+                b"another-enrolled-ciphertext",
+                now + chrono::Duration::hours(2),
+            )
+            .await
+            .unwrap();
+
+        let records = repository.list().await.unwrap();
+        let mut selected = HashSet::new();
+        for seed in 0..64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            selected.insert(choose_random_usable_account(records.clone(), now, &mut rng));
+        }
+        assert_eq!(
+            selected,
+            HashSet::from_iter([Some(enrolled), Some(another_enrolled)])
+        );
+
+        assert_eq!(
+            choose_random_usable_account(
+                vec![records
+                    .into_iter()
+                    .find(|record| record.account().account_id() == expired)
+                    .expect("expired record should be present")],
+                now,
+                &mut StdRng::seed_from_u64(0),
+            ),
+            None
         );
     }
 

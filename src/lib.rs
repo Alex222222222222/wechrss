@@ -12,6 +12,7 @@ pub mod archive;
 pub mod config;
 pub mod domain;
 pub mod error;
+pub mod logging;
 pub mod persistence;
 pub mod rss;
 pub mod web;

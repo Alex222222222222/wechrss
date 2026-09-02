@@ -40,6 +40,7 @@ The application container receives the same value:
 ```yaml
 environment:
   APP_TIMEZONE: Asia/Shanghai
+  LOG_LEVEL: warn
   QUIET_HOURS_START: "23:00"
   QUIET_HOURS_END: "07:00"
 ```
@@ -111,8 +112,8 @@ WEREAD_ARTICLE_LIST_URL=https://i.weread.qq.com/web/mp/articles
 
 `WEREAD_ACCOUNT_ID` remains available as the default panel-enrolled account.
 When it is unset, each source-sync job
-selects a non-disabled, unexpired account from PostgreSQL; a source-specific
-account relationship takes precedence. If no usable account is enrolled, the
+randomly selects a non-disabled, unexpired account from PostgreSQL; a
+source-specific account relationship takes precedence. If no usable account is enrolled, the
 job fails with a warning and the source is left for its next scheduling
 interval. Enroll or replace credentials later from the protected admin panel;
 the running worker observes the account on a subsequent job without a restart.
@@ -130,10 +131,14 @@ The admin panel provides the non-interactive credential enrollment flow: after
 signing in at `/admin/login`, copy the complete `Cookie` request-header value
 from a successful `/web/mp/articles` request in a desktop browser, then paste
 it into the WeRead authentication form with its RFC3339 access-session expiry.
-The response contains only the account UUID and status metadata; use that UUID
-as the source's `account_id`. To rotate a session, submit the new cookie using
-the same account ID. QR-code login remains deferred, and no cookie should be
-placed in a ConfigMap or container image.
+The display name may be left empty when the cookie contains `wr_name`; Werrss
+percent-decodes that cookie value and uses it as the display name. The response
+contains only the account UUID and status metadata. Use that UUID
+as a source's `account_id` when a source must stay pinned to one account; leave
+the field empty to randomly use any enabled, unexpired enrolled account. To
+rotate a session, submit the new cookie using the same account ID. QR-code
+login remains deferred, and no cookie should be placed in a ConfigMap or
+container image.
 
 ## Kubernetes
 

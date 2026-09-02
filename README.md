@@ -91,6 +91,7 @@ keys in a secret manager or an ignored local environment file.
 | `APP_INSTANCE_ID` | Generated UUID | Stable instance identity used for distributed job leases. Set a distinct value for each long-lived replica; an ID is generated for local use when omitted. |
 | `HTTP_BIND` | `0.0.0.0` | Host or IP address for the shared feed, health, and optional admin listener. IPv6 addresses may be supplied without brackets. |
 | `HTTP_PORT` | `8080` | Shared HTTP listener port. It must be between `1` and `65535`. |
+| `LOG_LEVEL` | `warn` | Minimum log severity: `off`, `error`, `warn`, `info`, `debug`, or `trace`. Each emitted line includes a timestamp, level, module target, and event detail. |
 | `APP_TIMEZONE` | `UTC` | IANA timezone used for quiet-hours evaluation and browser timezone checks. |
 | `QUIET_HOURS_START` | Unset | Inclusive local quiet-hours start in `HH:MM` format. It must be set together with `QUIET_HOURS_END`. |
 | `QUIET_HOURS_END` | Unset | Exclusive local quiet-hours end in `HH:MM` format. Equal start and end values are rejected. |
@@ -106,7 +107,7 @@ keys in a secret manager or an ignored local environment file.
 | `BROWSER_VIEWPORT_WIDTH` | `1280` | Browser viewport width in CSS pixels. Valid range: `1`–`8192`. |
 | `BROWSER_VIEWPORT_HEIGHT` | `2000` | Browser viewport height in CSS pixels. Valid range: `1`–`8192`. |
 | `BROWSER_EXTRA_ARGS` | Empty | Optional whitespace-separated browser arguments. At most 32 arguments are accepted, each must begin with `-`, and controlled browser arguments such as User-Agent, window size, persistent-profile paths, and headless mode cannot be overridden. |
-| `WEREAD_ACCOUNT_ID` | Unset | Optional stable WeRead account UUID used as the default panel-enrolled account. When unset, source-sync selects an enabled, unexpired account enrolled through the admin panel from PostgreSQL for each job. |
+| `WEREAD_ACCOUNT_ID` | Unset | Optional stable WeRead account UUID used as the default panel-enrolled account. When unset, an unbound source-sync job randomly selects an enabled, unexpired account enrolled through the admin panel from PostgreSQL. A source-specific account ID takes precedence. |
 | `WEREAD_ARTICLE_LIST_URL` | `https://i.weread.qq.com/web/mp/articles` | Exact HTTPS WeRead article-list endpoint. Credentials, fragments, and non-default ports are rejected. |
 
 ### Workers, jobs, and leases
@@ -202,22 +203,28 @@ than a commitment:
    availability and timezone mismatches separately from API liveness and
    PostgreSQL readiness, and prevent browser jobs from being claimed while the
    browser sidecar is unhealthy.
-2. **Normalize application logs.** Define a consistent structured event and
+2. **Polish the web UI.** Improve information hierarchy, loading and empty
+   states, validation feedback, and responsive behavior in the administrator
+   panel so routine source and account operations are easier to understand.
+3. **Add internationalization (i18n).** Move user-facing panel messages into
+   translation resources and add additional locale support after the default
+   Chinese-language experience is stable.
+4. **Normalize application logs.** Define a consistent structured event and
    severity vocabulary across API, scheduler, worker, browser, and persistence
    paths; redact sensitive values and make correlation identifiers predictable
    for operators and log aggregation tools.
-3. **Add QR-code login.** Implement the bounded, single-use login-attempt
+5. **Add QR-code login.** Implement the bounded, single-use login-attempt
    lifecycle and interactive confirmation flow so operators do not need to
    supply credentials manually. This remains deferred after the
    first release.
-4. **Add missed-article repair/backfill jobs.** Queue and process articles
+6. **Add missed-article repair/backfill jobs.** Queue and process articles
    missed during synchronization with bounded retries and deduplication. This
    improves recovery after partial upstream failures but is not required for
    the first release.
-5. **Persist archived assets and rewrite feed URLs.** Store approved media in
+7. **Persist archived assets and rewrite feed URLs.** Store approved media in
    local or object storage so archived articles can remain useful when
    upstream assets change or disappear.
-6. **Evaluate PGMQ as a queue transport optimization.** The current custom
+8. **Evaluate PGMQ as a queue transport optimization.** The current custom
    `jobs` table remains the version-one transport; PGMQ can be evaluated later
    if queue throughput or operational overhead becomes a demonstrated
    bottleneck.
@@ -278,6 +285,11 @@ When a due source-sync job finds no enabled, unexpired account, it records a
 warning and a scheduled failure; the source is reconsidered on its next due
 interval. Enrolling or replacing credentials in the admin panel makes the
 account available to later jobs without restarting the worker.
+
+When adding a source, its WeRead account ID is optional. Set the ID returned by
+the admin panel to pin that source to one account; leave it empty to randomly
+select among enabled, unexpired enrolled accounts for each synchronization
+job.
 
 ### Single-admin panel and API
 

@@ -19,7 +19,7 @@
 //! BROWSER_USER_AGENT / BROWSER_LOCALE / BROWSER_VIEWPORT_WIDTH /
 //! BROWSER_VIEWPORT_HEIGHT / BROWSER_EXTRA_ARGS
 //! WEREAD_ACCOUNT_ID / WEREAD_ARTICLE_LIST_URL
-//! APP_INSTANCE_ID / HTTP_BIND / HTTP_PORT / APP_ROLES
+//! APP_INSTANCE_ID / HTTP_BIND / HTTP_PORT / APP_ROLES / LOG_LEVEL
 //! APP_TIMEZONE / QUIET_HOURS_START / QUIET_HOURS_END
 //! JOB_POLL_SECONDS / JOB_LEASE_SECONDS / JOB_HEARTBEAT_SECONDS /
 //! JOB_MAX_ATTEMPTS
@@ -105,6 +105,7 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "HTTP_BIND",
     "HTTP_PORT",
     "APP_ROLES",
+    "LOG_LEVEL",
     "APP_TIMEZONE",
     "QUIET_HOURS_START",
     "QUIET_HOURS_END",
@@ -174,6 +175,7 @@ const APPLICATION_ENVIRONMENT_PREFIXES: &[&str] = &[
     "BROWSER_",
     "WEREAD_",
     "DATABASE_POOL_",
+    "LOG_",
 ];
 
 const LEGACY_ENVIRONMENT_VARIABLES: &[&str] = &["ARCHIVE_BACKEND", "ARCHIVE_LOCAL_PATH"];
@@ -342,6 +344,8 @@ pub enum ConfigError {
 pub struct AppConfig {
     /// Components constructed by this process.
     pub roles: AppRoles,
+    /// Maximum severity emitted by the process logger.
+    pub log_level: tracing::level_filters::LevelFilter,
     /// Maximum number of jobs executed concurrently by a worker process.
     pub worker_concurrency: u32,
     /// PostgreSQL URL, retained as a secret because it may contain a password.
@@ -448,6 +452,7 @@ impl AppConfig {
 
     fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
         let roles = AppRoles::parse(raw.app_roles.as_deref().unwrap_or("api"))?;
+        let log_level = parse_log_level(raw.log_level.as_deref())?;
         let worker_concurrency = bounded_positive_u32(
             raw.worker_concurrency.unwrap_or(1),
             "WORKER_CONCURRENCY",
@@ -721,6 +726,7 @@ impl AppConfig {
 
         Ok(Self {
             roles,
+            log_level,
             worker_concurrency,
             database_url: SecretString::new(database_url.into_boxed_str()),
             database_pool_min_connections,
@@ -794,6 +800,7 @@ struct RawConfig {
     http_bind: Option<String>,
     http_port: Option<u16>,
     app_roles: Option<String>,
+    log_level: Option<String>,
     app_timezone: Option<String>,
     quiet_hours_start: Option<String>,
     quiet_hours_end: Option<String>,
@@ -953,6 +960,22 @@ fn parse_optional_weread_account_id(
         });
     }
     Ok(Some(WeReadAccountId::from_uuid(account_id)))
+}
+
+fn parse_log_level(
+    value: Option<&str>,
+) -> Result<tracing::level_filters::LevelFilter, ConfigError> {
+    let value = value.unwrap_or("warn").trim();
+    if value.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            variable: "LOG_LEVEL",
+            reason: "expected off, error, warn, info, debug, or trace",
+        });
+    }
+    value.parse().map_err(|_| ConfigError::InvalidValue {
+        variable: "LOG_LEVEL",
+        reason: "expected off, error, warn, info, debug, or trace",
+    })
 }
 
 fn parse_weread_article_list_url(value: Option<String>) -> Result<Url, ConfigError> {
@@ -1317,6 +1340,7 @@ mod tests {
     fn loads_defaults_and_explicit_values_from_environment_pairs() {
         let config = AppConfig::from_env_iter(valid_environment()).unwrap();
 
+        assert_eq!(config.log_level, tracing::level_filters::LevelFilter::WARN);
         assert_eq!(config.browser_engine, BrowserEngine::Chromium);
         assert!(config.browser_user_agent.is_none());
         assert_eq!(config.browser_locale, "zh-CN");
@@ -1358,6 +1382,43 @@ mod tests {
                 .parse::<chrono::DateTime<chrono::Utc>>()
                 .unwrap()
         ));
+    }
+
+    #[test]
+    fn parses_configured_log_levels_and_rejects_unknown_values() {
+        for (value, expected) in [
+            ("off", tracing::level_filters::LevelFilter::OFF),
+            ("error", tracing::level_filters::LevelFilter::ERROR),
+            (" warn ", tracing::level_filters::LevelFilter::WARN),
+            ("info", tracing::level_filters::LevelFilter::INFO),
+            ("debug", tracing::level_filters::LevelFilter::DEBUG),
+            ("trace", tracing::level_filters::LevelFilter::TRACE),
+        ] {
+            let config = AppConfig::from_env_iter(replace_environment(
+                valid_environment(),
+                "LOG_LEVEL",
+                value,
+            ))
+            .unwrap();
+            assert_eq!(config.log_level, expected, "LOG_LEVEL={value:?}");
+        }
+
+        for value in ["", "verbose", "warning", "info,sqlx=debug"] {
+            assert!(
+                matches!(
+                    AppConfig::from_env_iter(replace_environment(
+                        valid_environment(),
+                        "LOG_LEVEL",
+                        value,
+                    )),
+                    Err(ConfigError::InvalidValue {
+                        variable: "LOG_LEVEL",
+                        ..
+                    })
+                ),
+                "LOG_LEVEL={value:?} should be rejected"
+            );
+        }
     }
 
     #[test]

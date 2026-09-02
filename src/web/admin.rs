@@ -15,6 +15,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -125,7 +126,7 @@ struct LoginResponse {
 #[derive(Deserialize)]
 struct ProvisionWeReadAccountRequest {
     account_id: Option<Uuid>,
-    display_name: String,
+    display_name: Option<String>,
     cookie_header: String,
     access_expires_at: String,
 }
@@ -214,11 +215,15 @@ async fn provision_weread_account(
         Ok(credentials) => credentials,
         Err(response) => return *response,
     };
+    let display_name = match display_name_from_request(&request) {
+        Ok(display_name) => display_name,
+        Err(response) => return *response,
+    };
     match state
         .weread_auth
         .provision(CredentialProvision {
             account_id,
-            display_name: request.display_name,
+            display_name,
             credentials,
         })
         .await
@@ -256,12 +261,16 @@ async fn replace_weread_account(
         Ok(credentials) => credentials,
         Err(response) => return *response,
     };
+    let display_name = match display_name_from_request(&request) {
+        Ok(display_name) => display_name,
+        Err(response) => return *response,
+    };
     match state
         .weread_auth
         .replace(
             CredentialProvision {
                 account_id,
-                display_name: request.display_name,
+                display_name,
                 credentials,
             },
             &format!("admin:{}", session.username()),
@@ -318,6 +327,35 @@ fn credentials_from_request(
     credentials
         .with_web_cookie(request.cookie_header.clone())
         .map_err(|error| Box::new(validation_error(error.to_string())))
+}
+
+fn display_name_from_request(
+    request: &ProvisionWeReadAccountRequest,
+) -> Result<String, Box<Response>> {
+    if let Some(display_name) = request
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|display_name| !display_name.is_empty())
+    {
+        return Ok(display_name.to_owned());
+    }
+
+    let encoded_name = cookie_value(&request.cookie_header, "wr_name").ok_or_else(|| {
+        Box::new(validation_error(
+            "display_name must be provided or cookie_header must contain a non-empty wr_name",
+        ))
+    })?;
+    let display_name = percent_decode_str(&encoded_name)
+        .decode_utf8()
+        .map_err(|_| Box::new(validation_error("cookie_header wr_name is not valid UTF-8")))?;
+    let display_name = display_name.trim();
+    if display_name.is_empty() {
+        return Err(Box::new(validation_error(
+            "display_name must be provided or cookie_header must contain a non-empty wr_name",
+        )));
+    }
+    Ok(display_name.to_owned())
 }
 
 async fn get_weread_account(
@@ -821,5 +859,55 @@ mod tests {
             },
         ));
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn provisioning_request(
+        display_name: Option<&str>,
+        cookie_header: &str,
+    ) -> ProvisionWeReadAccountRequest {
+        ProvisionWeReadAccountRequest {
+            account_id: None,
+            display_name: display_name.map(str::to_owned),
+            cookie_header: cookie_header.to_owned(),
+            access_expires_at: "2030-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn derives_display_name_from_percent_encoded_weread_cookie_name() {
+        let request = provisioning_request(None, "wr_name=Alex%20Hua; wr_vid=vid");
+        assert_eq!(
+            display_name_from_request(&request).ok(),
+            Some("Alex Hua".to_owned())
+        );
+    }
+
+    #[test]
+    fn explicit_display_name_takes_precedence_over_weread_cookie_name() {
+        let request = provisioning_request(Some("  Chosen name  "), "wr_name=Cookie%20name");
+        assert_eq!(
+            display_name_from_request(&request).ok(),
+            Some("Chosen name".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_display_name_requires_a_valid_nonempty_weread_cookie_name() {
+        for cookie_header in ["wr_vid=vid", "wr_name="] {
+            let request = provisioning_request(Some("   "), cookie_header);
+            let response = display_name_from_request(&request).unwrap_err();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("validation body should be readable");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+                "display_name must be provided or cookie_header must contain a non-empty wr_name"
+            );
+        }
+
+        let request = provisioning_request(Some("   "), "wr_name=%FF");
+        let response = display_name_from_request(&request).unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

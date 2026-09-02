@@ -35,7 +35,7 @@ pub enum CredentialError {
     /// Access credentials must expire after they are issued.
     #[error("access credential expiry must be in the future")]
     ExpiryNotAfterIssue,
-    /// Browser cookie headers must contain non-empty name/value pairs.
+    /// Browser cookie headers must contain valid name/value pairs.
     #[error("WeRead web cookie header is invalid")]
     InvalidWebCookie,
 }
@@ -103,9 +103,9 @@ impl WeReadCredentials {
             || cookie_header.split(';').any(|part| {
                 let part = part.trim();
                 part.is_empty()
-                    || part.split_once('=').is_none_or(|(name, value)| {
-                        name.trim().is_empty() || value.trim().is_empty()
-                    })
+                    || part
+                        .split_once('=')
+                        .is_none_or(|(name, _value)| name.trim().is_empty())
             })
         {
             return Err(CredentialError::InvalidWebCookie);
@@ -382,5 +382,14 @@ mod tests {
                 Err(CredentialError::InvalidWebCookie)
             ));
         }
+    }
+
+    #[test]
+    fn web_cookie_accepts_optional_empty_values() {
+        let cookie = "wr_avatar=; wr_skey=access; wr_rt=refresh; _qimei_h38=";
+        assert_eq!(
+            credentials().with_web_cookie(cookie).unwrap().web_cookie(),
+            Some(cookie)
+        );
     }
 }

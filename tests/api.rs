@@ -428,6 +428,114 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_can_provision_weread_account_with_empty_optional_cookie_values(pool: PgPool) {
+    let app = admin_app(&pool);
+    let login = app
+        .clone()
+        .oneshot(json_request(
+            "/api/admin/login",
+            serde_json::json!({"username": "admin", "password": "correct horse"}),
+        ))
+        .await
+        .expect("valid login request should complete");
+    assert_eq!(login.status(), StatusCode::OK);
+    let cookie = login.headers()[header::SET_COOKIE]
+        .to_str()
+        .expect("session cookie should be valid")
+        .split(';')
+        .next()
+        .expect("cookie should contain a value")
+        .to_owned();
+    let login_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(login.into_body(), usize::MAX)
+            .await
+            .expect("login body should be readable"),
+    )
+    .expect("login body should be JSON");
+    let csrf = login_body["csrf_token"]
+        .as_str()
+        .expect("CSRF should be returned");
+    let expiry = (Utc::now() + Duration::days(30)).to_rfc3339();
+
+    let missing_name = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/accounts",
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({
+                "account_id": null,
+                "display_name": null,
+                "cookie_header": "wr_vid=12983214; wr_skey=access; wr_rt=refresh; wr_name=",
+                "access_expires_at": expiry,
+            })),
+        ))
+        .await
+        .expect("invalid account provisioning request should complete");
+    assert_eq!(missing_name.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let missing_name_body = to_bytes(missing_name.into_body(), usize::MAX)
+        .await
+        .expect("validation body should be readable");
+    let missing_name_body: serde_json::Value =
+        serde_json::from_slice(&missing_name_body).expect("validation body should be JSON");
+    assert_eq!(
+        missing_name_body["error"],
+        "display_name must be provided or cookie_header must contain a non-empty wr_name"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/accounts",
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({
+                "account_id": null,
+                "display_name": null,
+                "cookie_header": "wr_avatar=; wr_fp=1237823; wr_gender=0; wr_localvid=awefhiauef; wr_name=Alex%20Hua; wr_ql=0; wr_rt=web%400H5swX9Mm95b1~YWmDF_AD; wr_skey=aewi238; wr_vid=12983214; wr_gid=12412424; _qimei_fingerprint=aefhiuawef; _qimei_h38=; _qimei_i_1=aewaefuhi; _qimei_i_2=aewufhiew; _qimei_i_3=awefhbieuwh2839ifde; _qimei_q32=; _qimei_q36=; yybsdk-webId=ahweiufhwiu3829hcf; _qimei_uuid42=wefhu3289hf",
+                "access_expires_at": expiry,
+            })),
+        ))
+        .await
+        .expect("account provisioning request should complete");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("account response should be readable");
+    let account: serde_json::Value =
+        serde_json::from_slice(&body).expect("account response should be JSON");
+    let account_id = account["account_id"]
+        .as_str()
+        .expect("new account should receive an ID")
+        .parse::<Uuid>()
+        .expect("account ID should be a UUID");
+    assert!(!account_id.is_nil());
+    assert_eq!(account["display_name"], "Alex Hua");
+    assert_eq!(account["credential_version"], 1);
+    assert_eq!(account["access_expires_at"], expiry);
+    assert!(!String::from_utf8_lossy(&body).contains("aewi238"));
+
+    let status = app
+        .oneshot(admin_request(
+            &format!("/api/admin/weread/accounts/{account_id}"),
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("account status request should complete");
+    assert_eq!(status.status(), StatusCode::OK);
+    let status_body = to_bytes(status.into_body(), usize::MAX)
+        .await
+        .expect("account status response should be readable");
+    let status: serde_json::Value =
+        serde_json::from_slice(&status_body).expect("account status should be JSON");
+    assert_eq!(status["account_id"], account_id.to_string());
+    assert_eq!(status["display_name"], "Alex Hua");
+    assert_eq!(status["disabled"], false);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn feed_route_serves_xml_and_honors_conditional_requests(pool: PgPool) {
     let source_id = insert_source(&pool).await;
     publish_cache(&pool, source_id).await;
