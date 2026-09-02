@@ -31,6 +31,8 @@ pub struct CredentialRecord {
 pub struct CredentialReplacement {
     /// Account whose credentials are being replaced.
     pub account_id: WeReadAccountId,
+    /// Updated operator-facing account label.
+    pub display_name: String,
     /// Version read before the refresh exchange.
     pub expected_version: i64,
     /// New encrypted credential payload.
@@ -76,6 +78,9 @@ impl CredentialRecord {
 /// Errors raised by account credential persistence.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CredentialRepositoryError {
+    /// The requested account does not exist.
+    #[error("credential account {account_id} was not found")]
+    NotFound { account_id: WeReadAccountId },
     /// The requested account was concurrently changed or is absent.
     #[error("credential version conflict for account {account_id}")]
     Conflict { account_id: WeReadAccountId },
@@ -97,6 +102,12 @@ pub trait CredentialRepository: Send + Sync {
     /// selection. Implementations must not return disabled accounts.
     async fn list(&self) -> Result<Vec<CredentialRecord>, CredentialRepositoryError>;
 
+    /// Lists all enrolled accounts in deterministic order for administrative
+    /// status views. Implementations must not decrypt or omit disabled records.
+    async fn list_all(&self) -> Result<Vec<CredentialRecord>, CredentialRepositoryError> {
+        self.list().await
+    }
+
     /// Loads one account and its encrypted credential payload.
     async fn find(
         &self,
@@ -117,6 +128,16 @@ pub trait CredentialRepository: Send + Sync {
         &self,
         replacement: CredentialReplacement,
     ) -> Result<CredentialRecord, CredentialRepositoryError>;
+
+    /// Enables or disables an enrolled account.
+    async fn set_disabled(
+        &self,
+        account_id: WeReadAccountId,
+        disabled: bool,
+    ) -> Result<CredentialRecord, CredentialRepositoryError>;
+
+    /// Permanently removes an enrolled account and its lease row.
+    async fn delete(&self, account_id: WeReadAccountId) -> Result<(), CredentialRepositoryError>;
 }
 
 /// PostgreSQL-backed credential repository.
@@ -153,6 +174,18 @@ impl CredentialRepository for PostgresCredentialRepository {
     async fn list(&self) -> Result<Vec<CredentialRecord>, CredentialRepositoryError> {
         sqlx::query(
             "SELECT account_id, display_name, credentials_ciphertext, access_expires_at, credential_version, disabled FROM weread_accounts WHERE NOT disabled ORDER BY access_expires_at ASC, account_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .into_iter()
+        .map(decode_record)
+            .collect()
+    }
+
+    async fn list_all(&self) -> Result<Vec<CredentialRecord>, CredentialRepositoryError> {
+        sqlx::query(
+            "SELECT account_id, display_name, credentials_ciphertext, access_expires_at, credential_version, disabled FROM weread_accounts ORDER BY access_expires_at ASC, account_id ASC",
         )
         .fetch_all(&self.pool)
         .await
@@ -209,7 +242,7 @@ impl CredentialRepository for PostgresCredentialRepository {
     ) -> Result<CredentialRecord, CredentialRepositoryError> {
         validate_inputs(
             replacement.account_id,
-            "valid",
+            &replacement.display_name,
             &replacement.ciphertext,
             replacement.access_expires_at,
         )?;
@@ -227,19 +260,19 @@ impl CredentialRepository for PostgresCredentialRepository {
                 SELECT lease.account_id
                 FROM account_leases AS lease
                 WHERE lease.account_id = $1
-                  AND lease.lease_owner = $5
-                  AND lease.lease_token = $6
+                  AND lease.lease_owner = $6
+                  AND lease.lease_token = $7
                   AND lease.lease_until > clock_timestamp()
                 FOR UPDATE
             )
             UPDATE weread_accounts AS account
-            SET credentials_ciphertext = $3,
-                access_expires_at = $4,
+            SET display_name = $3,
+                credentials_ciphertext = $4,
+                access_expires_at = $5,
                 credential_version = credential_version + 1,
                 updated_at = clock_timestamp()
             WHERE account.account_id = $1
               AND account.credential_version = $2
-              AND NOT account.disabled
               AND EXISTS (
                   SELECT 1
                   FROM live_lease
@@ -252,6 +285,7 @@ impl CredentialRepository for PostgresCredentialRepository {
         )
         .bind(replacement.account_id.as_uuid())
         .bind(replacement.expected_version)
+        .bind(replacement.display_name.trim())
         .bind(&replacement.ciphertext)
         .bind(replacement.access_expires_at)
         .bind(replacement.lease_owner)
@@ -264,6 +298,42 @@ impl CredentialRepository for PostgresCredentialRepository {
             .ok_or(CredentialRepositoryError::Conflict {
                 account_id: replacement.account_id,
             })
+    }
+
+    async fn set_disabled(
+        &self,
+        account_id: WeReadAccountId,
+        disabled: bool,
+    ) -> Result<CredentialRecord, CredentialRepositoryError> {
+        let row = sqlx::query(
+            "UPDATE weread_accounts SET disabled = $2, updated_at = clock_timestamp() WHERE account_id = $1 RETURNING account_id, display_name, credentials_ciphertext, access_expires_at, credential_version, disabled",
+        )
+        .bind(account_id.as_uuid())
+        .bind(disabled)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        row.map(decode_record)
+            .transpose()?
+            .ok_or(CredentialRepositoryError::NotFound { account_id })
+    }
+
+    async fn delete(&self, account_id: WeReadAccountId) -> Result<(), CredentialRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let result = sqlx::query("DELETE FROM weread_accounts WHERE account_id = $1")
+            .bind(account_id.as_uuid())
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        if result.rows_affected() == 0 {
+            return Err(CredentialRepositoryError::NotFound { account_id });
+        }
+        sqlx::query("DELETE FROM account_leases WHERE account_id = $1")
+            .bind(account_id.as_uuid())
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)
     }
 }
 
@@ -408,6 +478,17 @@ impl CredentialRepository for MemoryCredentialRepository {
         Ok(records)
     }
 
+    async fn list_all(&self) -> Result<Vec<CredentialRecord>, CredentialRepositoryError> {
+        let mut records: Vec<_> = self.state.lock().await.records.values().cloned().collect();
+        records.sort_by_key(|record| {
+            (
+                record.account().access_expires_at(),
+                record.account().account_id().as_uuid(),
+            )
+        });
+        Ok(records)
+    }
+
     async fn find(
         &self,
         account_id: WeReadAccountId,
@@ -447,7 +528,7 @@ impl CredentialRepository for MemoryCredentialRepository {
     ) -> Result<CredentialRecord, CredentialRepositoryError> {
         validate_inputs(
             replacement.account_id,
-            "valid",
+            &replacement.display_name,
             &replacement.ciphertext,
             replacement.access_expires_at,
         )?;
@@ -478,19 +559,49 @@ impl CredentialRepository for MemoryCredentialRepository {
             .records
             .get(&replacement.account_id)
             .filter(|record| record.account().credential_version() == replacement.expected_version)
-            .filter(|record| !record.account().disabled())
             .ok_or(CredentialRepositoryError::Conflict {
                 account_id: replacement.account_id,
             })?;
         let account = WeReadAccount::from_parts(
             replacement.account_id,
-            current.account().display_name().to_owned(),
+            replacement.display_name.trim().to_owned(),
             replacement.expected_version + 1,
             replacement.access_expires_at,
-            false,
+            current.account().disabled(),
         );
         let record = CredentialRecord::from_parts(account, replacement.ciphertext);
         state.records.insert(replacement.account_id, record.clone());
         Ok(record)
+    }
+
+    async fn set_disabled(
+        &self,
+        account_id: WeReadAccountId,
+        disabled: bool,
+    ) -> Result<CredentialRecord, CredentialRepositoryError> {
+        let mut state = self.state.lock().await;
+        let current = state
+            .records
+            .get(&account_id)
+            .ok_or(CredentialRepositoryError::NotFound { account_id })?;
+        let account = WeReadAccount::from_parts(
+            account_id,
+            current.account().display_name().to_owned(),
+            current.account().credential_version(),
+            current.account().access_expires_at(),
+            disabled,
+        );
+        let record = CredentialRecord::from_parts(account, current.ciphertext().to_vec());
+        state.records.insert(account_id, record.clone());
+        Ok(record)
+    }
+
+    async fn delete(&self, account_id: WeReadAccountId) -> Result<(), CredentialRepositoryError> {
+        let mut state = self.state.lock().await;
+        state
+            .records
+            .remove(&account_id)
+            .map(|_| ())
+            .ok_or(CredentialRepositoryError::NotFound { account_id })
     }
 }

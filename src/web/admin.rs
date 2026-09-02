@@ -10,7 +10,7 @@ use std::{net::SocketAddr, sync::Arc};
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -75,14 +75,30 @@ pub fn admin_router(
         weread_auth,
     });
     Router::new()
+        .route("/", get(root_redirect))
         .route("/admin/login", get(login_page))
         .route("/admin", get(admin_page))
+        .route("/admin/", get(admin_page))
+        .route("/admin/weread/accounts", get(weread_accounts_page))
+        .route(
+            "/admin/weread/accounts/{account_id}",
+            get(weread_account_page),
+        )
         .route("/api/admin/login", post(login))
         .route("/api/admin/logout", post(logout))
-        .route("/api/admin/weread/accounts", post(provision_weread_account))
+        .route(
+            "/api/admin/weread/accounts",
+            get(list_weread_accounts).post(provision_weread_account),
+        )
         .route(
             "/api/admin/weread/accounts/{account_id}",
-            get(get_weread_account).put(replace_weread_account),
+            get(get_weread_account)
+                .put(replace_weread_account)
+                .delete(delete_weread_account),
+        )
+        .route(
+            "/api/admin/weread/accounts/{account_id}/enabled",
+            post(set_weread_account_enabled),
         )
         .route("/api/admin/sources", get(list_sources).post(create_source))
         .route("/api/admin/sources/{source_id}/enabled", post(set_enabled))
@@ -138,6 +154,22 @@ struct WeReadAccountResponse {
     credential_version: i64,
     access_expires_at: String,
     disabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WeReadAccountListResponse {
+    account_id: Uuid,
+    display_name: String,
+    status: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetEnabledRequest {
+    enabled: bool,
+}
+
+async fn root_redirect() -> Redirect {
+    Redirect::temporary("/admin/")
 }
 
 impl From<crate::domain::credentials::WeReadAccount> for WeReadAccountResponse {
@@ -282,6 +314,43 @@ async fn replace_weread_account(
     }
 }
 
+async fn list_weread_accounts(
+    State(state): State<Arc<AdminApiState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(error) = authenticate(&state.auth, &headers) {
+        return auth_error_response(error);
+    }
+    let now = Utc::now();
+    match state.weread_auth.list_accounts().await {
+        Ok(accounts) => Json(
+            accounts
+                .into_iter()
+                .map(|account| WeReadAccountListResponse {
+                    account_id: account.account_id().as_uuid(),
+                    display_name: account.display_name().to_owned(),
+                    status: weread_account_status(&account, now),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(error) => auth_service_error_response(error),
+    }
+}
+
+fn weread_account_status(
+    account: &crate::domain::credentials::WeReadAccount,
+    now: DateTime<Utc>,
+) -> &'static str {
+    if account.disabled() {
+        "disabled"
+    } else if account.access_expires_at() <= now {
+        "expired"
+    } else {
+        "active"
+    }
+}
+
 fn credentials_from_request(
     request: &ProvisionWeReadAccountRequest,
 ) -> Result<crate::domain::credentials::WeReadCredentials, Box<Response>> {
@@ -375,6 +444,93 @@ async fn get_weread_account(
         Ok(account) => Json(WeReadAccountResponse::from(account)).into_response(),
         Err(AuthServiceError::AccountNotFound { .. }) => not_found("WeRead account"),
         Err(error) => auth_service_error_response(error),
+    }
+}
+
+async fn set_weread_account_enabled(
+    State(state): State<Arc<AdminApiState>>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SetEnabledRequest>,
+) -> Response {
+    let _session = match protected_mutation(&state, &headers) {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    let account_id = match parse_account_id(&account_id) {
+        Ok(account_id) => account_id,
+        Err(response) => return *response,
+    };
+    match state
+        .weread_auth
+        .set_disabled(account_id, !request.enabled)
+        .await
+    {
+        Ok(account) => Json(WeReadAccountResponse::from(account)).into_response(),
+        Err(error) => auth_service_error_response(error),
+    }
+}
+
+async fn delete_weread_account(
+    State(state): State<Arc<AdminApiState>>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let _session = match protected_mutation(&state, &headers) {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    let account_id = match parse_account_id(&account_id) {
+        Ok(account_id) => account_id,
+        Err(response) => return *response,
+    };
+    match state.weread_auth.delete(account_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => auth_service_error_response(error),
+    }
+}
+
+async fn weread_account_page(
+    State(state): State<Arc<AdminApiState>>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match authenticate(&state.auth, &headers) {
+        Ok(session) => session,
+        Err(_) => {
+            return (StatusCode::SEE_OTHER, [(header::LOCATION, "/admin/login")]).into_response()
+        }
+    };
+    let account_id = match parse_account_id(&account_id) {
+        Ok(account_id) => account_id,
+        Err(response) => return *response,
+    };
+    match state.weread_auth.account(account_id).await {
+        Ok(account) => ui::weread_account_page(&session, &account).into_response(),
+        Err(AuthServiceError::AccountNotFound { .. }) => not_found("WeRead account"),
+        Err(error) => auth_service_error_response(error),
+    }
+}
+
+async fn weread_accounts_page(
+    State(state): State<Arc<AdminApiState>>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match authenticate(&state.auth, &headers) {
+        Ok(session) => session,
+        Err(_) => {
+            return (StatusCode::SEE_OTHER, [(header::LOCATION, "/admin/login")]).into_response()
+        }
+    };
+    ui::weread_accounts_page(&session).into_response()
+}
+
+fn parse_account_id(value: &str) -> Result<WeReadAccountId, Box<Response>> {
+    match Uuid::parse_str(value) {
+        Ok(value) if !value.is_nil() => Ok(WeReadAccountId::from_uuid(value)),
+        _ => Err(Box::new(validation_error(
+            "account_id must be a non-nil UUID",
+        ))),
     }
 }
 
@@ -729,6 +885,9 @@ fn auth_service_error_response(error: AuthServiceError) -> Response {
             crate::persistence::repositories::credential_repository::CredentialRepositoryError::Conflict { .. },
         ) => StatusCode::CONFLICT,
         AuthServiceError::Repository(
+            crate::persistence::repositories::credential_repository::CredentialRepositoryError::NotFound { .. },
+        ) => StatusCode::NOT_FOUND,
+        AuthServiceError::Repository(
             crate::persistence::repositories::credential_repository::CredentialRepositoryError::Invalid(_),
         ) => StatusCode::UNPROCESSABLE_ENTITY,
         AuthServiceError::Credentials(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -924,5 +1083,35 @@ mod tests {
         let request = provisioning_request(Some("   "), "wr_name=%FF");
         let response = display_name_from_request(&request).unwrap_err();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn account_status_distinguishes_active_expired_and_disabled_accounts() {
+        let now = "2026-09-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let active = crate::domain::credentials::WeReadAccount::from_parts(
+            WeReadAccountId::from_uuid(Uuid::from_u128(1)),
+            "active".to_owned(),
+            1,
+            now + Duration::hours(1),
+            false,
+        );
+        let expired = crate::domain::credentials::WeReadAccount::from_parts(
+            WeReadAccountId::from_uuid(Uuid::from_u128(2)),
+            "expired".to_owned(),
+            1,
+            now,
+            false,
+        );
+        let disabled = crate::domain::credentials::WeReadAccount::from_parts(
+            WeReadAccountId::from_uuid(Uuid::from_u128(3)),
+            "disabled".to_owned(),
+            1,
+            now + Duration::hours(1),
+            true,
+        );
+
+        assert_eq!(weread_account_status(&active, now), "active");
+        assert_eq!(weread_account_status(&expired, now), "expired");
+        assert_eq!(weread_account_status(&disabled, now), "disabled");
     }
 }

@@ -47,6 +47,22 @@ use werrss::{
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool) {
     let app = admin_app(&pool);
+    let root = app
+        .clone()
+        .oneshot(get_request("/", None))
+        .await
+        .expect("root request should complete");
+    assert_eq!(root.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(root.headers()[header::LOCATION], "/admin/");
+
+    let slash_admin = app
+        .clone()
+        .oneshot(get_request("/admin/", None))
+        .await
+        .expect("slash-admin request should complete");
+    assert_eq!(slash_admin.status(), StatusCode::SEE_OTHER);
+    assert_eq!(slash_admin.headers()[header::LOCATION], "/admin/login");
+
     let login = app
         .clone()
         .oneshot(json_request(
@@ -65,6 +81,14 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
         .expect("admin page request should complete");
     assert_eq!(page.status(), StatusCode::SEE_OTHER);
     assert_eq!(page.headers()[header::LOCATION], "/admin/login");
+
+    let accounts_page = app
+        .clone()
+        .oneshot(get_request("/admin/weread/accounts", None))
+        .await
+        .expect("unauthenticated accounts page request should complete");
+    assert_eq!(accounts_page.status(), StatusCode::SEE_OTHER);
+    assert_eq!(accounts_page.headers()[header::LOCATION], "/admin/login");
 
     let login = app
         .clone()
@@ -107,6 +131,21 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
     .expect("admin page should be UTF-8");
     assert!(page_body.contains("Werrss admin"));
     assert!(!page_body.contains("correct horse"));
+    assert!(page_body.contains("href=\"/admin/weread/accounts\""));
+
+    let accounts_page = app
+        .clone()
+        .oneshot(admin_request("/admin/weread/accounts", &cookie, None, None))
+        .await
+        .expect("authenticated accounts page request should complete");
+    assert_eq!(accounts_page.status(), StatusCode::OK);
+    let accounts_page_body = to_bytes(accounts_page.into_body(), usize::MAX)
+        .await
+        .expect("accounts page body should be readable");
+    let accounts_page_body = String::from_utf8_lossy(&accounts_page_body);
+    assert!(accounts_page_body.contains("<h1>WeRead accounts</h1>"));
+    assert!(accounts_page_body.contains("/api/admin/weread/accounts"));
+    assert!(!accounts_page_body.contains("correct horse"));
 
     let sources = app
         .clone()
@@ -162,6 +201,37 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
     assert!(!String::from_utf8_lossy(&account_body).contains("access-secret-from-form"));
     assert!(!String::from_utf8_lossy(&account_body).contains("refresh-secret-from-form"));
 
+    let unauthenticated_accounts = app
+        .clone()
+        .oneshot(get_request("/api/admin/weread/accounts", None))
+        .await
+        .expect("unauthenticated account list request should complete");
+    assert_eq!(unauthenticated_accounts.status(), StatusCode::UNAUTHORIZED);
+
+    let accounts = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/accounts",
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("account list request should complete");
+    assert_eq!(accounts.status(), StatusCode::OK);
+    let accounts_body = to_bytes(accounts.into_body(), usize::MAX)
+        .await
+        .expect("account list body should be readable");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&accounts_body)
+            .expect("account list should be JSON"),
+        serde_json::json!([{
+            "account_id": account_id,
+            "display_name": "Primary WeRead",
+            "status": "active"
+        }])
+    );
+
     let account_status = app
         .clone()
         .oneshot(admin_request(
@@ -177,6 +247,25 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
         .await
         .expect("account status response should be readable");
     assert!(!String::from_utf8_lossy(&account_status_body).contains("secret-from-form"));
+
+    let account_page = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/admin/weread/accounts/{account_id}"),
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("account page request should complete");
+    assert_eq!(account_page.status(), StatusCode::OK);
+    let account_page_body = to_bytes(account_page.into_body(), usize::MAX)
+        .await
+        .expect("account page body should be readable");
+    let account_page_body = String::from_utf8_lossy(&account_page_body);
+    assert!(account_page_body.contains(&account_id.to_string()));
+    assert!(account_page_body.contains("/api/admin/weread/accounts/${accountId}/enabled"));
+    assert!(!account_page_body.contains("access-secret-from-form"));
 
     let replacement = app
         .clone()
@@ -203,6 +292,86 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
     assert_eq!(replacement_response["account_id"], account_id.to_string());
     assert_eq!(replacement_response["credential_version"], 2);
     assert!(!String::from_utf8_lossy(&replacement_body).contains("rotated-access"));
+
+    let disabled = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/api/admin/weread/accounts/{account_id}/enabled"),
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({"enabled": false})),
+        ))
+        .await
+        .expect("account disable request should complete");
+    assert_eq!(disabled.status(), StatusCode::OK);
+    let disabled_body = to_bytes(disabled.into_body(), usize::MAX).await.unwrap();
+    let disabled_response: serde_json::Value = serde_json::from_slice(&disabled_body).unwrap();
+    assert_eq!(disabled_response["disabled"], true);
+
+    let disabled_list = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/accounts",
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("disabled account list request should complete");
+    let disabled_list_body = to_bytes(disabled_list.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&disabled_list_body).unwrap(),
+        serde_json::json!([{
+            "account_id": account_id,
+            "display_name": "Primary WeRead",
+            "status": "disabled"
+        }])
+    );
+
+    let disabled_replacement = app
+        .clone()
+        .oneshot(admin_request_with_method(
+            &format!("/api/admin/weread/accounts/{account_id}"),
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({
+                "account_id": account_id,
+                "display_name": "Renamed WeRead",
+                "cookie_header": "wr_vid=vid-new; wr_skey=access-new; wr_rt=refresh-new",
+                "access_expires_at": "2099-03-01T00:00:00Z"
+            })),
+            "PUT",
+        ))
+        .await
+        .expect("disabled account replacement should complete");
+    assert_eq!(disabled_replacement.status(), StatusCode::OK);
+    let disabled_replacement_body = to_bytes(disabled_replacement.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let disabled_replacement_response: serde_json::Value =
+        serde_json::from_slice(&disabled_replacement_body).unwrap();
+    assert_eq!(
+        disabled_replacement_response["display_name"],
+        "Renamed WeRead"
+    );
+    assert_eq!(disabled_replacement_response["disabled"], true);
+
+    let enabled = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/api/admin/weread/accounts/{account_id}/enabled"),
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({"enabled": true})),
+        ))
+        .await
+        .expect("account enable request should complete");
+    assert_eq!(enabled.status(), StatusCode::OK);
+    let enabled_body = to_bytes(enabled.into_body(), usize::MAX).await.unwrap();
+    let enabled_response: serde_json::Value = serde_json::from_slice(&enabled_body).unwrap();
+    assert_eq!(enabled_response["disabled"], false);
 
     let duplicate_account = app
         .clone()
@@ -312,6 +481,44 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
         mismatched_replacement.status(),
         StatusCode::UNPROCESSABLE_ENTITY
     );
+
+    let deleted = app
+        .clone()
+        .oneshot(admin_request_with_method(
+            &format!("/api/admin/weread/accounts/{account_id}"),
+            &cookie,
+            Some(csrf),
+            None,
+            "DELETE",
+        ))
+        .await
+        .expect("account delete request should complete");
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+    let deleted_status = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/api/admin/weread/accounts/{account_id}"),
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("deleted account status request should complete");
+    assert_eq!(deleted_status.status(), StatusCode::NOT_FOUND);
+
+    let deleted_again = app
+        .clone()
+        .oneshot(admin_request_with_method(
+            &format!("/api/admin/weread/accounts/{account_id}"),
+            &cookie,
+            Some(csrf),
+            None,
+            "DELETE",
+        ))
+        .await
+        .expect("repeated account delete request should complete");
+    assert_eq!(deleted_again.status(), StatusCode::NOT_FOUND);
 
     let missing_csrf = app
         .clone()
@@ -425,6 +632,111 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
         .await
         .expect("invalid history request should complete");
     assert_eq!(invalid_history.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn every_protected_admin_route_rejects_an_unauthenticated_request(pool: PgPool) {
+    let app = admin_app(&pool);
+    let account_id = Uuid::from_u128(1);
+    let account_payload = serde_json::json!({
+        "account_id": account_id,
+        "display_name": "test account",
+        "cookie_header": "wr_vid=vid; wr_skey=skey; wr_rt=rt",
+        "access_expires_at": "2099-01-01T00:00:00Z"
+    });
+    let source_payload = serde_json::json!({
+        "book_id": "test-book",
+        "display_name": "test source",
+        "article_url": "https://mp.weixin.qq.com/s/test"
+    });
+    let protected_routes = vec![
+        ("GET", "/admin", None, StatusCode::SEE_OTHER),
+        ("GET", "/admin/", None, StatusCode::SEE_OTHER),
+        ("GET", "/admin/weread/accounts", None, StatusCode::SEE_OTHER),
+        (
+            "GET",
+            "/admin/weread/accounts/00000000-0000-0000-0000-000000000001",
+            None,
+            StatusCode::SEE_OTHER,
+        ),
+        (
+            "GET",
+            "/api/admin/weread/accounts",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "POST",
+            "/api/admin/weread/accounts",
+            Some(account_payload.clone()),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "GET",
+            "/api/admin/weread/accounts/00000000-0000-0000-0000-000000000001",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "PUT",
+            "/api/admin/weread/accounts/00000000-0000-0000-0000-000000000001",
+            Some(account_payload),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "DELETE",
+            "/api/admin/weread/accounts/00000000-0000-0000-0000-000000000001",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "POST",
+            "/api/admin/weread/accounts/00000000-0000-0000-0000-000000000001/enabled",
+            Some(serde_json::json!({"enabled": true})),
+            StatusCode::UNAUTHORIZED,
+        ),
+        ("GET", "/api/admin/sources", None, StatusCode::UNAUTHORIZED),
+        (
+            "POST",
+            "/api/admin/sources",
+            Some(source_payload),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "POST",
+            "/api/admin/sources/00000000-0000-0000-0000-000000000002/enabled",
+            Some(serde_json::json!({"enabled": true})),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "POST",
+            "/api/admin/sources/00000000-0000-0000-0000-000000000002/gate",
+            Some(serde_json::json!({"gate": "ready"})),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "POST",
+            "/api/admin/sources/00000000-0000-0000-0000-000000000002/feed-token",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "GET",
+            "/api/admin/sources/00000000-0000-0000-0000-000000000002/sync-runs",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        ("POST", "/api/admin/logout", None, StatusCode::UNAUTHORIZED),
+    ];
+
+    for (method, path, body, expected_status) in protected_routes {
+        let response = app
+            .clone()
+            .oneshot(admin_request_with_method(path, "", None, body, method))
+            .await
+            .expect("unauthenticated admin request should complete");
+        assert_eq!(response.status(), expected_status, "{method} {path}");
+    }
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]

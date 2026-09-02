@@ -76,7 +76,7 @@ fn worker_plan_uses_only_executable_jobs_and_preserves_concurrency() {
     assert_eq!(worker.concurrency(), 16);
     assert_eq!(
         worker.worker_config().allowed_job_types(),
-        &[JobType::FeedRebuild]
+        &[JobType::FeedRebuild, JobType::SourceSync]
     );
     assert_eq!(
         worker.loop_config().idle_poll_interval(),

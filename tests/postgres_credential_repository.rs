@@ -109,6 +109,7 @@ async fn encrypted_account_rows_support_versioned_replacement(pool: PgPool) {
     let replaced = repository
         .replace(CredentialReplacement {
             account_id,
+            display_name: "primary".to_owned(),
             expected_version: 1,
             ciphertext: b"ciphertext-v2".to_vec(),
             access_expires_at: at(7_200),
@@ -123,6 +124,7 @@ async fn encrypted_account_rows_support_versioned_replacement(pool: PgPool) {
         repository
             .replace(CredentialReplacement {
                 account_id,
+                display_name: "primary".to_owned(),
                 expected_version: 1,
                 ciphertext: b"stale".to_vec(),
                 access_expires_at: at(8_000),
@@ -168,6 +170,7 @@ async fn credential_replacement_rejects_a_stale_account_lease(pool: PgPool) {
         repository
             .replace(CredentialReplacement {
                 account_id,
+                display_name: "primary".to_owned(),
                 expected_version: 1,
                 ciphertext: b"stale-worker-write".to_vec(),
                 access_expires_at: at(8_000),
@@ -180,6 +183,7 @@ async fn credential_replacement_rejects_a_stale_account_lease(pool: PgPool) {
     let updated = repository
         .replace(CredentialReplacement {
             account_id,
+            display_name: "primary".to_owned(),
             expected_version: 1,
             ciphertext: b"current-worker-write".to_vec(),
             access_expires_at: at(8_000),
@@ -222,6 +226,7 @@ async fn credential_replacement_waits_for_the_live_lease_row_lock(pool: PgPool) 
 
     let replacement = CredentialReplacement {
         account_id,
+        display_name: "primary".to_owned(),
         expected_version: 1,
         ciphertext: b"ciphertext-v2".to_vec(),
         access_expires_at: at(7_200),

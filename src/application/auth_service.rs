@@ -452,6 +452,50 @@ where
         Ok(self.load(account_id).await?.account().clone())
     }
 
+    /// Returns non-secret metadata for every enrolled account, including
+    /// disabled accounts for administrative status views.
+    pub async fn list_accounts(&self) -> Result<Vec<WeReadAccount>, AuthServiceError> {
+        Ok(self
+            .dependencies
+            .accounts
+            .list_all()
+            .await?
+            .into_iter()
+            .map(|record| record.account().clone())
+            .collect())
+    }
+
+    /// Enables or disables an enrolled account without exposing credentials.
+    pub async fn set_disabled(
+        &self,
+        account_id: WeReadAccountId,
+        disabled: bool,
+    ) -> Result<WeReadAccount, AuthServiceError> {
+        match self
+            .dependencies
+            .accounts
+            .set_disabled(account_id, disabled)
+            .await
+        {
+            Ok(record) => Ok(record.account().clone()),
+            Err(CredentialRepositoryError::NotFound { .. }) => {
+                Err(AuthServiceError::AccountNotFound { account_id })
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Permanently deletes an enrolled account and any account lease row.
+    pub async fn delete(&self, account_id: WeReadAccountId) -> Result<(), AuthServiceError> {
+        match self.dependencies.accounts.delete(account_id).await {
+            Ok(()) => Ok(()),
+            Err(CredentialRepositoryError::NotFound { .. }) => {
+                Err(AuthServiceError::AccountNotFound { account_id })
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Loads and decrypts credentials for the authenticated acquisition
     /// boundary. Callers receive the value only for the duration of a single
     /// upstream operation; it is never suitable for API responses or logs.
@@ -494,11 +538,6 @@ where
 
         let result = async {
             let current = self.load(provision.account_id).await?;
-            if current.account().disabled() {
-                return Err(AuthServiceError::AccountDisabled {
-                    account_id: provision.account_id,
-                });
-            }
             let ciphertext = self
                 .dependencies
                 .cipher
@@ -509,6 +548,7 @@ where
                 .accounts
                 .replace(CredentialReplacement {
                     account_id: provision.account_id,
+                    display_name: provision.display_name.clone(),
                     expected_version: current.account().credential_version(),
                     ciphertext,
                     access_expires_at: provision.credentials.access_expires_at(),
@@ -604,6 +644,7 @@ where
             .accounts
             .replace(CredentialReplacement {
                 account_id,
+                display_name: current.account().display_name().to_owned(),
                 expected_version: current.account().credential_version(),
                 ciphertext,
                 access_expires_at: credentials.access_expires_at(),
@@ -830,6 +871,10 @@ mod tests {
             self.0.list().await
         }
 
+        async fn list_all(&self) -> Result<Vec<CredentialRecord>, CredentialRepositoryError> {
+            self.0.list_all().await
+        }
+
         async fn find(
             &self,
             account_id: WeReadAccountId,
@@ -856,6 +901,21 @@ mod tests {
             Err(CredentialRepositoryError::Conflict {
                 account_id: replacement.account_id,
             })
+        }
+
+        async fn set_disabled(
+            &self,
+            account_id: WeReadAccountId,
+            disabled: bool,
+        ) -> Result<CredentialRecord, CredentialRepositoryError> {
+            self.0.set_disabled(account_id, disabled).await
+        }
+
+        async fn delete(
+            &self,
+            account_id: WeReadAccountId,
+        ) -> Result<(), CredentialRepositoryError> {
+            self.0.delete(account_id).await
         }
     }
 
@@ -1267,6 +1327,67 @@ mod tests {
             service
                 .account(WeReadAccountId::from_uuid(Uuid::from_u128(99)))
                 .await,
+            Err(AuthServiceError::AccountNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn account_lifecycle_can_disable_reauthenticate_rename_enable_and_delete() {
+        let accounts = MemoryCredentialRepository::new(at(100));
+        let leases = MemoryAccountLeaseRepository::new(at(100));
+        let service = service(accounts, leases, RecordingRefresher::default());
+        service
+            .provision(CredentialProvision {
+                account_id: account_id(),
+                display_name: "primary".to_owned(),
+                credentials: credentials(at(3_600))
+                    .with_web_cookie("wr_vid=vid-old; wr_skey=access-old; wr_rt=refresh-old")
+                    .unwrap(),
+            })
+            .await
+            .unwrap();
+
+        let disabled = service.set_disabled(account_id(), true).await.unwrap();
+        assert!(disabled.disabled());
+        assert!(matches!(
+            service.credentials(account_id()).await,
+            Err(AuthServiceError::AccountDisabled { .. })
+        ));
+
+        let replaced = service
+            .replace(
+                CredentialProvision {
+                    account_id: account_id(),
+                    display_name: "renamed".to_owned(),
+                    credentials: WeReadCredentials::new(
+                        "access-new",
+                        "refresh-new",
+                        at(7_200),
+                        at(100),
+                    )
+                    .unwrap()
+                    .with_web_cookie("wr_vid=vid-new; wr_skey=access-new; wr_rt=refresh-new")
+                    .unwrap(),
+                },
+                "admin:primary",
+            )
+            .await
+            .unwrap();
+        assert_eq!(replaced.display_name(), "renamed");
+        assert!(replaced.disabled());
+
+        let enabled = service.set_disabled(account_id(), false).await.unwrap();
+        assert!(!enabled.disabled());
+        let stored = service.credentials(account_id()).await.unwrap();
+        assert_eq!(stored.access_token(), "access-new");
+        assert_eq!(
+            stored.web_cookie(),
+            Some("wr_vid=vid-new; wr_skey=access-new; wr_rt=refresh-new")
+        );
+
+        service.delete(account_id()).await.unwrap();
+        assert!(matches!(
+            service.delete(account_id()).await,
             Err(AuthServiceError::AccountNotFound { .. })
         ));
     }
