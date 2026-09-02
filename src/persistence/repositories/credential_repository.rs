@@ -177,7 +177,13 @@ impl CredentialRepository for PostgresCredentialRepository {
         .bind(access_expires_at)
         .fetch_one(&self.pool)
         .await
-        .map_err(storage_error)?;
+        .map_err(|error| match &error {
+            sqlx::Error::Database(database_error)
+                if database_error.code().as_deref() == Some("23505") => {
+                    CredentialRepositoryError::Conflict { account_id }
+                }
+            _ => storage_error(error),
+        })?;
         decode_record(row)
     }
 

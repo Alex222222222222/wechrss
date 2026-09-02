@@ -7,11 +7,11 @@
 //! authenticated list request, then releases both before each public article
 //! is fetched with a clean browser session.
 //!
-//! The authenticated browser profile is explicitly pre-authenticated. Login
-//! and QR exchange remain outside this first runtime slice; credential
-//! persistence and non-interactive refresh belong to `AuthService`, not this
-//! acquisition boundary. Lease contention is reported as a retryable acquisition
-//! failure, and a lost lease is never followed by another upstream request.
+//! Authentication may use an explicitly pre-authenticated browser profile or
+//! an encrypted cookie header injected by the application authentication
+//! boundary. Login and QR exchange remain outside this first runtime slice.
+//! Lease contention is reported as a retryable acquisition failure, and a lost
+//! lease is never followed by another upstream request.
 
 use chrono::Duration;
 

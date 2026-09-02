@@ -8,8 +8,9 @@
 //!
 //! The plan is conservative about worker dispatch. Feed rebuild is always
 //! executable; source synchronization is included only when the validated
-//! configuration contains both a pre-authenticated browser profile and a
-//! default WeRead account identity. A worker must never claim work that its
+//! configuration contains a default WeRead account identity. Authentication
+//! may come from a pre-authenticated browser profile or an admin-enrolled
+//! encrypted cookie header. A worker must never claim work that its
 //! runtime cannot execute and durably complete.
 //!
 //! API readiness does not depend on WebDriver availability. The API plan only

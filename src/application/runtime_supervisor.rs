@@ -5,10 +5,10 @@
 //! PostgreSQL pool, builds only the selected adapters, and supervises the API,
 //! scheduler, and executable feed-rebuild/source-sync worker loops.
 //!
-//! Authenticated source work is constructed only when a pre-authenticated
-//! browser profile and account identity are configured. Non-interactive
-//! credential refresh can additionally be wired with a deployment-specific
-//! transport; QR login remains intentionally deferred.
+//! Authenticated source work is constructed when a WeRead account identity is
+//! configured. It uses either a pre-authenticated browser profile or an
+//! encrypted cookie enrolled through the admin panel. QR login remains
+//! intentionally deferred.
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration as StdDuration};
 
@@ -24,11 +24,14 @@ use crate::{
         browser_pool::BrowserPool,
         pacing::PacingController,
         webdriver::{BrowserProfile, BrowserViewport, WebDriverFactory},
-        weread::{BrowserWeReadAdapter, WeReadEndpointError},
+        weread::{
+            BrowserWeReadAdapter, WeReadCredentialProvider, WeReadCredentialProviderError,
+            WeReadEndpointError,
+        },
     },
     application::auth_service::{
         AuthService, AuthServiceConfig, AuthServiceDependencies, CredentialRefreshJobHandler,
-        CredentialRefresher, RingCredentialCipher,
+        CredentialRefresher, ManualCredentialRefresher, RingCredentialCipher,
     },
     config::{AppConfig, AppRole},
     domain::job::JobType,
@@ -93,6 +96,37 @@ type SourceSyncHandler = SourceSyncJobHandler<
         WebDriverArticlePageFetcher,
     >,
 >;
+
+type RuntimeAuthService = AuthService<
+    PostgresCredentialRepository,
+    PostgresAccountLeaseRepository,
+    ManualCredentialRefresher,
+    RingCredentialCipher,
+>;
+
+#[derive(Clone)]
+struct RuntimeWeReadCredentialProvider {
+    auth: RuntimeAuthService,
+}
+
+#[async_trait::async_trait]
+impl WeReadCredentialProvider for RuntimeWeReadCredentialProvider {
+    async fn credentials(
+        &self,
+        account_id: crate::domain::credentials::WeReadAccountId,
+    ) -> Result<crate::domain::credentials::WeReadCredentials, WeReadCredentialProviderError> {
+        self.auth.credentials(account_id).await.map_err(|error| {
+            if matches!(
+                error,
+                crate::application::auth_service::AuthServiceError::AccountNotFound { .. }
+            ) {
+                WeReadCredentialProviderError::NotProvisioned
+            } else {
+                WeReadCredentialProviderError::Unavailable
+            }
+        })
+    }
+}
 
 impl<S, L, R, C> OptionalJobHandler for CredentialRefreshJobHandler<S, L, R, C>
 where
@@ -440,6 +474,7 @@ impl RuntimeSupervisor {
                     .ok_or(RuntimeSupervisorError::AdminAuthConfig)?,
             )
             .map_err(RuntimeSupervisorError::AdminAuth)?;
+            let weread_auth = self.build_auth_service()?;
             router = router.merge(admin_router(
                 auth,
                 SourceService::new(
@@ -448,6 +483,7 @@ impl RuntimeSupervisor {
                 ),
                 FeedTokenService::new(PostgresFeedTokenRepository::new(self.pool.clone())),
                 PostgresSyncRunRepository::new(self.pool.clone()),
+                weread_auth,
             ));
         }
         Ok(router)
@@ -546,11 +582,6 @@ impl RuntimeSupervisor {
             .config
             .weread_account_id
             .ok_or(RuntimeSupervisorError::SourceSyncNotConfigured)?;
-        let profile_path = self
-            .config
-            .browser_authenticated_profile
-            .as_deref()
-            .ok_or(RuntimeSupervisorError::SourceSyncNotConfigured)?;
         let browser_profile = BrowserProfile {
             user_agent: self.config.browser_user_agent.clone(),
             viewport: BrowserViewport::new(
@@ -561,12 +592,14 @@ impl RuntimeSupervisor {
             expected_timezone: Some(self.config.timezone),
             extra_args: self.config.browser_extra_args.clone(),
         };
-        let webdriver = WebDriverFactory::new(
+        let mut webdriver = WebDriverFactory::new(
             self.config.webdriver_url.clone(),
             self.config.browser_engine,
         )
-        .with_profile(browser_profile)
-        .with_authenticated_profile_path(profile_path);
+        .with_profile(browser_profile);
+        if let Some(profile_path) = self.config.browser_authenticated_profile.as_deref() {
+            webdriver = webdriver.with_authenticated_profile_path(profile_path);
+        }
         let acquisition_config = BrowserSourceSyncAcquirerConfig::new(
             account_id,
             format!("{}-source-worker", self.config.instance_id),
@@ -575,9 +608,14 @@ impl RuntimeSupervisor {
         )
         .map_err(RuntimeSupervisorError::SourceSyncAcquirerConfig)?;
         let pacing = PacingController::from_entropy(self.config.pacing);
-        let weread = BrowserWeReadAdapter::new(self.config.weread_article_list_url.clone())
+        let mut weread = BrowserWeReadAdapter::new(self.config.weread_article_list_url.clone())
             .map_err(RuntimeSupervisorError::WeReadEndpoint)?
             .with_pacing(pacing.clone());
+        if self.config.browser_authenticated_profile.is_none() {
+            weread = weread.with_credential_provider(Arc::new(RuntimeWeReadCredentialProvider {
+                auth: self.build_auth_service()?,
+            }));
+        }
         let acquirer = BrowserSourceSyncAcquirer::new(
             BrowserSourceSyncAcquirerDependencies {
                 browser_pool: self
@@ -611,6 +649,26 @@ impl RuntimeSupervisor {
                 sync_service: SyncService::new(),
             },
             handler_config,
+        ))
+    }
+
+    fn build_auth_service(&self) -> Result<RuntimeAuthService, RuntimeSupervisorError> {
+        let auth_config = AuthServiceConfig::new(
+            Duration::minutes(5),
+            chrono_duration(self.config.account_lease, "ACCOUNT_LEASE_SECONDS")?,
+            chrono_duration(self.config.account_heartbeat, "ACCOUNT_HEARTBEAT_SECONDS")?,
+        )
+        .map_err(RuntimeSupervisorError::AuthServiceConfig)?;
+        let cipher = RingCredentialCipher::new(&self.config.credential_encryption_key)
+            .map_err(RuntimeSupervisorError::CredentialCipher)?;
+        Ok(AuthService::new(
+            AuthServiceDependencies {
+                accounts: PostgresCredentialRepository::new(self.pool.clone()),
+                leases: PostgresAccountLeaseRepository::new(self.pool.clone()),
+                refresher: ManualCredentialRefresher,
+                cipher,
+            },
+            auth_config,
         ))
     }
 
@@ -985,6 +1043,25 @@ mod tests {
         supervisor
             .build_worker(plan, 0)
             .expect("authenticated source-sync worker should be constructible");
+    }
+
+    #[tokio::test]
+    async fn panel_enrolled_accounts_allow_source_sync_without_a_profile() {
+        let mut config = authenticated_config("all");
+        config.browser_authenticated_profile = None;
+        let supervisor = RuntimeSupervisor::new(config, lazy_pool())
+            .expect("an enrolled-account runtime should not require a profile");
+        let RuntimeComponent::Worker(plan) = supervisor
+            .plan()
+            .component(AppRole::Worker)
+            .expect("worker role should exist")
+        else {
+            panic!("worker role should produce a worker plan")
+        };
+
+        supervisor
+            .build_worker(plan, 0)
+            .expect("cookie-backed source-sync worker should be constructible");
     }
 
     #[tokio::test]

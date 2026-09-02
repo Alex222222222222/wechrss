@@ -34,8 +34,9 @@ running any component.
 ## First usable version scope
 
 The first usable version includes a small authenticated admin panel for source
-management, synchronization status, feed-link copying, and operator-facing
-error states. It has one administrator whose username and password are supplied
+management, manual WeRead credential enrollment, synchronization status,
+feed-link copying, and operator-facing error states. It has one administrator
+whose username and password are supplied
 through `ADMIN_USERNAME` and `ADMIN_PASSWORD`; there is no user-management
 lifecycle in the first version. The panel uses the same API and
 application-service boundaries as other clients and does not expose credentials,
@@ -105,8 +106,8 @@ keys in a secret manager or an ignored local environment file.
 | `BROWSER_VIEWPORT_WIDTH` | `1280` | Browser viewport width in CSS pixels. Valid range: `1`–`8192`. |
 | `BROWSER_VIEWPORT_HEIGHT` | `2000` | Browser viewport height in CSS pixels. Valid range: `1`–`8192`. |
 | `BROWSER_EXTRA_ARGS` | Empty | Optional whitespace-separated browser arguments. At most 32 arguments are accepted, each must begin with `-`, and controlled profile arguments such as User-Agent, window size, profile path, and headless mode cannot be overridden. |
-| `BROWSER_AUTHENTICATED_PROFILE` | Unset | Path to a pre-authenticated browser profile used only for the authenticated WeRead list request. It must be set together with `WEREAD_ACCOUNT_ID`. |
-| `WEREAD_ACCOUNT_ID` | Unset | Stable WeRead account UUID associated with authenticated source synchronization. It must be set together with `BROWSER_AUTHENTICATED_PROFILE`. |
+| `BROWSER_AUTHENTICATED_PROFILE` | Unset | Optional path to a pre-authenticated browser profile used for the authenticated WeRead list request. When omitted, source synchronization loads the encrypted cookie header enrolled in the admin panel. |
+| `WEREAD_ACCOUNT_ID` | Unset | Stable WeRead account UUID associated with authenticated source synchronization. It is required for scheduler/source-sync roles and can be copied from the admin enrollment response. |
 | `WEREAD_ARTICLE_LIST_URL` | `https://i.weread.qq.com/web/mp/articles` | Exact HTTPS WeRead article-list endpoint. Credentials, fragments, and non-default ports are rejected. |
 
 ### Workers, jobs, and leases
@@ -249,13 +250,24 @@ rotate the refresh token. If it does not, the previous refresh token is
 retained. Authentication-required and risk-control results stop the operation
 and require operator action; they are not retried automatically.
 
-This service boundary is implemented and tested. A deployment-specific
+This service boundary is implemented and tested. Administrators can enroll an
+already-issued WeRead web cookie header from `/admin`; the API accepts it only
+on the protected, CSRF-guarded `POST /api/admin/weread/accounts` route and
+returns only the generated account ID and non-secret status metadata. `GET
+/api/admin/weread/accounts/{account_id}` returns that same metadata for
+checking an enrollment. Re-authentication uses the protected `PUT
+/api/admin/weread/accounts/{account_id}` route and keeps the same account ID
+for existing source references. QR login is not part of this flow, and
+credentials cannot be read back through the panel.
+
+A deployment-specific
 `CredentialRefresher` can be injected into `RuntimeSupervisor`; that enables
 `credential_refresh` jobs in the worker plan and makes the runtime scheduler
 enqueue one deduplicated refresh job for each active account within the
-refresh window. The current
-browser-backed source-sync runtime still uses a pre-authenticated browser
-profile. See
+refresh window. When `BROWSER_AUTHENTICATED_PROFILE` is omitted, the
+browser-backed source-sync runtime loads the enrolled cookie header through
+`AuthService` and injects it into a fresh authenticated browser session. A
+pre-authenticated profile remains available as a compatibility option. See
 [`AuthService`](src/application/auth_service.rs) and the
 [authentication architecture](ARCHITECTURE.md#source-scheduling-and-account-leases).
 
@@ -272,7 +284,13 @@ request. The panel is available at `/admin` and uses these API routes:
 - `POST /api/admin/sources/{id}/enabled` and `/gate` for operator controls;
 - `POST /api/admin/sources/{id}/feed-token` to create/rotate a copyable feed
   link; and
-- `GET /api/admin/sources/{id}/sync-runs` for synchronization history.
+- `GET /api/admin/sources/{id}/sync-runs` for synchronization history;
+- `POST /api/admin/weread/accounts` to enroll an already-issued WeRead cookie
+  header and expiry; and
+- `PUT /api/admin/weread/accounts/{account_id}` to replace an account's cookie
+  header without changing source references; and
+- `GET /api/admin/weread/accounts/{account_id}` to inspect non-secret account
+  status.
 
 There is no user-management endpoint. Put the application behind TLS in a
 deployment so the session cookie and credentials are protected in transit.

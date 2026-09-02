@@ -4,13 +4,17 @@
 > configuration, applies pending SQLx migrations, and composes the selected API,
 > scheduler, feed-rebuild, and authenticated source-sync worker roles. Encrypted
 > WeRead credential provisioning and lease-serialized non-interactive refresh
-> are available as an application service. A deployment-specific refresh
+> are available as an application service. Administrators can enroll an
+> already-issued WeRead web cookie header from the protected `/admin` panel;
+> cookie and derived token values are encrypted before persistence and are
+> never returned. A
+> deployment-specific refresh
 > transport can be injected into the runtime worker; QR/login exchange and
 > browser health checks remain unfinished. The single-admin API and panel are
 > available when explicitly enabled. API
 > liveness/readiness endpoints are available. Source
-> synchronization still requires a pre-authenticated browser profile and
-> WeRead account ID.
+> synchronization requires a WeRead account ID and uses the enrolled cookie
+> header when no pre-authenticated browser profile is configured.
 
 When browser-backed source synchronization is enabled, its worker and browser
 sidecar must use the same IANA timezone for quiet-hours decisions and
@@ -68,7 +72,8 @@ Provide `DATABASE_URL` and the other runtime settings through the deployment
 environment; do not put credentials in a Dockerfile, image layer, or committed
 configuration file. The image contains the application and timezone/CA data,
 but browser-backed source synchronization still requires the separately
-configured WebDriver sidecar described below.
+configured WebDriver sidecar described below. Its authenticated session can
+come from an admin-enrolled cookie header or the compatibility profile.
 
 The public feeds, health endpoints, and optional admin panel share the API
 listener. Set its host and port with `HTTP_BIND` and `HTTP_PORT`:
@@ -96,24 +101,34 @@ automatically increase upstream fetch concurrency.
 
 ### Authenticated WeRead source synchronization
 
-Set these values together to enable source-sync acquisition:
+Set the account ID and endpoint to enable source-sync acquisition. A browser
+profile is optional when the account was enrolled through the admin panel:
 
 ```text
-BROWSER_AUTHENTICATED_PROFILE=/path/visible-to-the-browser-sidecar
 WEREAD_ACCOUNT_ID=<stable-account-uuid>
 WEREAD_ARTICLE_LIST_URL=https://i.weread.qq.com/web/mp/articles
 ```
 
-The profile must already contain an authorized WeRead session and must be
-mounted into the browser sidecar at the configured path. The runtime uses it
-only for the authenticated article-list request, holds a PostgreSQL account
-lease while that request is active, and releases the lease before opening a
-clean public session for article content. It does not perform login, persist
-credentials, or send the authenticated profile to public WeChat pages. The
-article-list URL is restricted by configuration validation to the exact HTTPS
-`i.weread.qq.com/web/mp/articles` endpoint without credentials, fragments, or a
-non-default port. If either of the first two values is missing, source-sync
-composition is disabled and scheduler startup is rejected.
+When `BROWSER_AUTHENTICATED_PROFILE` is set, the profile must already contain
+an authorized WeRead session and must be mounted into the browser sidecar at
+the configured path. Otherwise, enroll the cookie header from the admin panel;
+the runtime injects it into a fresh authenticated browser session. Both paths
+hold a PostgreSQL account lease while the authenticated request is active and
+release it before opening a clean public session for article content. Neither
+path sends authentication material to public WeChat pages. The article-list
+URL is restricted by configuration validation to the exact HTTPS
+`i.weread.qq.com/web/mp/articles` endpoint without credentials, fragments, or
+a non-default port. If `WEREAD_ACCOUNT_ID` is missing, source-sync composition
+is disabled and scheduler startup is rejected.
+
+The admin panel provides the non-interactive credential enrollment flow: after
+signing in at `/admin/login`, copy the complete `Cookie` request-header value
+from a successful `/web/mp/articles` request in a desktop browser, then paste
+it into the WeRead authentication form with its RFC3339 access-session expiry.
+The response contains only the account UUID and status metadata; use that UUID
+as the source's `account_id`. To rotate a session, submit the new cookie using
+the same account ID. QR-code login remains deferred, and no cookie should be
+placed in a ConfigMap or container image.
 
 ## Kubernetes
 

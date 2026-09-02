@@ -23,12 +23,18 @@
 //! QR exchange remains outside this protocol adapter; credential refresh is
 //! handled by the application authentication lifecycle.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use url::Url;
 
-use crate::domain::{credentials::WeReadAccountId, source::VerifiedWechatArticleUrl};
+use crate::domain::{
+    credentials::{WeReadAccountId, WeReadCredentials},
+    source::VerifiedWechatArticleUrl,
+};
 
 use super::{
     browser_pool::{AccountLeaseError, AccountLeaseStore},
@@ -115,6 +121,28 @@ pub enum WeReadAdapterError {
     /// An upstream URL could not be reduced to a verified public WeChat URL.
     #[error("WeRead article URL is not a verified public WeChat URL")]
     InvalidArticleUrl,
+}
+
+/// Errors raised while loading stored browser credentials.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum WeReadCredentialProviderError {
+    /// No credentials exist for the requested account.
+    #[error("WeRead credentials are not provisioned for this account")]
+    NotProvisioned,
+    /// The account is disabled or its encrypted payload is invalid.
+    #[error("stored WeRead credentials are unavailable")]
+    Unavailable,
+}
+
+/// Application boundary used by the browser adapter to load one account's
+/// decrypted credentials for one request.
+#[async_trait]
+pub trait WeReadCredentialProvider: Send + Sync {
+    /// Returns credentials without exposing them to the HTTP layer.
+    async fn credentials(
+        &self,
+        account_id: WeReadAccountId,
+    ) -> Result<WeReadCredentials, WeReadCredentialProviderError>;
 }
 
 /// Validation failure for the authenticated WeRead article-list endpoint.
@@ -335,10 +363,22 @@ fn integer_value(value: &Value) -> Option<i64> {
 }
 
 /// Thirtyfour-backed authenticated article-list adapter.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BrowserWeReadAdapter {
     endpoint: Url,
     pacing: Option<PacingController>,
+    credential_provider: Option<Arc<dyn WeReadCredentialProvider>>,
+}
+
+impl std::fmt::Debug for BrowserWeReadAdapter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrowserWeReadAdapter")
+            .field("endpoint", &self.endpoint)
+            .field("pacing", &self.pacing)
+            .field("credential_provider", &self.credential_provider.is_some())
+            .finish()
+    }
 }
 
 impl BrowserWeReadAdapter {
@@ -353,12 +393,20 @@ impl BrowserWeReadAdapter {
         Ok(Self {
             endpoint,
             pacing: None,
+            credential_provider: None,
         })
     }
 
     /// Adds the shared pacing controller used before authenticated requests.
     pub fn with_pacing(mut self, pacing: PacingController) -> Self {
         self.pacing = Some(pacing);
+        self
+    }
+
+    /// Uses encrypted credentials supplied by the application boundary. When
+    /// absent, the adapter retains the legacy pre-authenticated-profile mode.
+    pub fn with_credential_provider(mut self, provider: Arc<dyn WeReadCredentialProvider>) -> Self {
+        self.credential_provider = Some(provider);
         self
     }
 
@@ -379,6 +427,26 @@ where
     ) -> Result<Vec<WeReadArticleReference>, WeReadAdapterError> {
         let endpoint = article_list_endpoint(&self.endpoint, book_id)?;
         request.ensure_usable().map_err(WeReadAdapterError::from)?;
+        if let Some(provider) = &self.credential_provider {
+            let credentials = provider
+                .credentials(request.account_id())
+                .await
+                .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+            let cookie = credentials.web_cookie().ok_or_else(|| {
+                WeReadAdapterError::Browser(
+                    "stored WeRead credentials do not contain a web cookie".to_owned(),
+                )
+            })?;
+            request
+                .goto("https://i.weread.qq.com/")
+                .await
+                .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+            request
+                .install_cookie_header(cookie)
+                .await
+                .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+            request.ensure_usable().map_err(WeReadAdapterError::from)?;
+        }
         if let Some(pacing) = &self.pacing {
             pacing.wait(crate::domain::pacing::DelayKind::Request).await;
         }

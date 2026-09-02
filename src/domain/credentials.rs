@@ -35,6 +35,9 @@ pub enum CredentialError {
     /// Access credentials must expire after they are issued.
     #[error("access credential expiry must be in the future")]
     ExpiryNotAfterIssue,
+    /// Browser cookie headers must contain non-empty name/value pairs.
+    #[error("WeRead web cookie header is invalid")]
+    InvalidWebCookie,
 }
 
 /// The secret material needed for authenticated WeRead requests.
@@ -46,6 +49,7 @@ pub enum CredentialError {
 pub struct WeReadCredentials {
     access_token: SecretString,
     refresh_token: SecretString,
+    web_cookie: Option<SecretString>,
     access_expires_at: DateTime<Utc>,
 }
 
@@ -79,8 +83,35 @@ impl WeReadCredentials {
         Ok(Self {
             access_token: SecretString::new(access_token.into_boxed_str()),
             refresh_token: SecretString::new(refresh_token.into_boxed_str()),
+            web_cookie: None,
             access_expires_at,
         })
+    }
+
+    /// Attaches the browser cookie header used by WeRead's web article APIs.
+    ///
+    /// The header is kept separate from the refresh-token values because the
+    /// web API authenticates with cookies rather than an OAuth bearer token.
+    /// It is validated before being retained and remains secret material.
+    pub fn with_web_cookie(
+        mut self,
+        cookie_header: impl Into<String>,
+    ) -> Result<Self, CredentialError> {
+        let cookie_header = cookie_header.into();
+        if cookie_header.trim().is_empty()
+            || cookie_header.chars().any(char::is_control)
+            || cookie_header.split(';').any(|part| {
+                let part = part.trim();
+                part.is_empty()
+                    || part.split_once('=').is_none_or(|(name, value)| {
+                        name.trim().is_empty() || value.trim().is_empty()
+                    })
+            })
+        {
+            return Err(CredentialError::InvalidWebCookie);
+        }
+        self.web_cookie = Some(SecretString::new(cookie_header.into_boxed_str()));
+        Ok(self)
     }
 
     /// Returns the access token only to the authenticated transport boundary.
@@ -91,6 +122,11 @@ impl WeReadCredentials {
     /// Returns the refresh token only to the refresh transport boundary.
     pub fn refresh_token(&self) -> &str {
         self.refresh_token.expose_secret()
+    }
+
+    /// Returns the browser cookie header only to the authenticated transport.
+    pub fn web_cookie(&self) -> Option<&str> {
+        self.web_cookie.as_ref().map(ExposeSecret::expose_secret)
     }
 
     /// Returns the access-token expiry without exposing secret material.
@@ -112,12 +148,16 @@ impl WeReadCredentials {
         access_expires_at: DateTime<Utc>,
         issued_at: DateTime<Utc>,
     ) -> Result<Self, CredentialError> {
-        Self::new(
+        let credentials = Self::new(
             access_token,
             refresh_token.unwrap_or_else(|| self.refresh_token().to_owned()),
             access_expires_at,
             issued_at,
-        )
+        )?;
+        match self.web_cookie() {
+            Some(cookie) => credentials.with_web_cookie(cookie.to_owned()),
+            None => Ok(credentials),
+        }
     }
 }
 
@@ -290,5 +330,57 @@ impl AccountLease {
     /// Reports whether the lease is live at an explicitly supplied instant.
     pub fn is_live_at(&self, now: DateTime<Utc>) -> bool {
         self.lease_until > now
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn credentials() -> WeReadCredentials {
+        WeReadCredentials::new(
+            "access",
+            "refresh",
+            DateTime::<Utc>::UNIX_EPOCH + Duration::hours(1),
+            DateTime::<Utc>::UNIX_EPOCH,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn web_cookie_is_retained_across_refresh() {
+        let credentials = credentials()
+            .with_web_cookie("wr_vid=vid; wr_skey=access; wr_rt=refresh")
+            .unwrap();
+        let refreshed = credentials
+            .refreshed(
+                "new-access",
+                Some("new-refresh".to_owned()),
+                DateTime::<Utc>::UNIX_EPOCH + Duration::hours(2),
+                DateTime::<Utc>::UNIX_EPOCH,
+            )
+            .unwrap();
+
+        assert_eq!(
+            refreshed.web_cookie(),
+            Some("wr_vid=vid; wr_skey=access; wr_rt=refresh")
+        );
+        assert_eq!(refreshed.access_token(), "new-access");
+        assert_eq!(refreshed.refresh_token(), "new-refresh");
+    }
+
+    #[test]
+    fn web_cookie_rejects_empty_pairs_and_control_characters() {
+        for cookie in [
+            "",
+            "wr_skey=access;",
+            "wr_skey=access; =value",
+            "wr_skey=access\n",
+        ] {
+            assert!(matches!(
+                credentials().with_web_cookie(cookie),
+                Err(CredentialError::InvalidWebCookie)
+            ));
+        }
     }
 }

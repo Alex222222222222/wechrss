@@ -19,9 +19,10 @@
 //! The capability ports, process-local browser capacity boundary, public
 //! Thirtyfour navigation, identity resolution, common article extraction,
 //! bounded public page pacing/scroll execution, optional browser-visible
-//! timezone validation, and the pre-authenticated WeRead article-list
-//! transport and authenticated request pacing are executable. Login/refresh
-//! and browser sidecar health checks remain TODOs in the child modules.
+//! timezone validation, the pre-authenticated or cookie-backed WeRead
+//! article-list transport, and authenticated request pacing are executable.
+//! Login/refresh and browser sidecar health checks remain TODOs in the child
+//! modules.
 
 pub mod article_page;
 pub mod browser_pool;

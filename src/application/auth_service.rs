@@ -84,6 +84,25 @@ pub trait CredentialRefresher: Send + Sync {
     ) -> Result<RefreshedCredentials, CredentialRefreshError>;
 }
 
+/// Refresh boundary used when credentials are entered manually by an
+/// administrator but no upstream refresh transport has been configured.
+///
+/// Keeping this as an explicit implementation lets the admin panel reuse the
+/// same authentication service without pretending that refresh is available.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ManualCredentialRefresher;
+
+#[async_trait]
+impl CredentialRefresher for ManualCredentialRefresher {
+    async fn refresh(
+        &self,
+        _account_id: WeReadAccountId,
+        _refresh_token: &str,
+    ) -> Result<RefreshedCredentials, CredentialRefreshError> {
+        Err(CredentialRefreshError::AuthenticationRequired)
+    }
+}
+
 #[async_trait]
 impl<T> CredentialRefresher for Arc<T>
 where
@@ -189,6 +208,7 @@ impl RingCredentialCipher {
 struct CredentialPayload {
     access_token: String,
     refresh_token: String,
+    web_cookie: Option<String>,
     access_expires_at: DateTime<Utc>,
 }
 
@@ -201,6 +221,7 @@ impl CredentialCipher for RingCredentialCipher {
         let payload = CredentialPayload {
             access_token: credentials.access_token().to_owned(),
             refresh_token: credentials.refresh_token().to_owned(),
+            web_cookie: credentials.web_cookie().map(ToOwned::to_owned),
             access_expires_at: credentials.access_expires_at(),
         };
         let mut bytes =
@@ -247,13 +268,19 @@ impl CredentialCipher for RingCredentialCipher {
             .map_err(|_| CredentialCipherError::InvalidCiphertext)?;
         let payload: CredentialPayload =
             serde_json::from_slice(plaintext).map_err(|_| CredentialCipherError::InvalidPayload)?;
-        WeReadCredentials::new(
+        let credentials = WeReadCredentials::new(
             payload.access_token,
             payload.refresh_token,
             payload.access_expires_at,
             DateTime::<Utc>::UNIX_EPOCH,
         )
-        .map_err(|_| CredentialCipherError::InvalidPayload)
+        .map_err(|_| CredentialCipherError::InvalidPayload)?;
+        match payload.web_cookie {
+            Some(cookie) => credentials
+                .with_web_cookie(cookie)
+                .map_err(|_| CredentialCipherError::InvalidPayload),
+            None => Ok(credentials),
+        }
     }
 }
 
@@ -355,6 +382,7 @@ pub enum AuthServiceError {
 }
 
 /// Dependencies for [`AuthService`].
+#[derive(Clone)]
 pub struct AuthServiceDependencies<S, L, R, C> {
     /// Encrypted account repository.
     pub accounts: S,
@@ -367,6 +395,7 @@ pub struct AuthServiceDependencies<S, L, R, C> {
 }
 
 /// Coordinates provisioning and one-shot, lease-serialized credential refresh.
+#[derive(Clone)]
 pub struct AuthService<S, L, R, C> {
     dependencies: AuthServiceDependencies<S, L, R, C>,
     config: AuthServiceConfig,
@@ -413,6 +442,88 @@ where
             )
             .await?;
         Ok(record.account().clone())
+    }
+
+    /// Returns non-secret metadata for an enrolled account.
+    pub async fn account(
+        &self,
+        account_id: WeReadAccountId,
+    ) -> Result<WeReadAccount, AuthServiceError> {
+        Ok(self.load(account_id).await?.account().clone())
+    }
+
+    /// Loads and decrypts credentials for the authenticated acquisition
+    /// boundary. Callers receive the value only for the duration of a single
+    /// upstream operation; it is never suitable for API responses or logs.
+    pub async fn credentials(
+        &self,
+        account_id: WeReadAccountId,
+    ) -> Result<WeReadCredentials, AuthServiceError> {
+        let record = self.load(account_id).await?;
+        if record.account().disabled() {
+            return Err(AuthServiceError::AccountDisabled { account_id });
+        }
+        self.decrypt(&record)
+    }
+
+    /// Replaces manually supplied credentials under the account lease.
+    ///
+    /// This is the operator re-authentication path. It uses the same fenced,
+    /// version-checked repository operation as automatic refresh, so a manual
+    /// update cannot overwrite a concurrent refresh or a lease takeover.
+    pub async fn replace(
+        &self,
+        provision: CredentialProvision,
+        owner: &str,
+    ) -> Result<WeReadAccount, AuthServiceError> {
+        let Some(lease) = AccountLeaseGuard::acquire(
+            self.dependencies.leases.clone(),
+            provision.account_id,
+            owner,
+            self.config.lease_for,
+        )
+        .await?
+        else {
+            return Err(AuthServiceError::AccountBusy {
+                account_id: provision.account_id,
+            });
+        };
+        let mut heartbeat = lease
+            .start_heartbeat(self.config.lease_heartbeat, self.config.lease_for)
+            .map_err(AuthServiceError::Lease)?;
+
+        let result = async {
+            let current = self.load(provision.account_id).await?;
+            if current.account().disabled() {
+                return Err(AuthServiceError::AccountDisabled {
+                    account_id: provision.account_id,
+                });
+            }
+            let ciphertext = self
+                .dependencies
+                .cipher
+                .encrypt(provision.account_id, &provision.credentials)?;
+            lease.ensure_usable().map_err(AuthServiceError::Lease)?;
+            let updated = self
+                .dependencies
+                .accounts
+                .replace(CredentialReplacement {
+                    account_id: provision.account_id,
+                    expected_version: current.account().credential_version(),
+                    ciphertext,
+                    access_expires_at: provision.credentials.access_expires_at(),
+                    lease_owner: lease.owner().to_owned(),
+                    lease_token: lease.token(),
+                })
+                .await?;
+            Ok(updated.account().clone())
+        }
+        .await;
+        let heartbeat_result = heartbeat.stop().await;
+        let release_result = lease.release().await;
+        heartbeat_result.map_err(AuthServiceError::Lease)?;
+        release_result.map_err(AuthServiceError::Lease)?;
+        result
     }
 
     /// Refreshes credentials only when they are within the configured window.
@@ -805,7 +916,9 @@ mod tests {
             .provision(CredentialProvision {
                 account_id: account_id(),
                 display_name: "primary".to_owned(),
-                credentials: credentials(at(3_600)),
+                credentials: credentials(at(3_600))
+                    .with_web_cookie("wr_vid=vid; wr_skey=access-old; wr_rt=refresh-old")
+                    .unwrap(),
             })
             .await
             .unwrap();
@@ -1122,5 +1235,115 @@ mod tests {
         ));
         let value = credentials(DateTime::<Utc>::MAX_UTC);
         assert!(value.needs_refresh(DateTime::<Utc>::MAX_UTC, Duration::seconds(1)));
+    }
+    #[tokio::test]
+    async fn account_status_returns_metadata_without_decrypting_or_exposing_tokens() {
+        let accounts = MemoryCredentialRepository::new(at(100));
+        let service = service(
+            accounts,
+            MemoryAccountLeaseRepository::new(at(100)),
+            RecordingRefresher::default(),
+        );
+        service
+            .provision(CredentialProvision {
+                account_id: account_id(),
+                display_name: "primary".to_owned(),
+                credentials: credentials(at(3_600))
+                    .with_web_cookie("wr_vid=vid-old; wr_skey=access-old; wr_rt=refresh-old")
+                    .unwrap(),
+            })
+            .await
+            .unwrap();
+
+        let account = service.account(account_id()).await.unwrap();
+        assert_eq!(account.display_name(), "primary");
+        assert_eq!(account.credential_version(), 1);
+        assert_eq!(account.access_expires_at(), at(3_600));
+        assert!(matches!(
+            service
+                .account(WeReadAccountId::from_uuid(Uuid::from_u128(99)))
+                .await,
+            Err(AuthServiceError::AccountNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn manual_replacement_rotates_credentials_and_advances_version() {
+        let accounts = MemoryCredentialRepository::new(at(100));
+        let leases = MemoryAccountLeaseRepository::new(at(100));
+        let service = service(accounts, leases, RecordingRefresher::default());
+        service
+            .provision(CredentialProvision {
+                account_id: account_id(),
+                display_name: "primary".to_owned(),
+                credentials: credentials(at(3_600))
+                    .with_web_cookie("wr_vid=vid-old; wr_skey=access-old; wr_rt=refresh-old")
+                    .unwrap(),
+            })
+            .await
+            .unwrap();
+
+        let updated = service
+            .replace(
+                CredentialProvision {
+                    account_id: account_id(),
+                    display_name: "primary".to_owned(),
+                    credentials: WeReadCredentials::new(
+                        "access-new",
+                        "refresh-new",
+                        at(7_200),
+                        at(100),
+                    )
+                    .unwrap()
+                    .with_web_cookie("wr_vid=vid-new; wr_skey=access-new; wr_rt=refresh-new")
+                    .unwrap(),
+                },
+                "admin:primary",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.credential_version(), 2);
+        let stored = service.credentials(account_id()).await.unwrap();
+        assert_eq!(stored.access_token(), "access-new");
+        assert_eq!(stored.refresh_token(), "refresh-new");
+        assert_eq!(
+            stored.web_cookie(),
+            Some("wr_vid=vid-new; wr_skey=access-new; wr_rt=refresh-new")
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_replacement_reports_busy_when_another_owner_holds_lease() {
+        let accounts = MemoryCredentialRepository::new(at(100));
+        let leases = MemoryAccountLeaseRepository::new(at(100));
+        let service = service(accounts, leases.clone(), RecordingRefresher::default());
+        service
+            .provision(CredentialProvision {
+                account_id: account_id(),
+                display_name: "primary".to_owned(),
+                credentials: credentials(at(3_600)),
+            })
+            .await
+            .unwrap();
+        assert!(leases
+            .acquire(account_id(), "other-owner", Duration::minutes(5))
+            .await
+            .unwrap()
+            .is_some());
+
+        assert!(matches!(
+            service
+                .replace(
+                    CredentialProvision {
+                        account_id: account_id(),
+                        display_name: "primary".to_owned(),
+                        credentials: credentials(at(7_200)),
+                    },
+                    "admin:primary",
+                )
+                .await,
+            Err(AuthServiceError::AccountBusy { .. })
+        ));
     }
 }

@@ -44,7 +44,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use thirtyfour::common::capabilities::firefox::FirefoxPreferences;
 use thirtyfour::prelude::{ChromiumLikeCapabilities, DesiredCapabilities};
-use thirtyfour::{Capabilities, WebDriver};
+use thirtyfour::{Capabilities, Cookie, WebDriver};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
@@ -228,9 +228,10 @@ impl WebDriverFactory {
 
     /// Opens an authenticated browser session fenced by one account lease.
     ///
-    /// A pre-authenticated browser profile is required. The lease is acquired
-    /// before WebDriver creation and released again if session creation fails,
-    /// so a broken sidecar cannot strand account ownership until expiry.
+    /// A pre-authenticated browser profile or a cookie injected by the
+    /// authenticated protocol adapter is used. The lease is acquired before
+    /// WebDriver creation and released again if session creation fails, so a
+    /// broken sidecar cannot strand account ownership until expiry.
     pub async fn open_authenticated<R>(
         &self,
         pool: &BrowserPool,
@@ -248,17 +249,11 @@ impl WebDriverFactory {
         else {
             return Ok(None);
         };
-        let Some(profile_path) = self.authenticated_profile.as_deref() else {
-            let _ = session.release().await;
-            return Err(WebDriverError::Connect(
-                "authenticated browser profile is not configured".to_owned(),
-            ));
-        };
         let client = match connect(
             self.endpoint.clone(),
             self.engine,
             &self.profile,
-            Some(profile_path),
+            self.authenticated_profile.as_deref(),
         )
         .await
         {
@@ -840,6 +835,37 @@ where
             .goto(url)
             .await
             .map_err(|error| WebDriverError::Command(error.to_string()))
+    }
+
+    /// Installs a validated WeRead cookie header into the current browser
+    /// origin. The caller must navigate to `i.weread.qq.com` first because
+    /// WebDriver rejects cookies added while no matching origin is loaded.
+    pub(crate) async fn install_cookie_header(
+        &mut self,
+        cookie_header: &str,
+    ) -> Result<(), WebDriverError> {
+        let client = self
+            .session
+            .client
+            .as_ref()
+            .ok_or(WebDriverError::NotConnected)?;
+        for part in cookie_header.split(';') {
+            let part = part.trim();
+            let Some((name, value)) = part.split_once('=') else {
+                return Err(WebDriverError::Command(
+                    "WeRead cookie header contains an invalid pair".to_owned(),
+                ));
+            };
+            let mut cookie = Cookie::new(name.trim(), value.trim());
+            cookie.set_path("/");
+            cookie.set_domain("i.weread.qq.com");
+            cookie.set_secure(true);
+            client
+                .add_cookie(cookie)
+                .await
+                .map_err(|error| WebDriverError::Command(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Reads visible body text without exposing the raw WebDriver client.

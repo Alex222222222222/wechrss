@@ -88,8 +88,9 @@ startup errors; unrelated environment names are ignored.
 
 The first runtime is a modular monolith, but each process has an explicit role
 set: `api`, `scheduler`, `worker`, or `all`. The supervisor accepts scheduler
-and source-sync worker execution when the authenticated profile and account
-settings are configured together; otherwise scheduler startup fails closed and
+and source-sync worker execution when the WeRead account identity is
+configured; it uses an optional pre-authenticated profile or an encrypted
+cookie enrolled through the admin panel. Otherwise scheduler startup fails closed and
 workers remain feed-rebuild-only, preventing the scheduler from creating work
 no worker can execute. Kubernetes may scale API
 and worker processes independently
@@ -861,10 +862,11 @@ headless, or profile settings, including Chromium `--user-data-dir` and
 Firefox `-profile`; public sessions therefore cannot opt into a persistent
 credential-bearing browser profile through this setting.
 
-`BROWSER_AUTHENTICATED_PROFILE` and `WEREAD_ACCOUNT_ID` are optional but must
-be supplied together to compose authenticated source synchronization. The
-profile is pre-authenticated and is used only by the WeRead article-list
-adapter. `WEREAD_ARTICLE_LIST_URL` defaults to
+`WEREAD_ACCOUNT_ID` is required to compose authenticated source synchronization.
+`BROWSER_AUTHENTICATED_PROFILE` is optional: when supplied, the profile is
+pre-authenticated and is used only by the WeRead article-list adapter; when
+omitted, the adapter injects the encrypted cookie header enrolled through the
+admin panel. `WEREAD_ARTICLE_LIST_URL` defaults to
 `https://i.weread.qq.com/web/mp/articles` and is accepted only as that exact
 HTTPS endpoint without credentials, fragments, or a non-default port. Runtime
 source-sync listing holds the account lease through its authenticated request,
@@ -1137,11 +1139,13 @@ source-sync, and transport-backed credential-refresh jobs through one
 type-aware worker handler.
 
 The remaining tree intentionally contains no interactive login/credential
-exchange. Durable
-credential persistence and non-interactive refresh are executable, and active
-accounts can be scheduled for refresh when a transport is injected, but they
-are not provisioned by an HTTP route. Concrete source-sync acquisition/runtime composition is executable
-from a pre-authenticated browser profile. Binary asset
+exchange. Durable credential persistence and non-interactive refresh are
+executable, and the authenticated admin panel can provision accounts through a
+CSRF-protected route while returning only non-secret status metadata. Active
+accounts can be scheduled for refresh when a transport is injected. Concrete
+source-sync acquisition/runtime composition is executable from either a
+pre-authenticated browser profile or an admin-enrolled encrypted cookie
+header. Binary asset
 persistence, and URL rewriting remain documentation-only; the pure
 archive sanitizer and `ArchiveService` are executable. Acquisition now
 contains executable identity resolution, capability/session ports, local

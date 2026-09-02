@@ -571,10 +571,10 @@ impl AppConfig {
             "BROWSER_AUTHENTICATED_PROFILE",
         )?;
         let weread_account_id = parse_optional_weread_account_id(raw.weread_account_id)?;
-        if browser_authenticated_profile.is_some() != weread_account_id.is_some() {
+        if browser_authenticated_profile.is_some() && weread_account_id.is_none() {
             return Err(ConfigError::InvalidValue {
                 variable: "WEREAD_ACCOUNT_ID",
-                reason: "must be set together with BROWSER_AUTHENTICATED_PROFILE",
+                reason: "must be set when BROWSER_AUTHENTICATED_PROFILE is configured",
             });
         }
         let weread_article_list_url = parse_weread_article_list_url(raw.weread_article_list_url)?;
@@ -785,7 +785,7 @@ impl AppConfig {
     /// Returns whether authenticated WeRead source synchronization can be
     /// constructed by the runtime.
     pub const fn weread_source_sync_configured(&self) -> bool {
-        self.browser_authenticated_profile.is_some() && self.weread_account_id.is_some()
+        self.weread_account_id.is_some()
     }
 }
 
@@ -2120,13 +2120,7 @@ mod tests {
             "WEREAD_ACCOUNT_ID",
             "00000000-0000-0000-0000-000000000001",
         );
-        assert!(matches!(
-            AppConfig::from_env_iter(account_only),
-            Err(ConfigError::InvalidValue {
-                variable: "WEREAD_ACCOUNT_ID",
-                ..
-            })
-        ));
+        assert!(AppConfig::from_env_iter(account_only).is_ok());
 
         for endpoint in [
             "http://i.weread.qq.com/web/mp/articles",

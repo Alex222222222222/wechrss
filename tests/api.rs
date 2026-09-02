@@ -14,6 +14,10 @@ use tower::ServiceExt;
 use uuid::Uuid;
 use werrss::{
     application::{
+        auth_service::{
+            AuthService, AuthServiceConfig, AuthServiceDependencies, ManualCredentialRefresher,
+            RingCredentialCipher,
+        },
         feed_service::{
             FeedRebuildJobConfig, FeedService, FeedServiceConfig, PostgresFeedRebuildQueue,
         },
@@ -23,6 +27,8 @@ use werrss::{
     domain::source::{FeedRevision, SourceId},
     persistence::{
         repositories::{
+            account_lease_repository::PostgresAccountLeaseRepository,
+            credential_repository::PostgresCredentialRepository,
             feed_cache_repository::{
                 FeedBuildLeaseRepository, FeedCachePublishResult, FeedCacheTransactionRepository,
                 PostgresFeedBuildLeaseRepository, PostgresFeedCacheRepository,
@@ -116,6 +122,197 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
         serde_json::json!([])
     );
 
+    let account_id = Uuid::new_v4();
+    let account_payload = serde_json::json!({
+        "account_id": account_id,
+        "display_name": "Primary WeRead",
+        "cookie_header": "wr_vid=vid-secret; wr_skey=access-secret-from-form; wr_rt=refresh-secret-from-form",
+        "access_expires_at": "2099-01-01T00:00:00Z"
+    });
+    let missing_account_csrf = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/accounts",
+            &cookie,
+            None,
+            Some(account_payload.clone()),
+        ))
+        .await
+        .expect("account mutation should complete");
+    assert_eq!(missing_account_csrf.status(), StatusCode::FORBIDDEN);
+
+    let account = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/accounts",
+            &cookie,
+            Some(csrf),
+            Some(account_payload),
+        ))
+        .await
+        .expect("account provisioning should complete");
+    assert_eq!(account.status(), StatusCode::CREATED);
+    let account_body = to_bytes(account.into_body(), usize::MAX)
+        .await
+        .expect("account response should be readable");
+    let account_response: serde_json::Value =
+        serde_json::from_slice(&account_body).expect("account response should be JSON");
+    assert_eq!(account_response["account_id"], account_id.to_string());
+    assert_eq!(account_response["credential_version"], 1);
+    assert!(!String::from_utf8_lossy(&account_body).contains("access-secret-from-form"));
+    assert!(!String::from_utf8_lossy(&account_body).contains("refresh-secret-from-form"));
+
+    let account_status = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/api/admin/weread/accounts/{account_id}"),
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("account status request should complete");
+    assert_eq!(account_status.status(), StatusCode::OK);
+    let account_status_body = to_bytes(account_status.into_body(), usize::MAX)
+        .await
+        .expect("account status response should be readable");
+    assert!(!String::from_utf8_lossy(&account_status_body).contains("secret-from-form"));
+
+    let replacement = app
+        .clone()
+        .oneshot(admin_request_with_method(
+            &format!("/api/admin/weread/accounts/{account_id}"),
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({
+                "account_id": account_id,
+                "display_name": "Primary WeRead",
+                "cookie_header": "wr_vid=vid-secret; wr_skey=rotated-access; wr_rt=rotated-refresh",
+                "access_expires_at": "2099-02-01T00:00:00Z"
+            })),
+            "PUT",
+        ))
+        .await
+        .expect("account replacement should complete");
+    assert_eq!(replacement.status(), StatusCode::OK);
+    let replacement_body = to_bytes(replacement.into_body(), usize::MAX)
+        .await
+        .expect("replacement response should be readable");
+    let replacement_response: serde_json::Value =
+        serde_json::from_slice(&replacement_body).expect("replacement response should be JSON");
+    assert_eq!(replacement_response["account_id"], account_id.to_string());
+    assert_eq!(replacement_response["credential_version"], 2);
+    assert!(!String::from_utf8_lossy(&replacement_body).contains("rotated-access"));
+
+    let duplicate_account = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/accounts",
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({
+                "account_id": account_id,
+                "display_name": "Duplicate",
+                "cookie_header": "wr_vid=vid-secret; wr_skey=duplicate-access; wr_rt=duplicate-refresh",
+                "access_expires_at": "2099-04-01T00:00:00Z"
+            })),
+        ))
+        .await
+        .expect("duplicate account request should complete");
+    assert_eq!(duplicate_account.status(), StatusCode::CONFLICT);
+
+    let invalid_expiry = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/accounts",
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({
+                "display_name": "Invalid",
+                "cookie_header": "wr_vid=vid-invalid; wr_skey=access-invalid; wr_rt=refresh-invalid",
+                "access_expires_at": "not-a-timestamp"
+            })),
+        ))
+        .await
+        .expect("invalid account request should complete");
+    assert_eq!(invalid_expiry.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let invalid_cookie = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/accounts",
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({
+                "display_name": "Invalid cookie",
+                "cookie_header": "wr_vid=vid-only; wr_skey=access-only",
+                "access_expires_at": "2099-01-01T00:00:00Z"
+            })),
+        ))
+        .await
+        .expect("invalid cookie request should complete");
+    assert_eq!(invalid_cookie.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let invalid_account_id = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/accounts",
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({
+                "account_id": Uuid::nil(),
+                "display_name": "Invalid account ID",
+                "cookie_header": "wr_vid=vid-invalid; wr_skey=access-invalid; wr_rt=refresh-invalid",
+                "access_expires_at": "2099-05-01T00:00:00Z"
+            })),
+        ))
+        .await
+        .expect("nil account ID request should complete");
+    assert_eq!(
+        invalid_account_id.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let invalid_display_name = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/accounts",
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({
+                "display_name": "   ",
+                "cookie_header": "wr_vid=vid-invalid; wr_skey=access-invalid; wr_rt=refresh-invalid",
+                "access_expires_at": "2099-06-01T00:00:00Z"
+            })),
+        ))
+        .await
+        .expect("blank display name request should complete");
+    assert_eq!(
+        invalid_display_name.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let mismatched_replacement = app
+        .clone()
+        .oneshot(admin_request_with_method(
+            &format!("/api/admin/weread/accounts/{account_id}"),
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({
+                "account_id": Uuid::new_v4(),
+                "display_name": "Primary WeRead",
+                "cookie_header": "wr_vid=vid-secret; wr_skey=other-access; wr_rt=other-refresh",
+                "access_expires_at": "2099-03-01T00:00:00Z"
+            })),
+            "PUT",
+        ))
+        .await
+        .expect("mismatched replacement request should complete");
+    assert_eq!(
+        mismatched_replacement.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
     let missing_csrf = app
         .clone()
         .oneshot(admin_request(
@@ -197,7 +394,7 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
             &format!("/api/admin/sources/{}/feed-token", Uuid::from_u128(99_999)),
             &cookie,
             Some(csrf),
-            None,
+            Some(serde_json::json!({})),
         ))
         .await
         .expect("missing source token request should complete");
@@ -478,8 +675,19 @@ fn admin_request(
     csrf: Option<&str>,
     body: Option<serde_json::Value>,
 ) -> Request<Body> {
+    let method = if body.is_some() { "POST" } else { "GET" };
+    admin_request_with_method(path, cookie, csrf, body, method)
+}
+
+fn admin_request_with_method(
+    path: &str,
+    cookie: &str,
+    csrf: Option<&str>,
+    body: Option<serde_json::Value>,
+    method: &str,
+) -> Request<Body> {
     let mut builder = Request::builder()
-        .method(if body.is_some() { "POST" } else { "GET" })
+        .method(method)
         .uri(path)
         .header(header::COOKIE, cookie);
     if let Some(csrf) = csrf {
@@ -512,6 +720,23 @@ fn admin_app(pool: &PgPool) -> axum::Router {
         ),
         FeedTokenService::new(PostgresFeedTokenRepository::new(pool.clone())),
         PostgresSyncRunRepository::new(pool.clone()),
+        AuthService::new(
+            AuthServiceDependencies {
+                accounts: PostgresCredentialRepository::new(pool.clone()),
+                leases: PostgresAccountLeaseRepository::new(pool.clone()),
+                refresher: ManualCredentialRefresher,
+                cipher: RingCredentialCipher::new(&SecretString::new(
+                    "integration credential key".to_owned().into_boxed_str(),
+                ))
+                .expect("test credential cipher should be valid"),
+            },
+            AuthServiceConfig::new(
+                Duration::minutes(5),
+                Duration::minutes(10),
+                Duration::minutes(1),
+            )
+            .expect("test auth configuration should be valid"),
+        ),
     )
     .layer(Extension(ConnectInfo(std::net::SocketAddr::from((
         [127, 0, 0, 1],
