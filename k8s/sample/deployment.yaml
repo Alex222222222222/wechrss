@@ -25,9 +25,14 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       terminationGracePeriodSeconds: 30
+      volumes:
+        - name: firefox-shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
       containers:
         - name: werrss
-          image: ghcr.io/alex222222222222/werrss:v0.1.0
+          image: ghcr.io/alex222222222222/werrss:v0.1.1
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
@@ -42,8 +47,10 @@ spec:
               value: 0.0.0.0
             - name: HTTP_PORT
               value: "8080"
-            - name: APP_TIMEZONE
-              value: UTC
+            - name: WEBDRIVER_URL
+              value: http://127.0.0.1:4444
+            - name: BROWSER_ENGINE
+              value: firefox
           envFrom:
             - secretRef:
                 name: werrss-runtime
@@ -76,6 +83,46 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+        - name: firefox
+          image: ghcr.io/seleniumhq/standalone-firefox:4.42.0-20260303
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: webdriver
+              containerPort: 4444
+              protocol: TCP
+          volumeMounts:
+            - name: firefox-shm
+              mountPath: /dev/shm
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: webdriver
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /status
+              port: webdriver
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
 ---
 apiVersion: v1
 kind: Service

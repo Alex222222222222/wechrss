@@ -50,11 +50,11 @@ Kubernetes Secret.
 ## Werrss application image
 
 The release image is published to GHCR by `.github/workflows/container.yml`
-when a semantic-version tag such as `v0.1.0` is pushed. Pull the versioned
+when a semantic-version tag such as `v0.1.1` is pushed. Pull the versioned
 image with:
 
 ```sh
-docker pull ghcr.io/<owner>/<repository>:v0.1.0
+docker pull ghcr.io/<owner>/<repository>:v0.1.1
 ```
 
 For a local build, run this from the repository root:
@@ -119,21 +119,27 @@ composition is disabled and scheduler startup is rejected.
 
 ### Sample application deployment
 
-`k8s/sample/deployment.yaml` is a portable API-only example. It runs the
-published release image as a non-root user, exposes a ClusterIP Service, and
-uses `/api/health` for liveness and `/api/ready` for PostgreSQL-backed
-readiness. Before applying it, create the referenced `werrss-runtime` Secret
-with at least these keys using your secret-management process:
+`k8s/sample/deployment.yaml` is a portable example with the Werrss API and an
+internal Selenium standalone Firefox WebDriver sidecar. The application uses
+the pod loopback address (`http://127.0.0.1:4444`) to reach Firefox; the
+WebDriver port is not exposed by the ClusterIP Service. The sample runs both
+containers as non-root, gives Firefox an in-memory `/dev/shm`, and uses
+`/api/health` for Werrss liveness, `/api/ready` for PostgreSQL-backed Werrss
+readiness, and `/status` for WebDriver health. Before applying it, create the
+referenced `werrss-runtime` Secret with at least these keys using your
+secret-management process:
 
 ```text
 DATABASE_URL
 CREDENTIAL_ENCRYPTION_KEY
 ```
 
-The sample deliberately leaves the Secret out of the repository. It also uses
-`APP_ROLES=api`; add the browser, WeRead, worker, and scheduler settings from
-the environment-variable reference before selecting additional roles. Replace
-the image reference if deploying a fork or a different release:
+The sample deliberately leaves the Secret out of the repository. It uses
+`APP_ROLES=api` so the deployment is safe to start without a configured
+authenticated WeRead profile; add the browser, WeRead, worker, and scheduler
+settings from the environment-variable reference before selecting additional
+roles. Pin the Firefox image to an image digest for production, and replace
+either image reference when deploying a fork or a different release:
 
 ```sh
 kubectl apply -f k8s/sample/deployment.yaml
