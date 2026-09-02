@@ -70,6 +70,128 @@ There is no separate host or port for the admin panel. For an IPv6 bind, use a
 raw address such as `::1`; the runtime adds the required brackets when it
 constructs the socket address.
 
+## Environment variable reference
+
+Configuration is loaded once at startup from environment variables. Variables
+marked **required** must be present; all other variables use the documented
+default. Durations use seconds unless the name ends in `_MS`. Invalid values,
+unknown names under the application-owned prefixes, and incomplete conditional
+settings fail startup. Keep database URLs, passwords, tokens, and encryption
+keys in a secret manager or an ignored local environment file.
+
+### Database and process roles
+
+| Variable | Default | Explanation |
+| --- | --- | --- |
+| `DATABASE_URL` | **Required** | PostgreSQL connection URL, including any SQLx-supported SSL, certificate, and authentication query parameters. It is passed through to SQLx and never logged. |
+| `DATABASE_POOL_MIN_CONNECTIONS` | `1` | Minimum number of PostgreSQL connections kept in the pool. It must not exceed the maximum. |
+| `DATABASE_POOL_MAX_CONNECTIONS` | `10` | Maximum number of PostgreSQL connections. It must be greater than zero. |
+| `APP_ROLES` | `api` | Comma-separated roles: `api`, `scheduler`, and/or `worker`; `all` enables every role. Scheduler/source-sync and worker configuration is validated according to the selected roles. |
+| `APP_INSTANCE_ID` | Generated UUID | Stable instance identity used for distributed job leases. Set a distinct value for each long-lived replica; an ID is generated for local use when omitted. |
+| `HTTP_BIND` | `0.0.0.0` | Host or IP address for the shared feed, health, and optional admin listener. IPv6 addresses may be supplied without brackets. |
+| `HTTP_PORT` | `8080` | Shared HTTP listener port. It must be between `1` and `65535`. |
+| `APP_TIMEZONE` | `UTC` | IANA timezone used for quiet-hours evaluation and browser timezone checks. |
+| `QUIET_HOURS_START` | Unset | Inclusive local quiet-hours start in `HH:MM` format. It must be set together with `QUIET_HOURS_END`. |
+| `QUIET_HOURS_END` | Unset | Exclusive local quiet-hours end in `HH:MM` format. Equal start and end values are rejected. |
+
+### Browser and WeRead acquisition
+
+| Variable | Default | Explanation |
+| --- | --- | --- |
+| `WEBDRIVER_URL` | `http://webdriver:4444` | HTTP(S) URL of the internal Thirtyfour WebDriver sidecar. |
+| `BROWSER_ENGINE` | `chromium` | Browser behind WebDriver: `chromium`/`chrome` or `firefox`/`firefox-esr`. |
+| `BROWSER_USER_AGENT` | Browser default | Optional fixed User-Agent for controlled diagnostics. It must be non-empty, contain no control characters, and be no longer than 512 characters; keep it consistent with the selected browser. |
+| `BROWSER_LOCALE` | `zh-CN` | Locale passed to the browser profile. It must be a non-empty locale token without whitespace. |
+| `BROWSER_VIEWPORT_WIDTH` | `1280` | Browser viewport width in CSS pixels. Valid range: `1`–`8192`. |
+| `BROWSER_VIEWPORT_HEIGHT` | `2000` | Browser viewport height in CSS pixels. Valid range: `1`–`8192`. |
+| `BROWSER_EXTRA_ARGS` | Empty | Optional whitespace-separated browser arguments. At most 32 arguments are accepted, each must begin with `-`, and controlled profile arguments such as User-Agent, window size, profile path, and headless mode cannot be overridden. |
+| `BROWSER_AUTHENTICATED_PROFILE` | Unset | Path to a pre-authenticated browser profile used only for the authenticated WeRead list request. It must be set together with `WEREAD_ACCOUNT_ID`. |
+| `WEREAD_ACCOUNT_ID` | Unset | Stable WeRead account UUID associated with authenticated source synchronization. It must be set together with `BROWSER_AUTHENTICATED_PROFILE`. |
+| `WEREAD_ARTICLE_LIST_URL` | `https://i.weread.qq.com/web/mp/articles` | Exact HTTPS WeRead article-list endpoint. Credentials, fragments, and non-default ports are rejected. |
+
+### Workers, jobs, and leases
+
+| Variable | Default | Explanation |
+| --- | --- | --- |
+| `WORKER_CONCURRENCY` | `1` | Maximum number of worker loops in this process. Valid range: `1`–`1024`; this controls upstream work independently from API replicas. |
+| `JOB_POLL_SECONDS` | `30` | Scheduler/worker polling interval for due work and recovery. It must be positive. |
+| `JOB_LEASE_SECONDS` | `600` | Duration of a claimed job lease. It must exceed `JOB_HEARTBEAT_SECONDS` plus the maximum page-operation duration. |
+| `JOB_HEARTBEAT_SECONDS` | `60` | Maximum interval between job-lease heartbeats. It must be less than `JOB_LEASE_SECONDS`. |
+| `JOB_MAX_ATTEMPTS` | `3` | Failure-attempt budget for retryable jobs. It must be positive. |
+| `ACCOUNT_LEASE_SECONDS` | `600` | Duration of an authenticated WeRead account lease. It must exceed its heartbeat interval. |
+| `ACCOUNT_HEARTBEAT_SECONDS` | `60` | Maximum interval between authenticated-account lease heartbeats. It must be less than `ACCOUNT_LEASE_SECONDS`. |
+| `SOURCE_FAILURE_COOLDOWN_SECONDS` | `300` | Delay before an ordinarily failed source may be scheduled again. It may be zero and is capped at seven days. |
+
+The interval between successful fetches of an individual source is not a
+process environment variable. It is the source's `sync_interval_seconds`
+setting in the admin API and defaults to one hour for a newly created source.
+The next fetch is scheduled relative to the completion time of the previous
+sync.
+
+### RSS and feed-cache behavior
+
+| Variable | Default | Explanation |
+| --- | --- | --- |
+| `RSS_CACHE_TTL_SECONDS` | `1800` | Freshness period for a persisted RSS document. It must be positive. |
+| `RSS_STALE_WHILE_REVALIDATE_SECONDS` | `60` | Additional period during which stale RSS may be served while a rebuild is requested. It may be zero and is capped at 24 hours. |
+| `RSS_CACHE_MISS_WAIT_MS` | `5000` | Bounded wait associated with a cache miss before retry advice is returned. Valid range: `1`–`60000` milliseconds. |
+| `RSS_FEED_URL` | Unset | Public HTTP(S) URL advertised in generated RSS channel links. It is required when the worker role is enabled. |
+| `FEED_BUILD_LEASE_SECONDS` | `600` | Duration of a distributed feed-build lease. It must exceed its heartbeat interval. |
+| `FEED_BUILD_HEARTBEAT_SECONDS` | `60` | Maximum interval between feed-build lease heartbeats. It must be less than `FEED_BUILD_LEASE_SECONDS`. |
+
+### Request pacing and bounded scrolling
+
+Pacing values are bounded normal-distribution parameters in milliseconds. Each
+sample is clamped to its configured inclusive minimum and maximum. Every value
+is finite and non-negative, each minimum must not exceed its maximum, and an
+individual delay is capped at 300,000 milliseconds. A zero standard deviation
+produces a constant delay. These settings reduce upstream request pressure and
+allow lazy page content to settle; they are not an anti-detection mechanism.
+
+| Variable | Default | Explanation |
+| --- | --- | --- |
+| `PACING_REQUEST_MEAN_MS` | `2000` | Mean delay before a WeRead or other upstream protocol request. |
+| `PACING_REQUEST_STDDEV_MS` | `250` | Standard deviation for upstream-request delay sampling. |
+| `PACING_REQUEST_MIN_MS` | `1000` | Inclusive lower bound for upstream-request delays. |
+| `PACING_REQUEST_MAX_MS` | `4000` | Inclusive upper bound for upstream-request delays. |
+| `PACING_PAGE_NAVIGATION_MEAN_MS` | `3000` | Mean delay before navigating to a public article page. |
+| `PACING_PAGE_NAVIGATION_STDDEV_MS` | `500` | Standard deviation for page-navigation delay sampling. |
+| `PACING_PAGE_NAVIGATION_MIN_MS` | `1500` | Inclusive lower bound for page-navigation delays. |
+| `PACING_PAGE_NAVIGATION_MAX_MS` | `7000` | Inclusive upper bound for page-navigation delays. |
+| `PACING_PAGE_ACTION_MEAN_MS` | `1000` | Mean delay between public page actions such as extraction and scrolling. |
+| `PACING_PAGE_ACTION_STDDEV_MS` | `200` | Standard deviation for page-action delay sampling. |
+| `PACING_PAGE_ACTION_MIN_MS` | `500` | Inclusive lower bound for page-action delays. |
+| `PACING_PAGE_ACTION_MAX_MS` | `3000` | Inclusive upper bound for page-action delays. |
+| `PACING_SCROLL_SETTLE_MEAN_MS` | `1000` | Mean delay after a scroll so lazy-loaded content can settle. |
+| `PACING_SCROLL_SETTLE_STDDEV_MS` | `200` | Standard deviation for scroll-settle delay sampling. |
+| `PACING_SCROLL_SETTLE_MIN_MS` | `500` | Inclusive lower bound for scroll-settle delays. |
+| `PACING_SCROLL_SETTLE_MAX_MS` | `3000` | Inclusive upper bound for scroll-settle delays. |
+| `SCROLL_MAX_STEPS` | `4` | Maximum number of bounded scroll actions per article page. Valid range: `1`–`64`. |
+| `SCROLL_MAX_PIXELS` | `4000` | Maximum cumulative CSS-pixel scroll distance per article page. Valid range: `1`–`1000000`. |
+| `SCROLL_MAX_OPERATION_SECONDS` | `30` | Maximum duration of one page interaction and scroll operation. It must be positive and no greater than one hour. |
+
+### Optional asset archiving
+
+| Variable | Default | Explanation |
+| --- | --- | --- |
+| `ASSET_ARCHIVE_BACKEND` | `disabled` | Asset mode: `disabled` keeps approved external URLs, `local` writes to a local directory, or `s3` uses an S3-compatible object store. |
+| `ASSET_ARCHIVE_LOCAL_PATH` | Unset | Required when the backend is `local`; persistent directory for archived binary assets. |
+| `ASSET_ARCHIVE_S3_ENDPOINT` | Unset | Required when the backend is `s3`; credential-free HTTP(S) S3-compatible endpoint. |
+| `ASSET_ARCHIVE_S3_BUCKET` | Unset | Required when the backend is `s3`; object-store bucket name. |
+| `ASSET_ARCHIVE_S3_REGION` | Unset | Required when the backend is `s3`; region or signing scope. |
+| `ASSET_ARCHIVE_S3_ACCESS_KEY` | Unset | Required when the backend is `s3`; object-store access key. Store it as a secret. |
+| `ASSET_ARCHIVE_S3_SECRET_KEY` | Unset | Required when the backend is `s3`; object-store secret key. Store it as a secret. |
+
+### Administration and encryption
+
+| Variable | Default | Explanation |
+| --- | --- | --- |
+| `ADMIN_ENABLED` | `false` | Enables the single-administrator API and panel when `true`. |
+| `ADMIN_USERNAME` | Unset | Required only when `ADMIN_ENABLED=true`; configured administrator username. |
+| `ADMIN_PASSWORD` | Unset | Required only when `ADMIN_ENABLED=true`; configured administrator password. Store it as a secret. |
+| `SESSION_SIGNING_KEY` | Unset | Required only when `ADMIN_ENABLED=true`; independent secret used to sign admin sessions. It must differ from the admin password and credential-encryption key. |
+| `CREDENTIAL_ENCRYPTION_KEY` | **Required** | Secret used to encrypt WeRead credentials before persistence. It must be protected and must not be reused as the session-signing key. |
+
 ## Roadmap
 
 These possible features are ordered approximately by user value and operational
