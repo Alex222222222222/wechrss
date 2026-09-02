@@ -285,6 +285,7 @@ async fn replace_weread_account(
 fn credentials_from_request(
     request: &ProvisionWeReadAccountRequest,
 ) -> Result<crate::domain::credentials::WeReadCredentials, Box<Response>> {
+    let cookie_header = request.cookie_header.trim();
     let access_expires_at = match DateTime::parse_from_rfc3339(&request.access_expires_at) {
         Ok(value) => value.with_timezone(&Utc),
         Err(_) => {
@@ -293,12 +294,12 @@ fn credentials_from_request(
             )))
         }
     };
-    if cookie_value(&request.cookie_header, "wr_vid").is_none() {
+    if cookie_value(cookie_header, "wr_vid").is_none() {
         return Err(Box::new(validation_error(
             "cookie_header must contain wr_vid",
         )));
     }
-    let access_token = match cookie_value(&request.cookie_header, "wr_skey") {
+    let access_token = match cookie_value(cookie_header, "wr_skey") {
         Some(value) => value,
         None => {
             return Err(Box::new(validation_error(
@@ -306,7 +307,7 @@ fn credentials_from_request(
             )))
         }
     };
-    let refresh_token = match cookie_value(&request.cookie_header, "wr_rt") {
+    let refresh_token = match cookie_value(cookie_header, "wr_rt") {
         Some(value) => value,
         None => {
             return Err(Box::new(validation_error(
@@ -325,7 +326,7 @@ fn credentials_from_request(
         Err(error) => return Err(Box::new(validation_error(error.to_string()))),
     };
     credentials
-        .with_web_cookie(request.cookie_header.clone())
+        .with_web_cookie(cookie_header.to_owned())
         .map_err(|error| Box::new(validation_error(error.to_string())))
 }
 
@@ -341,7 +342,7 @@ fn display_name_from_request(
         return Ok(display_name.to_owned());
     }
 
-    let encoded_name = cookie_value(&request.cookie_header, "wr_name").ok_or_else(|| {
+    let encoded_name = cookie_value(request.cookie_header.trim(), "wr_name").ok_or_else(|| {
         Box::new(validation_error(
             "display_name must be provided or cookie_header must contain a non-empty wr_name",
         ))
@@ -875,7 +876,7 @@ mod tests {
 
     #[test]
     fn derives_display_name_from_percent_encoded_weread_cookie_name() {
-        let request = provisioning_request(None, "wr_name=Alex%20Hua; wr_vid=vid");
+        let request = provisioning_request(None, " \nwr_name=Alex%20Hua; wr_vid=vid\n ");
         assert_eq!(
             display_name_from_request(&request).ok(),
             Some("Alex Hua".to_owned())
@@ -884,10 +885,24 @@ mod tests {
 
     #[test]
     fn explicit_display_name_takes_precedence_over_weread_cookie_name() {
-        let request = provisioning_request(Some("  Chosen name  "), "wr_name=Cookie%20name");
+        let request = provisioning_request(Some("  Chosen name \n"), "wr_name=Cookie%20name");
         assert_eq!(
             display_name_from_request(&request).ok(),
             Some("Chosen name".to_owned())
+        );
+    }
+
+    #[test]
+    fn credentials_trim_outer_cookie_header_whitespace_before_storage() {
+        let request = provisioning_request(
+            Some("Display name"),
+            " \nwr_vid=vid; wr_skey=access; wr_rt=refresh\n ",
+        );
+        let credentials = credentials_from_request(&request).expect("trimmed cookie is valid");
+
+        assert_eq!(
+            credentials.web_cookie(),
+            Some("wr_vid=vid; wr_skey=access; wr_rt=refresh")
         );
     }
 

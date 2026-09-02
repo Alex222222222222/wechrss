@@ -492,7 +492,7 @@ async fn admin_can_provision_weread_account_with_empty_optional_cookie_values(po
             Some(serde_json::json!({
                 "account_id": null,
                 "display_name": null,
-                "cookie_header": "wr_avatar=; wr_fp=1237823; wr_gender=0; wr_localvid=awefhiauef; wr_name=Alex%20Hua; wr_ql=0; wr_rt=web%400H5swX9Mm95b1~YWmDF_AD; wr_skey=aewi238; wr_vid=12983214; wr_gid=12412424; _qimei_fingerprint=aefhiuawef; _qimei_h38=; _qimei_i_1=aewaefuhi; _qimei_i_2=aewufhiew; _qimei_i_3=awefhbieuwh2839ifde; _qimei_q32=; _qimei_q36=; yybsdk-webId=ahweiufhwiu3829hcf; _qimei_uuid42=wefhu3289hf",
+                "cookie_header": " \nwr_avatar=; wr_fp=1237823; wr_gender=0; wr_localvid=awefhiauef; wr_name=Alex%20Hua; wr_ql=0; wr_rt=web%400H5swX9Mm95b1~YWmDF_AD; wr_skey=aewi238; wr_vid=12983214; wr_gid=12412424; _qimei_fingerprint=aefhiuawef; _qimei_h38=; _qimei_i_1=aewaefuhi; _qimei_i_2=aewufhiew; _qimei_i_3=awefhbieuwh2839ifde; _qimei_q32=; _qimei_q36=; yybsdk-webId=ahweiufhwiu3829hcf; _qimei_uuid42=wefhu3289hf\n ",
                 "access_expires_at": expiry,
             })),
         ))
