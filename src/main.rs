@@ -7,16 +7,23 @@ use werrss::{application::runtime_supervisor::RuntimeSupervisor, config::AppConf
 
 #[tokio::main]
 async fn main() {
+    logging::init_from_env();
     let result = async {
         let config = AppConfig::from_env()?;
-        logging::init(config.log_level);
+        tracing::info!(
+            roles = ?config.roles,
+            log_level = %config.log_level,
+            http_bind = %config.http_bind,
+            http_port = config.http_port,
+            "starting werrss runtime"
+        );
         let supervisor = RuntimeSupervisor::from_config(config).await?;
         supervisor.run_until_signal().await
     }
     .await;
 
     if let Err(error) = result {
-        eprintln!("werrss failed to start: {error}");
+        tracing::error!(error = %error, "werrss runtime terminated with an error");
         std::process::exit(1);
     }
 }

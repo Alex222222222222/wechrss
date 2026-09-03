@@ -368,9 +368,19 @@ where
     }
 
     /// Returns cached feed bytes or a bounded temporary-unavailable result.
+    #[tracing::instrument(skip_all, level = "debug", fields(source_id = %request.source_id))]
     pub async fn get_feed(&self, request: FeedRequest) -> Result<FeedDelivery, FeedServiceError> {
         validate_source_id(request.source_id)?;
-        let Some(read) = self.cache.get(request.source_id).await? else {
+        tracing::trace!("looking up feed cache");
+        let read = match self.cache.get(request.source_id).await {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::warn!(error = %error, "feed cache lookup failed");
+                return Err(error.into());
+            }
+        };
+        let Some(read) = read else {
+            tracing::debug!("feed cache miss; requesting a rebuild");
             let rebuild = self.enqueue_rebuild(request.source_id).await;
             return Ok(FeedDelivery::Unavailable {
                 retry_after: self.config.cache_miss_retry_after(),
@@ -388,6 +398,12 @@ where
             FeedCacheStatus::Stale => self.enqueue_rebuild(read.cache().source_id()).await,
         };
         let cache = read.cache().clone();
+        tracing::debug!(
+            status = ?status,
+            feed_revision = ?cache.feed_revision(),
+            rebuild = ?rebuild,
+            "feed cache lookup completed"
+        );
 
         if if_none_match_matches(request.if_none_match.as_deref(), cache.etag()) {
             Ok(FeedDelivery::NotModified {

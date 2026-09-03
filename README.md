@@ -193,11 +193,40 @@ allow lazy page content to settle; they are not an anti-detection mechanism.
 | `SESSION_SIGNING_KEY` | Unset | Required only when `ADMIN_ENABLED=true`; independent secret used to sign admin sessions. It must differ from the admin password and credential-encryption key. |
 | `CREDENTIAL_ENCRYPTION_KEY` | **Required** | Secret used to encrypt WeRead credentials before persistence. It must be protected and must not be reused as the session-signing key. |
 
+## Logging
+
+Werrss writes structured, container-friendly logs to standard error. Set
+`LOG_LEVEL` to `warn` (the default), `off`, `error`, `info`, `debug`, or `trace`
+to control verbosity. Every emitted line includes a timestamp, severity,
+module target, and event detail; completed instrumented operations also include
+their duration when span-close logging is enabled. Third-party WebDriver
+response logging remains capped at warning level even when application debug
+or trace diagnostics are enabled.
+
+The levels have these meanings:
+
+- `error`: a role or process cannot provide its contract, or a durable
+  operation failed.
+- `off`: disables log output.
+- `warn`: a recoverable failure, expected degradation, invalid operator input,
+  or an unavailable upstream dependency.
+- `info`: process and role lifecycle events and completed user or worker work.
+- `debug` and `trace`: bounded control-flow, timing, counts, identifiers, and
+  other diagnostics useful while investigating a single operation.
+
+Logs never include passwords, encryption keys, session or feed tokens, cookie
+values, request bodies, or raw upstream response documents. Keep the default
+level in production and temporarily use `LOG_LEVEL=debug` (or `trace` for
+low-level browser and pacing diagnostics) while investigating a problem.
+
 ## Roadmap
 
 These possible features are ordered approximately by user value and operational
 impact, not by implementation difficulty. The list is a planning guide rather
 than a commitment:
+
+Structured application logging and sensitive-value redaction are included in
+the current runtime; the remaining roadmap items are future work:
 
 1. **Add browser health and worker readiness diagnostics.** Report WebDriver
    availability and timezone mismatches separately from API liveness and
@@ -209,22 +238,18 @@ than a commitment:
 3. **Add internationalization (i18n).** Move user-facing panel messages into
    translation resources and add additional locale support after the default
    Chinese-language experience is stable.
-4. **Normalize application logs.** Define a consistent structured event and
-   severity vocabulary across API, scheduler, worker, browser, and persistence
-   paths; redact sensitive values and make correlation identifiers predictable
-   for operators and log aggregation tools.
-5. **Add QR-code login.** Implement the bounded, single-use login-attempt
+4. **Add QR-code login.** Implement the bounded, single-use login-attempt
    lifecycle and interactive confirmation flow so operators do not need to
    supply credentials manually. This remains deferred after the
    first release.
-6. **Add missed-article repair/backfill jobs.** Queue and process articles
+5. **Add missed-article repair/backfill jobs.** Queue and process articles
    missed during synchronization with bounded retries and deduplication. This
    improves recovery after partial upstream failures but is not required for
    the first release.
-7. **Persist archived assets and rewrite feed URLs.** Store approved media in
+6. **Persist archived assets and rewrite feed URLs.** Store approved media in
    local or object storage so archived articles can remain useful when
    upstream assets change or disappear.
-8. **Evaluate PGMQ as a queue transport optimization.** The current custom
+7. **Evaluate PGMQ as a queue transport optimization.** The current custom
    `jobs` table remains the version-one transport; PGMQ can be evaluated later
    if queue throughput or operational overhead becomes a demonstrated
    bottleneck.

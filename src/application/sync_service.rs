@@ -80,6 +80,7 @@ pub enum SyncAcquisitionError {
 pub struct ClassifiedSyncFailure {
     outcome: SyncOutcome,
     failure: SyncFailure,
+    log_as_error: bool,
 }
 
 impl ClassifiedSyncFailure {
@@ -93,12 +94,22 @@ impl ClassifiedSyncFailure {
         &self.failure
     }
 
+    /// Returns whether this failure should be emitted at error level.
+    ///
+    /// A source-sync run can finish with `Failed` while the application is
+    /// still healthy and should simply try again later. The missing-account
+    /// state is one such expected first-run condition.
+    pub(crate) const fn log_as_error(&self) -> bool {
+        self.log_as_error
+    }
+
     /// Creates an application-owned permanent failure with a safe message.
     pub(crate) fn permanent(message: &'static str) -> Self {
         Self {
             outcome: SyncOutcome::Failed,
             failure: SyncFailure::new(SyncFailureClass::Permanent, message)
                 .expect("static synchronization failure messages must be valid"),
+            log_as_error: true,
         }
     }
 
@@ -108,6 +119,7 @@ impl ClassifiedSyncFailure {
             outcome: SyncOutcome::RetryableFailure,
             failure: SyncFailure::new(SyncFailureClass::Retryable, message)
                 .expect("static synchronization failure messages must be valid"),
+            log_as_error: false,
         }
     }
 }
@@ -173,6 +185,8 @@ pub fn classify_acquisition_error(error: &SyncAcquisitionError) -> ClassifiedSyn
         outcome,
         failure: SyncFailure::new(class, message)
             .expect("static synchronization failure messages must be valid"),
+        log_as_error: outcome == SyncOutcome::Failed
+            && !matches!(error, SyncAcquisitionError::NoAccountEnrolled),
     }
 }
 
@@ -225,30 +239,54 @@ impl SyncService {
         observation_version: ArticleObservationVersion,
         fetched_at: DateTime<Utc>,
     ) -> Result<PreparedArticle, SyncServiceError> {
+        tracing::debug!(
+            source_id = %source_id,
+            review_id = %reference.review_id,
+            observation_version = observation_version.as_u64(),
+            "preparing synchronized article"
+        );
         let archived = self.archive.archive(&page.content_html);
-        let article = NewArticle {
-            source_id,
-            review_id: reference.review_id.clone(),
-            title: preferred_text(page.title, reference.title.clone()),
-            author: preferred_text_option(page.author, reference.author.clone()),
-            summary: preferred_text_option(page.summary, reference.summary.clone()),
-            cover_url: preferred_text_option(page.cover_url, reference.cover_url.clone()),
-            original_url: Some(page.canonical_url),
-            published_at: page
-                .published_at
-                .or(reference.published_at)
-                .ok_or(SyncServiceError::MissingPublishedAt)?,
-            content_html: archived.html().to_owned(),
-            content_hash: archived.content_hash().map(str::to_owned),
-            observation_version,
-            fetched_at,
-        }
-        .normalize()?;
+        let result = (|| {
+            let article = NewArticle {
+                source_id,
+                review_id: reference.review_id.clone(),
+                title: preferred_text(page.title, reference.title.clone()),
+                author: preferred_text_option(page.author, reference.author.clone()),
+                summary: preferred_text_option(page.summary, reference.summary.clone()),
+                cover_url: preferred_text_option(page.cover_url, reference.cover_url.clone()),
+                original_url: Some(page.canonical_url),
+                published_at: page
+                    .published_at
+                    .or(reference.published_at)
+                    .ok_or(SyncServiceError::MissingPublishedAt)?,
+                content_html: archived.html().to_owned(),
+                content_hash: archived.content_hash().map(str::to_owned),
+                observation_version,
+                fetched_at,
+            }
+            .normalize()?;
 
-        Ok(PreparedArticle {
-            article,
-            external_assets: archived.external_assets().to_vec(),
-        })
+            Ok(PreparedArticle {
+                article,
+                external_assets: archived.external_assets().to_vec(),
+            })
+        })();
+        match &result {
+            Ok(prepared) => tracing::debug!(
+                source_id = %source_id,
+                review_id = %reference.review_id,
+                content_bytes = prepared.article.content_html.len(),
+                external_assets = prepared.external_assets.len(),
+                "synchronized article prepared"
+            ),
+            Err(error) => tracing::warn!(
+                source_id = %source_id,
+                review_id = %reference.review_id,
+                error = %error,
+                "unable to prepare synchronized article"
+            ),
+        }
+        result
     }
 }
 

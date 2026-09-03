@@ -84,13 +84,16 @@ impl PacingController {
     /// Samples one delay without sleeping.
     pub async fn sample_delay(&self, kind: DelayKind) -> Duration {
         let mut rng = self.rng.lock().await;
-        self.policy.distribution(kind).sample(&mut *rng)
+        let delay = self.policy.distribution(kind).sample(&mut *rng);
+        tracing::trace!(delay_kind = ?kind, delay_ms = delay.as_millis(), "sampled upstream pacing delay");
+        delay
     }
 
     /// Samples and asynchronously waits for one operation delay.
     pub async fn wait(&self, kind: DelayKind) {
         let delay = self.sample_delay(kind).await;
         if !delay.is_zero() {
+            tracing::trace!(delay_kind = ?kind, delay_ms = delay.as_millis(), "waiting before upstream operation");
             tokio::time::sleep(delay).await;
         }
     }
@@ -131,6 +134,12 @@ impl PacingController {
                 .sample(&mut *rng);
             steps.push(ScrollStep { distance, settle });
         }
+        tracing::debug!(
+            viewport_height,
+            steps = steps.len(),
+            total_pixels = steps.iter().map(|step| step.distance).sum::<u32>(),
+            "created bounded article scroll plan"
+        );
         steps
     }
 }

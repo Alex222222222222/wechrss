@@ -268,28 +268,52 @@ where
     R: SchedulerRepository,
 {
     /// Runs one bounded scheduling pass.
+    #[tracing::instrument(
+        skip_all,
+        level = "debug",
+        fields(batch_limit = self.config.batch_limit(), reservation_for_ms = self.config.reservation_for().num_milliseconds())
+    )]
     pub async fn run_once(&self) -> Result<SchedulerRun, SchedulerError> {
+        tracing::trace!(
+            credential_refresh_enabled = self.credential_refresh.is_some(),
+            "starting scheduler pass"
+        );
         let credential_refreshes = match self.credential_refresh {
             Some(config) => {
-                self.repository
+                match self
+                    .repository
                     .enqueue_due_credential_refreshes(
                         self.config.batch_limit,
                         config.refresh_before,
                         config.max_attempts,
                     )
-                    .await?
+                    .await
+                {
+                    Ok(refreshes) => refreshes,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "scheduler could not enqueue credential refreshes");
+                        return Err(error.into());
+                    }
+                }
             }
             None => Vec::new(),
         };
-        let result = self
+        let result = match self
             .repository
             .enqueue_due_sources(
                 self.config.batch_limit,
                 self.config.reservation_for,
                 self.quiet_hours,
             )
-            .await?;
-        match result {
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(error = %error, "scheduler could not enqueue due sources");
+                return Err(error.into());
+            }
+        };
+        let result = match result {
             SchedulerPass::SkippedQuietHours => Ok(SchedulerRun::SkippedQuietHours {
                 credential_refreshes,
             }),
@@ -297,7 +321,25 @@ where
                 sources,
                 credential_refreshes,
             }),
+        };
+        match &result {
+            Ok(SchedulerRun::SkippedQuietHours {
+                credential_refreshes,
+            }) => tracing::debug!(
+                credential_refreshes = credential_refreshes.len(),
+                "scheduler pass skipped source work during quiet hours"
+            ),
+            Ok(SchedulerRun::Enqueued {
+                sources,
+                credential_refreshes,
+            }) => tracing::info!(
+                sources = sources.len(),
+                credential_refreshes = credential_refreshes.len(),
+                "scheduler enqueued due work"
+            ),
+            Err(error) => tracing::warn!(error = %error, "scheduler pass failed"),
         }
+        result
     }
 
     /// Polls the scheduler until the shutdown watch becomes true or is dropped.
@@ -312,9 +354,22 @@ where
         mut shutdown: tokio::sync::watch::Receiver<bool>,
         loop_config: SchedulerLoopConfig,
     ) -> SchedulerLoopStats {
+        tracing::info!(
+            poll_interval_ms = loop_config.poll_interval().as_millis(),
+            error_backoff_ms = loop_config.error_backoff().as_millis(),
+            "scheduler loop started"
+        );
         let mut stats = SchedulerLoopStats::default();
         loop {
             if shutdown.has_changed().is_err() || *shutdown.borrow() {
+                tracing::info!(
+                    passes = stats.passes,
+                    sources = stats.enqueued_sources,
+                    credential_refreshes = stats.enqueued_credential_refreshes,
+                    quiet_passes = stats.quiet_passes,
+                    errors = stats.errors,
+                    "scheduler loop stopped"
+                );
                 return stats;
             }
 
@@ -347,10 +402,18 @@ where
             };
 
             tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return stats;
-                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            tracing::info!(
+                                passes = stats.passes,
+                                sources = stats.enqueued_sources,
+                                credential_refreshes = stats.enqueued_credential_refreshes,
+                                quiet_passes = stats.quiet_passes,
+                                errors = stats.errors,
+                                "scheduler loop stopped"
+                            );
+                            return stats;
+                        }
                 }
                 _ = time::sleep(wait) => {}
             }

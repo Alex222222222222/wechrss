@@ -126,6 +126,34 @@ impl Default for BrowserProfile {
     }
 }
 
+impl WebDriverError {
+    /// Returns a bounded message safe to propagate into application errors
+    /// and logs. Thirtyfour error values may contain the complete response
+    /// body from the WebDriver sidecar.
+    pub(crate) fn safe_message(&self) -> String {
+        match self {
+            Self::Pool(_) => "browser pool operation failed".to_owned(),
+            Self::Connect(_) => "WebDriver session could not be created".to_owned(),
+            Self::Command(_) => "WebDriver command failed".to_owned(),
+            Self::NotConnected => "browser session is not connected to WebDriver".to_owned(),
+            Self::EnvironmentMismatch { field, .. } => {
+                format!("browser environment field {field} did not match the configured profile")
+            }
+        }
+    }
+
+    /// Returns a stable category suitable for diagnostic log fields.
+    pub(crate) const fn kind(&self) -> &'static str {
+        match self {
+            Self::Pool(_) => "pool",
+            Self::Connect(_) => "connect",
+            Self::Command(_) => "command",
+            Self::NotConnected => "not_connected",
+            Self::EnvironmentMismatch { .. } => "environment_mismatch",
+        }
+    }
+}
+
 /// Requested browser window dimensions in CSS pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrowserViewport {
@@ -197,19 +225,26 @@ impl WebDriverFactory {
         &self,
         pool: &BrowserPool,
     ) -> Result<PublicBrowserSession, WebDriverError> {
+        tracing::debug!(engine = ?self.engine, endpoint_host = ?self.endpoint.host_str(), "opening public WebDriver session");
         let session = pool.open_public().await?;
-        let client = connect(self.endpoint.clone(), self.engine, &self.profile)
-            .await
-            .map_err(WebDriverError::Connect)?;
+        let client = match connect(self.endpoint.clone(), self.engine, &self.profile).await {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(engine = ?self.engine, error_kind = "connect", "unable to create public WebDriver session");
+                return Err(WebDriverError::Connect(error));
+            }
+        };
         if let Err(error) = self.validate_environment(&client).await {
-            if let Err(cleanup_error) = close_webdriver(client).await {
+            tracing::warn!(engine = ?self.engine, error_kind = error.kind(), "public WebDriver environment validation failed");
+            if let Err(_cleanup_error) = close_webdriver(client).await {
                 tracing::warn!(
-                    error = %cleanup_error,
+                    error_kind = "cleanup",
                     "browser cleanup failed after environment validation error"
                 );
             }
             return Err(error);
         }
+        tracing::info!(session_id = %session.session_id(), engine = ?self.engine, "public WebDriver session opened");
         Ok(session.attach_client(client))
     }
 
@@ -230,6 +265,7 @@ impl WebDriverFactory {
     where
         R: AccountLeaseStore,
     {
+        tracing::debug!(account_id = %account_id, engine = ?self.engine, endpoint_host = ?self.endpoint.host_str(), "opening authenticated WebDriver session");
         let Some(session) = pool
             .open_authenticated(leases, account_id, owner, lease_for)
             .await?
@@ -239,20 +275,23 @@ impl WebDriverFactory {
         let client = match connect(self.endpoint.clone(), self.engine, &self.profile).await {
             Ok(client) => client,
             Err(error) => {
+                tracing::warn!(account_id = %account_id, engine = ?self.engine, error_kind = "connect", "unable to create authenticated WebDriver session");
                 let _ = session.release().await;
                 return Err(WebDriverError::Connect(error));
             }
         };
         if let Err(error) = self.validate_environment(&client).await {
-            if let Err(cleanup_error) = close_webdriver(client).await {
+            tracing::warn!(account_id = %account_id, error_kind = error.kind(), "authenticated WebDriver environment validation failed");
+            if let Err(_cleanup_error) = close_webdriver(client).await {
                 tracing::warn!(
-                    error = %cleanup_error,
+                    error_kind = "cleanup",
                     "browser cleanup failed after authenticated environment validation error"
                 );
             }
             let _ = session.release().await;
             return Err(error);
         }
+        tracing::info!(session_id = %session.session_id(), account_id = %account_id, engine = ?self.engine, "authenticated WebDriver session opened");
         Ok(Some(session.attach_client(client)))
     }
 
@@ -285,6 +324,7 @@ async fn connect(
     engine: BrowserEngine,
     profile: &BrowserProfile,
 ) -> Result<WebDriver, String> {
+    tracing::trace!(engine = ?engine, endpoint_host = ?endpoint.host_str(), "connecting to WebDriver sidecar");
     let capabilities = capabilities_for(engine, profile)?;
     let driver = WebDriver::builder(endpoint.as_str(), capabilities)
         .request_timeout(WEBDRIVER_REQUEST_TIMEOUT)
@@ -301,10 +341,12 @@ async fn connect(
     ] {
         if let Err(error) = result {
             let message = error.to_string();
+            tracing::warn!(engine = ?engine, error_kind = "command", "WebDriver session initialization command failed");
             let _ = close_webdriver(driver).await;
             return Err(message);
         }
     }
+    tracing::debug!(engine = ?engine, "connected to WebDriver sidecar");
     Ok(driver)
 }
 
@@ -487,12 +529,16 @@ impl PublicBrowserSession {
 
     /// Navigates the clean session to a validated public-page destination.
     pub(crate) async fn goto(&self, url: &str) -> Result<(), WebDriverError> {
+        tracing::trace!(session_id = %self.session_id, "navigating public browser session");
         self.client
             .as_ref()
             .ok_or(WebDriverError::NotConnected)?
             .goto(url)
             .await
-            .map_err(|error| WebDriverError::Command(error.to_string()))
+            .map_err(|error| {
+                tracing::warn!(session_id = %self.session_id, error_kind = "command", "public browser navigation failed");
+                WebDriverError::Command(error.to_string())
+            })
     }
 
     /// Returns the browser-observed URL after navigation and redirects.
@@ -507,12 +553,16 @@ impl PublicBrowserSession {
 
     /// Captures the current rendered page source.
     pub(crate) async fn source(&self) -> Result<String, WebDriverError> {
+        tracing::trace!(session_id = %self.session_id, "capturing public browser page source");
         self.client
             .as_ref()
             .ok_or(WebDriverError::NotConnected)?
             .source()
             .await
-            .map_err(|error| WebDriverError::Command(error.to_string()))
+            .map_err(|error| {
+                tracing::warn!(session_id = %self.session_id, error_kind = "command", "public browser page-source capture failed");
+                WebDriverError::Command(error.to_string())
+            })
     }
 
     /// Returns the current CSS viewport height for bounded scroll planning.
@@ -534,6 +584,7 @@ impl PublicBrowserSession {
 
     /// Scrolls down by a bounded number of CSS pixels.
     pub(crate) async fn scroll_by(&self, distance: u32) -> Result<(), WebDriverError> {
+        tracing::trace!(session_id = %self.session_id, distance, "scrolling public browser session");
         self.client
             .as_ref()
             .ok_or(WebDriverError::NotConnected)?
@@ -542,7 +593,10 @@ impl PublicBrowserSession {
                 vec![serde_json::json!(distance)],
             )
             .await
-            .map_err(|error| WebDriverError::Command(error.to_string()))?;
+            .map_err(|error| {
+                tracing::warn!(session_id = %self.session_id, error_kind = "command", "public browser scroll failed");
+                WebDriverError::Command(error.to_string())
+            })?;
         Ok(())
     }
 
@@ -569,7 +623,7 @@ impl PublicBrowserSession {
         if let Some(client) = self.client.take() {
             close_webdriver(client)
                 .await
-                .map_err(WebDriverError::Command)?;
+                .map_err(|error| WebDriverError::Command(error.to_owned()))?;
         }
         Ok(())
     }
@@ -748,22 +802,22 @@ where
 /// fallback to run on the Tokio executor after a failed or timed-out request.
 /// The cloned handle is leaked in every non-success path, which marks the
 /// remote session as abandoned while the cleanup task may still finish.
-async fn close_webdriver(client: WebDriver) -> Result<(), String> {
+async fn close_webdriver(client: WebDriver) -> Result<(), &'static str> {
     let abandon_guard = client.clone();
     let cleanup = tokio::spawn(async move { client.quit().await });
     match tokio::time::timeout(WEBDRIVER_CLEANUP_TIMEOUT, cleanup).await {
         Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(error))) => {
+        Ok(Ok(Err(_error))) => {
             let _ = abandon_guard.leak();
-            Err(error.to_string())
+            Err("WebDriver quit command failed")
         }
-        Ok(Err(error)) => {
+        Ok(Err(_error)) => {
             let _ = abandon_guard.leak();
-            Err(format!("browser cleanup task failed: {error}"))
+            Err("WebDriver cleanup task failed")
         }
         Err(_) => {
             let _ = abandon_guard.leak();
-            Err("browser cleanup timed out".to_owned())
+            Err("WebDriver cleanup timed out")
         }
     }
 }
@@ -788,13 +842,26 @@ where
 
     /// Navigates the authenticated browser to one protocol endpoint.
     pub(crate) async fn goto(&mut self, url: &str) -> Result<(), WebDriverError> {
+        tracing::trace!(
+            session_id = %self.session_id(),
+            account_id = %self.account_id(),
+            "navigating authenticated browser session"
+        );
         self.session
             .client
             .as_ref()
             .ok_or(WebDriverError::NotConnected)?
             .goto(url)
             .await
-            .map_err(|error| WebDriverError::Command(error.to_string()))
+            .map_err(|error| {
+                tracing::warn!(
+                    session_id = %self.session_id(),
+                    account_id = %self.account_id(),
+                    error_kind = "command",
+                    "authenticated browser navigation failed"
+                );
+                WebDriverError::Command(error.to_string())
+            })
     }
 
     /// Returns the browser-observed URL after navigation and redirects.
@@ -810,13 +877,26 @@ where
 
     /// Captures the authenticated browser's current rendered page source.
     pub(crate) async fn source(&self) -> Result<String, WebDriverError> {
+        tracing::trace!(
+            session_id = %self.session_id(),
+            account_id = %self.account_id(),
+            "capturing authenticated browser page source"
+        );
         self.session
             .client
             .as_ref()
             .ok_or(WebDriverError::NotConnected)?
             .source()
             .await
-            .map_err(|error| WebDriverError::Command(error.to_string()))
+            .map_err(|error| {
+                tracing::warn!(
+                    session_id = %self.session_id(),
+                    account_id = %self.account_id(),
+                    error_kind = "command",
+                    "authenticated browser page-source capture failed"
+                );
+                WebDriverError::Command(error.to_string())
+            })
     }
 
     /// Installs a validated WeRead cookie header into the current browser
@@ -826,11 +906,17 @@ where
         &mut self,
         cookie_header: &str,
     ) -> Result<(), WebDriverError> {
+        tracing::trace!(
+            session_id = %self.session_id(),
+            account_id = %self.account_id(),
+            "installing authenticated browser cookies"
+        );
         let client = self
             .session
             .client
             .as_ref()
             .ok_or(WebDriverError::NotConnected)?;
+        let mut cookie_count = 0_u32;
         for part in cookie_header.split(';') {
             let part = part.trim();
             let Some((name, value)) = part.split_once('=') else {
@@ -842,11 +928,23 @@ where
             cookie.set_path("/");
             cookie.set_domain("weread.qq.com");
             cookie.set_secure(true);
-            client
-                .add_cookie(cookie)
-                .await
-                .map_err(|error| WebDriverError::Command(error.to_string()))?;
+            client.add_cookie(cookie).await.map_err(|error| {
+                tracing::warn!(
+                    session_id = %self.session_id(),
+                    account_id = %self.account_id(),
+                    error_kind = "command",
+                    "authenticated browser cookie installation failed"
+                );
+                WebDriverError::Command(error.to_string())
+            })?;
+            cookie_count = cookie_count.saturating_add(1);
         }
+        tracing::debug!(
+            session_id = %self.session_id(),
+            account_id = %self.account_id(),
+            cookies = cookie_count,
+            "installed authenticated browser cookies"
+        );
         Ok(())
     }
 
@@ -858,6 +956,11 @@ where
     /// keeps the authenticated page origin and asks the browser Fetch API for
     /// the response text before any document rendering can change it.
     pub(crate) async fn fetch_text(&self, url: &str) -> Result<String, WebDriverError> {
+        tracing::trace!(
+            session_id = %self.session_id(),
+            account_id = %self.account_id(),
+            "fetching authenticated browser response text"
+        );
         let result = self
             .session
             .client
@@ -872,7 +975,15 @@ fetch(arguments[0], { credentials: "include" })
                 vec![serde_json::json!(url)],
             )
             .await
-            .map_err(|error| WebDriverError::Command(error.to_string()))?;
+            .map_err(|error| {
+                tracing::warn!(
+                    session_id = %self.session_id(),
+                    account_id = %self.account_id(),
+                    error_kind = "command",
+                    "authenticated browser response fetch failed"
+                );
+                WebDriverError::Command(error.to_string())
+            })?;
         let response: BrowserFetchTextResult = result
             .convert()
             .map_err(|error| WebDriverError::Command(error.to_string()))?;
@@ -881,9 +992,24 @@ fetch(arguments[0], { credentials: "include" })
                 "browser fetch failed: {error}"
             )));
         }
-        response.body.ok_or_else(|| {
+        let body = response.body.ok_or_else(|| {
             WebDriverError::Command("browser fetch returned no response body".to_owned())
-        })
+        });
+        match &body {
+            Ok(body) => tracing::debug!(
+                session_id = %self.session_id(),
+                account_id = %self.account_id(),
+                bytes = body.len(),
+                "received authenticated browser response text"
+            ),
+            Err(error) => tracing::warn!(
+                session_id = %self.session_id(),
+                account_id = %self.account_id(),
+                error = %error,
+                "authenticated browser response had no body"
+            ),
+        }
+        body
     }
 }
 
@@ -1239,6 +1365,15 @@ mod tests {
             &browser_environment("America/Los_Angeles")
         )
         .is_ok());
+    }
+
+    #[test]
+    fn safe_webdriver_error_messages_hide_response_bodies() {
+        let error = WebDriverError::Command(
+            "The WebDriver server returned an article body that must stay private".to_owned(),
+        );
+
+        assert_eq!(error.safe_message(), "WebDriver command failed");
     }
 
     #[tokio::test]

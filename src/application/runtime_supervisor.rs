@@ -241,6 +241,7 @@ pub struct RuntimeSupervisor {
 impl RuntimeSupervisor {
     /// Opens the configured PostgreSQL pool, applies pending migrations, and
     /// prepares the selected runtime roles.
+    #[tracing::instrument(skip_all, level = "debug")]
     pub async fn from_config(config: AppConfig) -> Result<Self, RuntimeSupervisorError> {
         let plan = Self::validated_plan(&config)?;
         let pool = connect_pool(&config)
@@ -250,6 +251,10 @@ impl RuntimeSupervisor {
             .await
             .map_err(RuntimeSupervisorError::Migration)?;
         let browser_pool = browser_pool_for_plan(&plan)?;
+        tracing::info!(
+            components = plan.components().len(),
+            "runtime supervisor initialized"
+        );
         Ok(Self {
             config,
             plan,
@@ -263,9 +268,14 @@ impl RuntimeSupervisor {
     ///
     /// This constructor is useful for tests and for deployments that run
     /// migrations as a separately authorized step.
+    #[tracing::instrument(skip_all, level = "debug")]
     pub fn new(config: AppConfig, pool: PgPool) -> Result<Self, RuntimeSupervisorError> {
         let plan = Self::validated_plan(&config)?;
         let browser_pool = browser_pool_for_plan(&plan)?;
+        tracing::debug!(
+            components = plan.components().len(),
+            "runtime supervisor created from existing pool"
+        );
         Ok(Self {
             config,
             plan,
@@ -287,6 +297,7 @@ impl RuntimeSupervisor {
     {
         self.credential_refresher = Some(Arc::new(refresher));
         self.plan.enable_credential_refresh();
+        tracing::info!("credential refresh transport enabled for runtime workers");
         self
     }
 
@@ -326,8 +337,14 @@ impl RuntimeSupervisor {
         shutdown: watch::Receiver<bool>,
     ) -> Result<(), RuntimeSupervisorError> {
         if *shutdown.borrow() {
+            tracing::debug!("runtime supervisor received an already-triggered shutdown");
             return Ok(());
         }
+
+        tracing::info!(
+            components = self.plan.components().len(),
+            "runtime supervisor starting roles"
+        );
 
         let (role_shutdown_tx, role_shutdown_rx) = watch::channel(false);
         let mut tasks = JoinSet::new();
@@ -337,6 +354,7 @@ impl RuntimeSupervisor {
                 RuntimeComponent::Api(api) => {
                     let listener = bind_listener(&api).await?;
                     let router = self.build_api_router()?;
+                    tracing::info!(bind = %listener.local_addr().map_or_else(|_| "unknown".to_owned(), |address| address.to_string()), "API role started");
                     let role_shutdown = role_shutdown_rx.clone();
                     tasks.spawn(async move {
                         axum::serve(
@@ -367,6 +385,7 @@ impl RuntimeSupervisor {
                         false => scheduler,
                     };
                     let role_shutdown = role_shutdown_rx.clone();
+                    tracing::info!("scheduler role started");
                     tasks.spawn(async move {
                         scheduler
                             .run_until_shutdown(role_shutdown, loop_config)
@@ -379,6 +398,7 @@ impl RuntimeSupervisor {
                         let loop_config = worker.loop_config();
                         let worker = self.build_worker(&worker, worker_index)?;
                         let role_shutdown = role_shutdown_rx.clone();
+                        tracing::info!(worker_index, "worker role started");
                         tasks.spawn(async move {
                             worker.run_until_shutdown(role_shutdown, loop_config).await;
                             Ok(())
@@ -393,8 +413,10 @@ impl RuntimeSupervisor {
             tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
+                        tracing::info!("runtime supervisor received shutdown; stopping roles");
                         let _ = role_shutdown_tx.send(true);
                         drain_tasks(tasks).await?;
+                        tracing::info!("runtime supervisor stopped all roles");
                         return Ok(());
                     }
                 }
@@ -402,6 +424,7 @@ impl RuntimeSupervisor {
                     let result = match joined {
                         Some(Ok(result)) => result,
                         Some(Err(error)) => {
+                            tracing::error!(error = %error, "runtime role task panicked; stopping all roles");
                             let _ = role_shutdown_tx.send(true);
                             drain_tasks(tasks).await?;
                             return Err(RuntimeSupervisorError::TaskJoin(error));
@@ -409,6 +432,7 @@ impl RuntimeSupervisor {
                         None => return Err(RuntimeSupervisorError::NoRuntimeTasks),
                     };
                     let error = result.err().unwrap_or(RuntimeSupervisorError::UnexpectedTaskExit);
+                    tracing::error!(error = %error, "runtime role exited unexpectedly; stopping all roles");
                     let _ = role_shutdown_tx.send(true);
                     drain_tasks(tasks).await?;
                     return Err(error);
@@ -419,6 +443,7 @@ impl RuntimeSupervisor {
 
     /// Runs selected roles until the operating system requests shutdown.
     pub async fn run_until_signal(self) -> Result<(), RuntimeSupervisorError> {
+        tracing::debug!("runtime supervisor waiting for shutdown signal");
         let (shutdown_tx, shutdown) = watch::channel(false);
         let runtime = tokio::spawn(self.run_until_shutdown(shutdown));
         tokio::pin!(runtime);
@@ -428,6 +453,7 @@ impl RuntimeSupervisor {
         tokio::select! {
             result = &mut runtime => result.map_err(RuntimeSupervisorError::TaskJoin)?,
             signal_result = &mut signal => {
+                tracing::info!("shutdown signal received");
                 let signal_result = signal_result.map_err(RuntimeSupervisorError::Signal);
                 let _ = shutdown_tx.send(true);
                 let runtime_result = runtime.await.map_err(RuntimeSupervisorError::TaskJoin)?;
@@ -732,9 +758,18 @@ async fn bind_listener(
     api: &super::runtime::ApiRuntimePlan,
 ) -> Result<TcpListener, RuntimeSupervisorError> {
     let address = listener_address(api.bind(), api.port());
-    TcpListener::bind(&address)
-        .await
-        .map_err(|error| RuntimeSupervisorError::HttpBind { address, error })
+    tracing::debug!(bind = %address, "binding API listener");
+    let result = TcpListener::bind(&address).await;
+    match result {
+        Ok(listener) => {
+            tracing::debug!(bind = %address, "API listener bound");
+            Ok(listener)
+        }
+        Err(error) => {
+            tracing::error!(bind = %address, error = %error, "unable to bind API listener");
+            Err(RuntimeSupervisorError::HttpBind { address, error })
+        }
+    }
 }
 
 fn listener_address(bind: &str, port: u16) -> String {

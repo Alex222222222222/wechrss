@@ -117,6 +117,8 @@ impl ArticlePageFetcher for WebDriverArticlePageFetcher {
         url: VerifiedWechatArticleUrl,
         mut session: PublicBrowserSession,
     ) -> Result<ExtractedArticlePage, ArticlePageError> {
+        let session_id = session.session_id();
+        tracing::debug!(session_id = %session_id, "starting public article extraction");
         let result = match &self.pacing {
             Some(pacing) => {
                 within_page_deadline(
@@ -129,13 +131,27 @@ impl ArticlePageFetcher for WebDriverArticlePageFetcher {
         };
         let cleanup_result = session.close_client().await;
         match (result, cleanup_result) {
-            (Ok(page), Ok(())) => Ok(page),
-            (Ok(_), Err(error)) => Err(ArticlePageError::Browser(format!(
-                "browser cleanup failed: {error}"
-            ))),
-            (Err(error), Ok(())) => Err(error),
+            (Ok(page), Ok(())) => {
+                tracing::info!(
+                    session_id = %session_id,
+                    content_bytes = page.content_html.len(),
+                    "public article extraction completed"
+                );
+                Ok(page)
+            }
+            (Ok(_), Err(error)) => {
+                tracing::warn!(session_id = %session_id, error = %error, "public article browser cleanup failed");
+                Err(ArticlePageError::Browser(format!(
+                    "browser cleanup failed: {error}"
+                )))
+            }
+            (Err(error), Ok(())) => {
+                tracing::warn!(session_id = %session_id, error = %error, "public article extraction failed");
+                Err(error)
+            }
             (Err(error), Err(cleanup_error)) => {
                 tracing::warn!(
+                    session_id = %session_id,
                     error = %cleanup_error,
                     "browser cleanup failed after article fetch error"
                 );
@@ -151,7 +167,13 @@ where
 {
     tokio::time::timeout(deadline, operation)
         .await
-        .map_err(|_| ArticlePageError::OperationTimedOut)?
+        .map_err(|_| {
+            tracing::warn!(
+                deadline_ms = deadline.as_millis(),
+                "public article operation timed out"
+            );
+            ArticlePageError::OperationTimedOut
+        })?
 }
 
 impl WebDriverArticlePageFetcher {
@@ -161,6 +183,7 @@ impl WebDriverArticlePageFetcher {
         session: &mut PublicBrowserSession,
         pacing: Option<&PacingController>,
     ) -> Result<ExtractedArticlePage, ArticlePageError> {
+        tracing::trace!(session_id = %session.session_id(), "navigating and extracting public article page");
         if let Some(pacing) = pacing {
             pacing.wait(DelayKind::PageNavigation).await;
         }
@@ -188,12 +211,16 @@ impl WebDriverArticlePageFetcher {
             pacing.wait(DelayKind::PageAction).await;
         }
         let html = session.source().await.map_err(map_webdriver_error)?;
-        parse_article_html(&html, canonical_url, self.timezone)
+        let result = parse_article_html(&html, canonical_url, self.timezone);
+        if let Err(error) = &result {
+            tracing::debug!(session_id = %session.session_id(), error = %error, "public article HTML did not produce an article");
+        }
+        result
     }
 }
 
 fn map_webdriver_error(error: WebDriverError) -> ArticlePageError {
-    ArticlePageError::Browser(error.to_string())
+    ArticlePageError::Browser(error.safe_message())
 }
 
 fn verify_final_url(final_url: url::Url) -> Result<VerifiedWechatArticleUrl, ArticlePageError> {

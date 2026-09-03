@@ -93,11 +93,42 @@ where
     L: FeedBuildLeaseRepository,
     U: FeedRebuildUnitOfWorkFactory,
 {
+    #[tracing::instrument(skip_all, level = "debug", fields(job_id = %lease.job.id()))]
     async fn execute(&self, lease: &JobLease, now: DateTime<Utc>) -> JobExecution {
-        match self.service.rebuild_for_job(lease).await {
-            Ok(outcome) => classify_outcome(outcome, now, self.config.retry_after()),
-            Err(error) => classify_error(&error, now, self.config.retry_after()),
-        }
+        tracing::debug!("starting feed rebuild job");
+        let execution = match self.service.rebuild_for_job(lease).await {
+            Ok(outcome) => {
+                tracing::info!(job_id = %lease.job.id(), outcome = ?outcome, "feed rebuild completed");
+                classify_outcome(outcome, now, self.config.retry_after())
+            }
+            Err(error) => {
+                let execution = classify_error(&error, now, self.config.retry_after());
+                match &execution {
+                    JobExecution::Failed { error: message } => tracing::error!(
+                        job_id = %lease.job.id(),
+                        error = %message,
+                        "feed rebuild reached a terminal failure"
+                    ),
+                    JobExecution::Retry {
+                        retry_at,
+                        error: message,
+                    } => tracing::warn!(
+                        job_id = %lease.job.id(),
+                        retry_at = %retry_at,
+                        error = %message,
+                        "feed rebuild will be retried"
+                    ),
+                    JobExecution::Deferred { resume_at } => tracing::debug!(
+                        job_id = %lease.job.id(),
+                        resume_at = %resume_at,
+                        "feed rebuild was deferred"
+                    ),
+                    JobExecution::Succeeded | JobExecution::Committed => {}
+                }
+                execution
+            }
+        };
+        execution
     }
 }
 

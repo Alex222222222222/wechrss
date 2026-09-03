@@ -423,6 +423,7 @@ where
 {
     /// Encrypts and stores credentials received from an operator or future
     /// interactive-login adapter.
+    #[tracing::instrument(skip_all, fields(account_id = %provision.account_id))]
     pub async fn provision(
         &self,
         provision: CredentialProvision,
@@ -441,6 +442,11 @@ where
                 provision.credentials.access_expires_at(),
             )
             .await?;
+        tracing::info!(
+            account_id = %record.account().account_id(),
+            access_expires_at = %record.account().access_expires_at(),
+            "WeRead account credentials provisioned"
+        );
         Ok(record.account().clone())
     }
 
@@ -449,20 +455,24 @@ where
         &self,
         account_id: WeReadAccountId,
     ) -> Result<WeReadAccount, AuthServiceError> {
-        Ok(self.load(account_id).await?.account().clone())
+        let account = self.load(account_id).await?.account().clone();
+        tracing::debug!(account_id = %account_id, "loaded WeRead account metadata");
+        Ok(account)
     }
 
     /// Returns non-secret metadata for every enrolled account, including
     /// disabled accounts for administrative status views.
     pub async fn list_accounts(&self) -> Result<Vec<WeReadAccount>, AuthServiceError> {
-        Ok(self
+        let accounts = self
             .dependencies
             .accounts
             .list_all()
             .await?
             .into_iter()
             .map(|record| record.account().clone())
-            .collect())
+            .collect::<Vec<_>>();
+        tracing::debug!(accounts = accounts.len(), "listed WeRead account metadata");
+        Ok(accounts)
     }
 
     /// Enables or disables an enrolled account without exposing credentials.
@@ -471,7 +481,7 @@ where
         account_id: WeReadAccountId,
         disabled: bool,
     ) -> Result<WeReadAccount, AuthServiceError> {
-        match self
+        let result = match self
             .dependencies
             .accounts
             .set_disabled(account_id, disabled)
@@ -482,18 +492,40 @@ where
                 Err(AuthServiceError::AccountNotFound { account_id })
             }
             Err(error) => Err(error.into()),
+        };
+        match &result {
+            Ok(_) => tracing::info!(
+                account_id = %account_id,
+                disabled,
+                "updated WeRead account enabled state"
+            ),
+            Err(error) => tracing::warn!(
+                account_id = %account_id,
+                error = %error,
+                "unable to update WeRead account enabled state"
+            ),
         }
+        result
     }
 
     /// Permanently deletes an enrolled account and any account lease row.
     pub async fn delete(&self, account_id: WeReadAccountId) -> Result<(), AuthServiceError> {
-        match self.dependencies.accounts.delete(account_id).await {
+        let result = match self.dependencies.accounts.delete(account_id).await {
             Ok(()) => Ok(()),
             Err(CredentialRepositoryError::NotFound { .. }) => {
                 Err(AuthServiceError::AccountNotFound { account_id })
             }
             Err(error) => Err(error.into()),
+        };
+        match &result {
+            Ok(()) => tracing::info!(account_id = %account_id, "deleted WeRead account"),
+            Err(error) => tracing::warn!(
+                account_id = %account_id,
+                error = %error,
+                "unable to delete WeRead account"
+            ),
         }
+        result
     }
 
     /// Loads and decrypts credentials for the authenticated acquisition
@@ -503,6 +535,7 @@ where
         &self,
         account_id: WeReadAccountId,
     ) -> Result<WeReadCredentials, AuthServiceError> {
+        tracing::trace!(account_id = %account_id, "loading WeRead credentials for acquisition");
         let record = self.load(account_id).await?;
         if record.account().disabled() {
             return Err(AuthServiceError::AccountDisabled { account_id });
@@ -515,11 +548,13 @@ where
     /// This is the operator re-authentication path. It uses the same fenced,
     /// version-checked repository operation as automatic refresh, so a manual
     /// update cannot overwrite a concurrent refresh or a lease takeover.
+    #[tracing::instrument(skip_all, fields(account_id = %provision.account_id))]
     pub async fn replace(
         &self,
         provision: CredentialProvision,
         owner: &str,
     ) -> Result<WeReadAccount, AuthServiceError> {
+        tracing::debug!("replacing WeRead account credentials");
         let Some(lease) = AccountLeaseGuard::acquire(
             self.dependencies.leases.clone(),
             provision.account_id,
@@ -563,6 +598,18 @@ where
         let release_result = lease.release().await;
         heartbeat_result.map_err(AuthServiceError::Lease)?;
         release_result.map_err(AuthServiceError::Lease)?;
+        match &result {
+            Ok(account) => tracing::info!(
+                account_id = %account.account_id(),
+                access_expires_at = %account.access_expires_at(),
+                "WeRead account credentials replaced"
+            ),
+            Err(error) => tracing::warn!(
+                account_id = %provision.account_id,
+                error = %error,
+                "unable to replace WeRead account credentials"
+            ),
+        }
         result
     }
 
@@ -572,6 +619,7 @@ where
     /// worker cannot suppress refreshes or write a future `updated_at`. The
     /// account lease is acquired before the second read and refresh, closing
     /// the race where two replicas observe the same expiry.
+    #[tracing::instrument(skip_all, fields(account_id = %account_id))]
     pub async fn refresh_if_needed(
         &self,
         account_id: WeReadAccountId,
@@ -584,6 +632,7 @@ where
         }
         let initial_credentials = self.decrypt(&initial)?;
         if !initial_credentials.needs_refresh(now, self.config.refresh_before) {
+            tracing::debug!(account_id = %account_id, "WeRead credentials do not need refresh");
             return Ok(AuthRefreshOutcome::Unchanged(initial.account().clone()));
         }
 
@@ -606,6 +655,21 @@ where
         let release_result = lease.release().await;
         heartbeat_result.map_err(AuthServiceError::Lease)?;
         release_result.map_err(AuthServiceError::Lease)?;
+        match &result {
+            Ok(AuthRefreshOutcome::Unchanged(_)) => {
+                tracing::debug!(account_id = %account_id, "WeRead credentials remained unchanged")
+            }
+            Ok(AuthRefreshOutcome::Refreshed(account)) => tracing::info!(
+                account_id = %account.account_id(),
+                access_expires_at = %account.access_expires_at(),
+                "refreshed WeRead credentials"
+            ),
+            Err(error) => tracing::warn!(
+                account_id = %account_id,
+                error = %error,
+                "unable to refresh WeRead credentials"
+            ),
+        }
         result
     }
 
@@ -721,8 +785,10 @@ where
     R: CredentialRefresher,
     C: CredentialCipher,
 {
+    #[tracing::instrument(skip_all, level = "debug", fields(job_id = %lease.job.id()))]
     pub(crate) async fn execute_job(&self, lease: &JobLease, now: DateTime<Utc>) -> JobExecution {
         if lease.job.job_type() != crate::domain::job::JobType::CredentialRefresh {
+            tracing::error!(job_id = %lease.job.id(), "credential refresh handler received an unsupported job type");
             return JobExecution::Failed {
                 error: "credential-refresh handler received an unsupported job type".to_owned(),
             };
@@ -735,17 +801,19 @@ where
             .and_then(|value| uuid::Uuid::parse_str(value).ok())
             .map(WeReadAccountId::from_uuid)
         else {
+            tracing::error!(job_id = %lease.job.id(), "credential refresh job has no valid account id");
             return JobExecution::Failed {
                 error: "credential-refresh job payload has no valid account id".to_owned(),
             };
         };
 
-        match self
+        let result = self
             .service
             .refresh_if_needed(account_id, &self.owner)
-            .await
-        {
+            .await;
+        let execution = match result {
             Ok(AuthRefreshOutcome::Unchanged(_) | AuthRefreshOutcome::Refreshed(_)) => {
+                tracing::info!(account_id = %account_id, "credential refresh job completed");
                 JobExecution::Succeeded
             }
             Err(AuthServiceError::AccountBusy { .. })
@@ -753,6 +821,7 @@ where
             | Err(AuthServiceError::Repository(CredentialRepositoryError::Conflict { .. }))
             | Err(AuthServiceError::Repository(CredentialRepositoryError::Backend(_)))
             | Err(AuthServiceError::Refresh(CredentialRefreshError::Transient)) => {
+                tracing::warn!(account_id = %account_id, "credential refresh is temporarily unavailable");
                 retry_at(now, self.retry_after)
             }
             Err(AuthServiceError::Refresh(CredentialRefreshError::AuthenticationRequired))
@@ -762,10 +831,14 @@ where
             | Err(AuthServiceError::AccountDisabled { .. })
             | Err(AuthServiceError::Repository(_))
             | Err(AuthServiceError::Cipher(_))
-            | Err(AuthServiceError::Credentials(_)) => JobExecution::Failed {
-                error: "credential refresh cannot complete for this account".to_owned(),
-            },
-        }
+            | Err(AuthServiceError::Credentials(_)) => {
+                tracing::error!(account_id = %account_id, "credential refresh reached a terminal failure");
+                JobExecution::Failed {
+                    error: "credential refresh cannot complete for this account".to_owned(),
+                }
+            }
+        };
+        execution
     }
 }
 

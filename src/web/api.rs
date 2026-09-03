@@ -89,7 +89,9 @@ struct FeedApiState<R, C, Q> {
 }
 
 /// Reports that this process is alive without contacting any dependency.
+#[tracing::instrument(skip_all, level = "trace")]
 async fn liveness() -> impl IntoResponse {
+    tracing::trace!("liveness probe succeeded");
     (StatusCode::OK, Json(json!({ "status": "ok" })))
 }
 
@@ -98,21 +100,26 @@ async fn liveness() -> impl IntoResponse {
 /// The response intentionally contains only stable component status and the
 /// configured timezone. Database errors are not returned to callers because
 /// they may contain connection details.
+#[tracing::instrument(skip_all, level = "debug")]
 async fn readiness<R, C, Q>(State(state): State<Arc<FeedApiState<R, C, Q>>>) -> Response
 where
     R: FeedTokenRepository + 'static,
     C: FeedCacheRepository + 'static,
     Q: FeedRebuildQueue + 'static,
 {
-    let database_available = sqlx::query_scalar::<_, i32>("SELECT 1")
+    let database_check = sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.pool)
-        .await
-        .is_ok_and(|value| value == 1);
+        .await;
+    let database_available = database_check.as_ref().is_ok_and(|value| *value == 1);
+    if let Err(error) = &database_check {
+        tracing::warn!(error = %error, "readiness database check failed");
+    }
     let (status, database, status_code) = if database_available {
         ("ready", "ready", StatusCode::OK)
     } else {
         ("not_ready", "unavailable", StatusCode::SERVICE_UNAVAILABLE)
     };
+    tracing::debug!(status, database, "readiness probe completed");
 
     (
         status_code,
@@ -135,6 +142,7 @@ where
     C: FeedCacheRepository + 'static,
     Q: FeedRebuildQueue + 'static,
 {
+    tracing::trace!("handling feed request");
     let Some(feed_token) = feed_path
         .strip_suffix(".xml")
         .filter(|token| !token.is_empty() && !token.contains('/'))
@@ -145,12 +153,15 @@ where
     let source_id = match state.token_service.resolve(feed_token).await {
         Ok(Some(source_id)) => source_id,
         Ok(None) | Err(FeedTokenServiceError::InvalidToken) => {
+            tracing::debug!("feed request used an unknown or invalid token");
             return empty_response(StatusCode::NOT_FOUND);
         }
         Err(FeedTokenServiceError::Repository(_)) => {
+            tracing::warn!("feed token lookup failed");
             return empty_response(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
+    tracing::debug!(source_id = %source_id, "resolved feed token");
 
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
@@ -159,19 +170,26 @@ where
     let request = crate::application::feed_service::FeedRequest::new(source_id, if_none_match);
 
     match state.feed_service.get_feed(request).await {
-        Ok(FeedDelivery::Cached { cache, status, .. }) => cached_response(
-            StatusCode::OK,
-            cache,
-            status,
-            state.feed_service.stale_while_revalidate(),
-        ),
-        Ok(FeedDelivery::NotModified { cache, status, .. }) => cached_response(
-            StatusCode::NOT_MODIFIED,
-            cache,
-            status,
-            state.feed_service.stale_while_revalidate(),
-        ),
+        Ok(FeedDelivery::Cached { cache, status, .. }) => {
+            tracing::debug!(source_id = %source_id, status = ?status, "serving cached feed");
+            cached_response(
+                StatusCode::OK,
+                cache,
+                status,
+                state.feed_service.stale_while_revalidate(),
+            )
+        }
+        Ok(FeedDelivery::NotModified { cache, status, .. }) => {
+            tracing::debug!(source_id = %source_id, status = ?status, "feed is not modified");
+            cached_response(
+                StatusCode::NOT_MODIFIED,
+                cache,
+                status,
+                state.feed_service.stale_while_revalidate(),
+            )
+        }
         Ok(FeedDelivery::Unavailable { retry_after, .. }) => {
+            tracing::debug!(source_id = %source_id, retry_after_seconds = retry_after.num_seconds(), "feed cache is unavailable");
             let mut response = empty_response(StatusCode::SERVICE_UNAVAILABLE);
             let value = HeaderValue::try_from(retry_after_seconds(retry_after).to_string())
                 .expect("numeric Retry-After values are valid headers");
@@ -179,6 +197,7 @@ where
             response
         }
         Err(FeedServiceError::InvalidSourceId | FeedServiceError::Cache(_)) => {
+            tracing::warn!(source_id = %source_id, "feed delivery failed");
             empty_response(StatusCode::SERVICE_UNAVAILABLE)
         }
     }

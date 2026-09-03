@@ -164,9 +164,19 @@ where
         owner: &str,
         lease_for: Duration,
     ) -> Result<Option<Self>, AccountLeaseError> {
-        let Some(lease) = repository.acquire(account_id, owner, lease_for).await? else {
+        tracing::trace!(account_id = %account_id, "acquiring WeRead account lease");
+        let acquired = match repository.acquire(account_id, owner, lease_for).await {
+            Ok(acquired) => acquired,
+            Err(error) => {
+                tracing::warn!(account_id = %account_id, error = %error, "unable to acquire WeRead account lease");
+                return Err(error);
+            }
+        };
+        let Some(lease) = acquired else {
+            tracing::debug!(account_id = %account_id, "WeRead account lease is held by another worker");
             return Ok(None);
         };
+        tracing::debug!(account_id = %account_id, "acquired WeRead account lease");
         Ok(Some(Self {
             repository,
             lease,
@@ -222,10 +232,12 @@ where
         {
             Ok(lease) => {
                 self.lease = lease;
+                tracing::trace!(account_id = %account_id, "heartbeated WeRead account lease");
                 Ok(())
             }
             Err(error) => {
                 self.cancelled.store(true, Ordering::Release);
+                tracing::warn!(account_id = %account_id, error = %error, "lost WeRead account lease heartbeat");
                 Err(error)
             }
         }
@@ -297,9 +309,17 @@ where
             cancelled,
         } = self;
         cancelled.store(true, Ordering::Release);
-        repository
+        let account_id = lease.account_id();
+        let result = repository
             .release(lease.account_id(), lease.owner(), lease.token())
-            .await
+            .await;
+        match &result {
+            Ok(()) => tracing::debug!(account_id = %account_id, "released WeRead account lease"),
+            Err(error) => {
+                tracing::warn!(account_id = %account_id, error = %error, "unable to release WeRead account lease")
+            }
+        }
+        result
     }
 
     pub(crate) fn into_session(
@@ -351,12 +371,15 @@ impl BrowserPool {
 
     /// Acquires a clean, unauthenticated public browser capability.
     pub async fn open_public(&self) -> Result<PublicBrowserSession, BrowserPoolError> {
-        let permit = self
-            .permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| BrowserPoolError::Closed)?;
+        tracing::trace!("acquiring public browser capacity");
+        let permit = match self.permits.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                tracing::warn!(error = %error, "public browser capacity is closed");
+                return Err(BrowserPoolError::Closed);
+            }
+        };
+        tracing::debug!("acquired public browser capacity");
         Ok(PublicBrowserSession::from_permit(permit))
     }
 
@@ -376,17 +399,21 @@ impl BrowserPool {
     where
         R: AccountLeaseStore,
     {
-        let permit = self
-            .permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| BrowserPoolError::Closed)?;
+        tracing::trace!(account_id = %account_id, "acquiring authenticated browser capacity");
+        let permit = match self.permits.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                tracing::warn!(account_id = %account_id, error = %error, "authenticated browser capacity is closed");
+                return Err(BrowserPoolError::Closed);
+            }
+        };
         let Some(guard) =
             AccountLeaseGuard::acquire(repository, account_id, owner, lease_for).await?
         else {
+            tracing::debug!(account_id = %account_id, "authenticated browser capacity acquired but account lease is unavailable");
             return Ok(None);
         };
+        tracing::debug!(account_id = %account_id, "acquired authenticated browser capacity");
         Ok(Some(guard.into_session(permit)))
     }
 }

@@ -243,6 +243,7 @@ struct SetEnabledRequest {
     enabled: bool,
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn root_redirect() -> Redirect {
     Redirect::temporary("/admin/")
 }
@@ -259,6 +260,7 @@ impl From<crate::domain::credentials::WeReadAccount> for WeReadAccountResponse {
     }
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn login(
     State(state): State<Arc<AdminApiState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -272,6 +274,7 @@ async fn login(
         Utc::now(),
     ) {
         Ok((session, cookie)) => {
+            tracing::info!("administrator login succeeded");
             let mut response = Json(LoginResponse {
                 username: session.username().to_owned(),
                 csrf_token: session.csrf_token().to_owned(),
@@ -285,10 +288,14 @@ async fn login(
             );
             response
         }
-        Err(error) => auth_error_response(error),
+        Err(error) => {
+            tracing::warn!(error = %error, "administrator login failed");
+            auth_error_response(error)
+        }
     }
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn logout(State(state): State<Arc<AdminApiState>>, headers: HeaderMap) -> Response {
     let session = match authenticate(&state.auth, &headers) {
         Ok(session) => session,
@@ -302,9 +309,11 @@ async fn logout(State(state): State<Arc<AdminApiState>>, headers: HeaderMap) -> 
         header::SET_COOKIE,
         HeaderValue::from_static(AdminAuthenticator::clear_cookie()),
     );
+    tracing::info!("administrator logout succeeded");
     response
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn provision_weread_account(
     State(state): State<Arc<AdminApiState>>,
     headers: HeaderMap,
@@ -335,15 +344,22 @@ async fn provision_weread_account(
         })
         .await
     {
-        Ok(account) => (
-            StatusCode::CREATED,
-            Json(WeReadAccountResponse::from(account)),
-        )
-            .into_response(),
-        Err(error) => auth_service_error_response(error),
+        Ok(account) => {
+            tracing::info!(account_id = %account.account_id(), "administrator provisioned a WeRead account");
+            (
+                StatusCode::CREATED,
+                Json(WeReadAccountResponse::from(account)),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "administrator could not provision a WeRead account");
+            auth_service_error_response(error)
+        }
     }
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn replace_weread_account(
     State(state): State<Arc<AdminApiState>>,
     Path(account_id): Path<String>,
@@ -384,11 +400,18 @@ async fn replace_weread_account(
         )
         .await
     {
-        Ok(account) => Json(WeReadAccountResponse::from(account)).into_response(),
-        Err(error) => auth_service_error_response(error),
+        Ok(account) => {
+            tracing::info!(account_id = %account.account_id(), "administrator replaced a WeRead account credential");
+            Json(WeReadAccountResponse::from(account)).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "administrator could not replace a WeRead account credential");
+            auth_service_error_response(error)
+        }
     }
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn list_weread_accounts(
     State(state): State<Arc<AdminApiState>>,
     headers: HeaderMap,
@@ -398,18 +421,27 @@ async fn list_weread_accounts(
     }
     let now = Utc::now();
     match state.weread_auth.list_accounts().await {
-        Ok(accounts) => Json(
-            accounts
-                .into_iter()
-                .map(|account| WeReadAccountListResponse {
-                    account_id: account.account_id().as_uuid(),
-                    display_name: account.display_name().to_owned(),
-                    status: weread_account_status(&account, now),
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Err(error) => auth_service_error_response(error),
+        Ok(accounts) => {
+            tracing::debug!(
+                accounts = accounts.len(),
+                "administrator listed WeRead accounts"
+            );
+            Json(
+                accounts
+                    .into_iter()
+                    .map(|account| WeReadAccountListResponse {
+                        account_id: account.account_id().as_uuid(),
+                        display_name: account.display_name().to_owned(),
+                        status: weread_account_status(&account, now),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .into_response()
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "administrator could not list WeRead accounts");
+            auth_service_error_response(error)
+        }
     }
 }
 
@@ -503,6 +535,7 @@ fn display_name_from_request(
     Ok(display_name.to_owned())
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn get_weread_account(
     State(state): State<Arc<AdminApiState>>,
     Path(account_id): Path<String>,
@@ -516,12 +549,19 @@ async fn get_weread_account(
         _ => return validation_error("account_id must be a non-nil UUID"),
     };
     match state.weread_auth.account(account_id).await {
-        Ok(account) => Json(WeReadAccountResponse::from(account)).into_response(),
+        Ok(account) => {
+            tracing::debug!(account_id = %account.account_id(), "administrator loaded WeRead account");
+            Json(WeReadAccountResponse::from(account)).into_response()
+        }
         Err(AuthServiceError::AccountNotFound { .. }) => not_found("WeRead account"),
-        Err(error) => auth_service_error_response(error),
+        Err(error) => {
+            tracing::warn!(account_id = %account_id, error = %error, "administrator could not load WeRead account");
+            auth_service_error_response(error)
+        }
     }
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn set_weread_account_enabled(
     State(state): State<Arc<AdminApiState>>,
     Path(account_id): Path<String>,
@@ -541,11 +581,18 @@ async fn set_weread_account_enabled(
         .set_disabled(account_id, !request.enabled)
         .await
     {
-        Ok(account) => Json(WeReadAccountResponse::from(account)).into_response(),
-        Err(error) => auth_service_error_response(error),
+        Ok(account) => {
+            tracing::info!(account_id = %account.account_id(), enabled = request.enabled, "administrator changed WeRead account enabled state");
+            Json(WeReadAccountResponse::from(account)).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(account_id = %account_id, error = %error, "administrator could not change WeRead account enabled state");
+            auth_service_error_response(error)
+        }
     }
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn delete_weread_account(
     State(state): State<Arc<AdminApiState>>,
     Path(account_id): Path<String>,
@@ -560,11 +607,18 @@ async fn delete_weread_account(
         Err(response) => return *response,
     };
     match state.weread_auth.delete(account_id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => auth_service_error_response(error),
+        Ok(()) => {
+            tracing::info!(account_id = %account_id, "administrator deleted WeRead account");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => {
+            tracing::warn!(account_id = %account_id, error = %error, "administrator could not delete WeRead account");
+            auth_service_error_response(error)
+        }
     }
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn weread_account_page(
     State(state): State<Arc<AdminApiState>>,
     Path(account_id): Path<String>,
@@ -587,6 +641,7 @@ async fn weread_account_page(
     }
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn weread_accounts_page(
     State(state): State<Arc<AdminApiState>>,
     headers: HeaderMap,
@@ -609,22 +664,30 @@ fn parse_account_id(value: &str) -> Result<WeReadAccountId, Box<Response>> {
     }
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn list_sources(State(state): State<Arc<AdminApiState>>, headers: HeaderMap) -> Response {
     if let Err(error) = authenticate(&state.auth, &headers) {
         return auth_error_response(error);
     }
     match state.sources.list().await {
-        Ok(sources) => Json(
-            sources
-                .into_iter()
-                .map(SourceResponse::from)
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Err(error) => application_error_response(error),
+        Ok(sources) => {
+            tracing::debug!(sources = sources.len(), "administrator listed sources");
+            Json(
+                sources
+                    .into_iter()
+                    .map(SourceResponse::from)
+                    .collect::<Vec<_>>(),
+            )
+            .into_response()
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "administrator could not list sources");
+            application_error_response(error)
+        }
     }
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn get_source(
     State(state): State<Arc<AdminApiState>>,
     Path(source_id): Path<String>,
@@ -638,9 +701,15 @@ async fn get_source(
         Err(response) => return *response,
     };
     match state.sources.find(source_id).await {
-        Ok(Some(source)) => Json(SourceResponse::from(source)).into_response(),
+        Ok(Some(source)) => {
+            tracing::debug!(source_id = %source_id, "administrator loaded source");
+            Json(SourceResponse::from(source)).into_response()
+        }
         Ok(None) => not_found("source"),
-        Err(error) => application_error_response(error),
+        Err(error) => {
+            tracing::warn!(source_id = %source_id, error = %error, "administrator could not load source");
+            application_error_response(error)
+        }
     }
 }
 
@@ -677,6 +746,7 @@ struct UpdateSourceRequest {
     max_attempts: Option<u32>,
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn create_source(
     State(state): State<Arc<AdminApiState>>,
     headers: HeaderMap,
@@ -750,11 +820,18 @@ async fn create_source(
         max_attempts: request.max_attempts.unwrap_or(3),
     };
     match state.sources.create(source).await {
-        Ok(source) => (StatusCode::CREATED, Json(SourceResponse::from(source))).into_response(),
-        Err(error) => application_error_response(error),
+        Ok(source) => {
+            tracing::info!(source_id = %source.id(), "administrator created source");
+            (StatusCode::CREATED, Json(SourceResponse::from(source))).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "administrator could not create source");
+            application_error_response(error)
+        }
     }
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn update_source(
     State(state): State<Arc<AdminApiState>>,
     Path(source_id): Path<String>,
@@ -799,11 +876,18 @@ async fn update_source(
         max_attempts: request.max_attempts,
     };
     match state.sources.update(source_id, patch).await {
-        Ok(source) => Json(SourceResponse::from(source)).into_response(),
-        Err(error) => application_error_response(error),
+        Ok(source) => {
+            tracing::info!(source_id = %source_id, "administrator updated source");
+            Json(SourceResponse::from(source)).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(source_id = %source_id, error = %error, "administrator could not update source");
+            application_error_response(error)
+        }
     }
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn delete_source(
     State(state): State<Arc<AdminApiState>>,
     Path(source_id): Path<String>,
@@ -818,8 +902,14 @@ async fn delete_source(
         Err(response) => return *response,
     };
     match state.sources.delete(source_id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => application_error_response(error),
+        Ok(()) => {
+            tracing::info!(source_id = %source_id, "administrator deleted source");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => {
+            tracing::warn!(source_id = %source_id, error = %error, "administrator could not delete source");
+            application_error_response(error)
+        }
     }
 }
 
@@ -848,6 +938,7 @@ struct EnabledRequest {
     enabled: bool,
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn set_enabled(
     State(state): State<Arc<AdminApiState>>,
     Path(source_id): Path<String>,
@@ -864,8 +955,14 @@ async fn set_enabled(
     };
     let _ = session;
     match state.sources.set_enabled(source_id, request.enabled).await {
-        Ok(source) => Json(SourceResponse::from(source)).into_response(),
-        Err(error) => application_error_response(error),
+        Ok(source) => {
+            tracing::info!(source_id = %source_id, enabled = request.enabled, "administrator changed source enabled state");
+            Json(SourceResponse::from(source)).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(source_id = %source_id, error = %error, "administrator could not change source enabled state");
+            application_error_response(error)
+        }
     }
 }
 
@@ -874,6 +971,7 @@ struct GateRequest {
     gate: SchedulingGate,
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn set_gate(
     State(state): State<Arc<AdminApiState>>,
     Path(source_id): Path<String>,
@@ -893,11 +991,18 @@ async fn set_gate(
         .set_scheduling_gate(source_id, request.gate)
         .await
     {
-        Ok(source) => Json(SourceResponse::from(source)).into_response(),
-        Err(error) => application_error_response(error),
+        Ok(source) => {
+            tracing::info!(source_id = %source_id, gate = ?request.gate, "administrator changed source scheduling gate");
+            Json(SourceResponse::from(source)).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(source_id = %source_id, error = %error, "administrator could not change source scheduling gate");
+            application_error_response(error)
+        }
     }
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn issue_feed_token(
     State(state): State<Arc<AdminApiState>>,
     Path(source_id): Path<String>,
@@ -913,6 +1018,7 @@ async fn issue_feed_token(
     };
     match state.feed_tokens.issue(source_id).await {
         Ok(token) => {
+            tracing::info!(source_id = %source_id, "administrator issued a feed token");
             let feed_path = format!("/feeds/{}.xml", token.as_str());
             let feed_url = state
                 .server_root_url
@@ -924,7 +1030,10 @@ async fn issue_feed_token(
             }))
             .into_response()
         }
-        Err(error) => feed_token_error_response(error),
+        Err(error) => {
+            tracing::warn!(source_id = %source_id, error = %error, "administrator could not issue a feed token");
+            feed_token_error_response(error)
+        }
     }
 }
 
@@ -942,6 +1051,7 @@ struct HistoryQuery {
     limit: Option<u32>,
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn list_sync_runs(
     State(state): State<Arc<AdminApiState>>,
     Path(source_id): Path<String>,
@@ -963,21 +1073,29 @@ async fn list_sync_runs(
         Ok(None) => not_found("source"),
         Err(error) => application_error_response(error),
         Ok(Some(_)) => match state.sync_runs.list_for_source(source_id, limit).await {
-            Ok(runs) => Json(
-                runs.into_iter()
-                    .map(SyncRunResponse::from)
-                    .collect::<Vec<_>>(),
-            )
-            .into_response(),
-            Err(error) => sync_run_error_response(error),
+            Ok(runs) => {
+                tracing::debug!(source_id = %source_id, runs = runs.len(), "administrator listed synchronization runs");
+                Json(
+                    runs.into_iter()
+                        .map(SyncRunResponse::from)
+                        .collect::<Vec<_>>(),
+                )
+                .into_response()
+            }
+            Err(error) => {
+                tracing::warn!(source_id = %source_id, error = %error, "administrator could not list synchronization runs");
+                sync_run_error_response(error)
+            }
         },
     }
 }
 
+#[tracing::instrument(skip_all, level = "trace")]
 async fn login_page() -> impl IntoResponse {
     ui::login_page()
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn admin_page(State(state): State<Arc<AdminApiState>>, headers: HeaderMap) -> Response {
     match authenticate(&state.auth, &headers) {
         Ok(session) => ui::admin_page(&session).into_response(),
@@ -985,6 +1103,7 @@ async fn admin_page(State(state): State<Arc<AdminApiState>>, headers: HeaderMap)
     }
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn source_page(
     State(state): State<Arc<AdminApiState>>,
     Path(source_id): Path<String>,
@@ -1018,12 +1137,16 @@ fn protected_mutation(
 }
 
 fn authenticate(auth: &AdminAuthenticator, headers: &HeaderMap) -> Result<AdminSession, AuthError> {
-    auth.authenticate_cookie(
+    let result = auth.authenticate_cookie(
         headers
             .get(header::COOKIE)
             .and_then(|value| value.to_str().ok()),
         Utc::now(),
-    )
+    );
+    if let Err(error) = &result {
+        tracing::debug!(error = %error, "admin request did not have a valid session");
+    }
+    result
 }
 
 fn csrf(
@@ -1031,12 +1154,16 @@ fn csrf(
     session: &AdminSession,
     headers: &HeaderMap,
 ) -> Result<(), AuthError> {
-    auth.verify_csrf(
+    let result = auth.verify_csrf(
         session,
         headers
             .get("x-csrf-token")
             .and_then(|value| value.to_str().ok()),
-    )
+    );
+    if let Err(error) = &result {
+        tracing::warn!(error = %error, "admin mutation failed CSRF validation");
+    }
+    result
 }
 
 fn client_key(peer: SocketAddr) -> String {
@@ -1137,6 +1264,7 @@ impl From<SyncRun> for SyncRunResponse {
 }
 
 fn auth_error_response(error: AuthError) -> Response {
+    tracing::debug!(error = %error, "returning admin authentication error");
     let status = match error {
         AuthError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         AuthError::InvalidCsrf => StatusCode::FORBIDDEN,
@@ -1154,6 +1282,7 @@ fn validation_error(message: impl Into<String>) -> Response {
 }
 
 fn identity_error_response(error: IdentityError) -> Response {
+    tracing::warn!(error = %error, "returning article identity resolution error");
     let status = match error {
         IdentityError::Browser(_) => StatusCode::SERVICE_UNAVAILABLE,
         IdentityError::InvalidArticleUrl(_)
@@ -1166,6 +1295,7 @@ fn identity_error_response(error: IdentityError) -> Response {
 }
 
 fn auth_service_error_response(error: AuthServiceError) -> Response {
+    tracing::warn!(error = %error, "returning WeRead account service error");
     let status = match error {
         AuthServiceError::AccountNotFound { .. } => StatusCode::NOT_FOUND,
         AuthServiceError::Repository(
@@ -1211,6 +1341,7 @@ fn not_found(resource: &str) -> Response {
 }
 
 fn application_error_response(error: SourceServiceError) -> Response {
+    tracing::warn!(error = %error, "returning source service error");
     let status = match &error {
         SourceServiceError::Source(SourceRepositoryError::BookIdConflict { .. }) => {
             StatusCode::CONFLICT
@@ -1235,6 +1366,7 @@ fn application_error_response(error: SourceServiceError) -> Response {
 }
 
 fn feed_token_error_response(error: FeedTokenServiceError) -> Response {
+    tracing::warn!(error = %error, "returning feed token service error");
     let status = match &error {
         FeedTokenServiceError::Repository(FeedTokenRepositoryError::SourceNotFound { .. }) => {
             StatusCode::NOT_FOUND
@@ -1259,6 +1391,7 @@ fn feed_token_error_response(error: FeedTokenServiceError) -> Response {
 }
 
 fn sync_run_error_response(error: SyncRunRepositoryError) -> Response {
+    tracing::warn!(error = %error, "returning synchronization history error");
     let status = match error {
         SyncRunRepositoryError::InvalidLimit => StatusCode::UNPROCESSABLE_ENTITY,
         SyncRunRepositoryError::NotFound { .. } => StatusCode::NOT_FOUND,

@@ -160,7 +160,25 @@ where
 {
     /// Enqueues work using the repository's active-job deduplication.
     pub async fn enqueue(&self, spec: NewJob) -> Result<EnqueueResult, JobServiceError> {
-        Ok(self.queue.enqueue(spec).await?)
+        tracing::debug!(job_type = ?spec.job_type, source_id = ?spec.source_id, "enqueueing durable job");
+        let result = self
+            .queue
+            .enqueue(spec)
+            .await
+            .map_err(JobServiceError::from);
+        match &result {
+            Ok(EnqueueResult::Inserted(job)) => tracing::info!(
+                job_id = %job.id(),
+                job_type = ?job.job_type(),
+                "durable job enqueued"
+            ),
+            Ok(EnqueueResult::AlreadyActive { job_id }) => tracing::debug!(
+                job_id = %job_id,
+                "durable job already active"
+            ),
+            Err(error) => tracing::warn!(error = %error, "unable to enqueue durable job"),
+        }
+        result
     }
 
     /// Claims one due job of an allowed type.
@@ -169,7 +187,7 @@ where
         now: DateTime<Utc>,
         allowed_job_types: &[JobType],
     ) -> Result<Option<JobLease>, JobServiceError> {
-        Ok(self
+        let result = self
             .queue
             .claim_next(
                 self.config.owner(),
@@ -177,12 +195,27 @@ where
                 self.config.lease_for(),
                 allowed_job_types,
             )
-            .await?)
+            .await
+            .map_err(JobServiceError::from);
+        match &result {
+            Ok(Some(lease)) => tracing::debug!(
+                job_id = %lease.job.id(),
+                job_type = ?lease.job.job_type(),
+                "claimed durable job"
+            ),
+            Ok(None) => tracing::trace!("no due durable job was claimable"),
+            Err(error) => tracing::warn!(error = %error, "unable to claim durable job"),
+        }
+        result
     }
 
     /// Reads one job snapshot through the queue's read port.
     pub async fn find(&self, job_id: Uuid) -> Result<Option<Job>, JobServiceError> {
-        Ok(self.queue.find(job_id).await?)
+        let result = self.queue.find(job_id).await.map_err(JobServiceError::from);
+        if let Err(error) = &result {
+            tracing::warn!(job_id = %job_id, error = %error, "unable to read durable job");
+        }
+        result
     }
 
     /// Heartbeats a lease using this service's owner and the lease's token.
@@ -191,7 +224,7 @@ where
         lease: &JobLease,
         now: DateTime<Utc>,
     ) -> Result<Job, JobServiceError> {
-        Ok(self
+        let result = self
             .queue
             .heartbeat(
                 lease.job.id(),
@@ -200,15 +233,29 @@ where
                 now,
                 self.config.lease_for(),
             )
-            .await?)
+            .await
+            .map_err(JobServiceError::from);
+        match &result {
+            Ok(_) => tracing::trace!(job_id = %lease.job.id(), "heartbeated durable job"),
+            Err(error) => {
+                tracing::warn!(job_id = %lease.job.id(), error = %error, "unable to heartbeat durable job")
+            }
+        }
+        result
     }
 
     /// Recovers up to the configured number of expired running jobs.
     pub async fn recover_expired(&self, now: DateTime<Utc>) -> Result<Vec<Job>, JobServiceError> {
-        Ok(self
+        let result = self
             .queue
             .recover_expired(now, self.config.recovery_batch_limit())
-            .await?)
+            .await
+            .map_err(JobServiceError::from);
+        match &result {
+            Ok(jobs) => tracing::info!(jobs = jobs.len(), "recovered expired durable jobs"),
+            Err(error) => tracing::warn!(error = %error, "unable to recover expired durable jobs"),
+        }
+        result
     }
 
     /// Applies a successful outcome through a caller-owned transaction.

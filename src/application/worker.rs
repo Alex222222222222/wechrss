@@ -384,6 +384,7 @@ where
     /// `now` is the compatibility/test clock accepted by the queue port. The
     /// PostgreSQL adapter makes lease decisions with its own statement-local
     /// clock; the in-memory adapter uses this value deterministically.
+    #[tracing::instrument(skip_all, level = "debug", fields(now = %now))]
     pub async fn run_once(&self, now: DateTime<Utc>) -> Result<WorkerRun, WorkerError> {
         let Some(lease) = self
             .jobs
@@ -391,10 +392,44 @@ where
             .await
             .map_err(WorkerError::Job)?
         else {
+            tracing::debug!("worker found no claimable jobs");
             return Ok(WorkerRun::Idle);
         };
 
+        tracing::debug!(
+            job_id = %lease.job.id(),
+            job_type = ?lease.job.job_type(),
+            "worker claimed job"
+        );
+
         let outcome = self.execute_with_heartbeats(&lease, now).await?;
+        match &outcome {
+            JobExecution::Succeeded | JobExecution::Committed => tracing::info!(
+                job_id = %lease.job.id(),
+                job_type = ?lease.job.job_type(),
+                outcome = execution_kind(&outcome),
+                "worker completed job"
+            ),
+            JobExecution::Deferred { resume_at } => tracing::debug!(
+                job_id = %lease.job.id(),
+                job_type = ?lease.job.job_type(),
+                resume_at = %resume_at,
+                "worker deferred job"
+            ),
+            JobExecution::Retry { retry_at, error } => tracing::warn!(
+                job_id = %lease.job.id(),
+                job_type = ?lease.job.job_type(),
+                retry_at = %retry_at,
+                error = %error,
+                "worker scheduled a job retry"
+            ),
+            JobExecution::Failed { error } => tracing::error!(
+                job_id = %lease.job.id(),
+                job_type = ?lease.job.job_type(),
+                error = %error,
+                "worker reached a terminal job failure"
+            ),
+        }
         let completed = if outcome == JobExecution::Committed {
             self.jobs
                 .find(lease.job.id())
@@ -440,9 +475,21 @@ where
         mut shutdown: tokio::sync::watch::Receiver<bool>,
         loop_config: WorkerLoopConfig,
     ) -> WorkerLoopStats {
+        tracing::info!(
+            allowed_job_types = ?self.config.allowed_job_types(),
+            heartbeat_every_ms = self.config.heartbeat_every().as_millis(),
+            "worker loop started"
+        );
         let mut stats = WorkerLoopStats::default();
         loop {
             if shutdown.has_changed().is_err() || *shutdown.borrow() {
+                tracing::info!(
+                    passes = stats.passes,
+                    completed = stats.completed,
+                    idle = stats.idle,
+                    errors = stats.errors,
+                    "worker loop stopped"
+                );
                 return stats;
             }
 
@@ -467,6 +514,13 @@ where
                 tokio::select! {
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
+                            tracing::info!(
+                                passes = stats.passes,
+                                completed = stats.completed,
+                                idle = stats.idle,
+                                errors = stats.errors,
+                                "worker loop stopped"
+                            );
                             return stats;
                         }
                     }
@@ -483,6 +537,7 @@ where
         lease: &JobLease,
         now: DateTime<Utc>,
     ) -> Result<JobExecution, WorkerError> {
+        tracing::debug!(job_id = %lease.job.id(), "worker started job handler");
         let mut ticker = time::interval_at(
             Instant::now() + self.config.heartbeat_every(),
             self.config.heartbeat_every(),
@@ -500,7 +555,17 @@ where
                     tokio::select! {
                         outcome = &mut handler => return Ok(outcome),
                         result = &mut heartbeat => {
-                            result.map_err(WorkerError::Heartbeat)?;
+                            match result {
+                                Ok(_) => tracing::trace!(job_id = %lease.job.id(), "worker heartbeated job lease"),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        job_id = %lease.job.id(),
+                                        error = %error,
+                                        "worker lost the job lease heartbeat"
+                                    );
+                                    return Err(WorkerError::Heartbeat(error));
+                                }
+                            }
                         }
                     }
                 }
@@ -531,6 +596,16 @@ where
             }
             JobExecution::Failed { error } => self.jobs.fail(transaction, lease, now, error).await,
         }
+    }
+}
+
+fn execution_kind(execution: &JobExecution) -> &'static str {
+    match execution {
+        JobExecution::Succeeded => "succeeded",
+        JobExecution::Committed => "committed",
+        JobExecution::Deferred { .. } => "deferred",
+        JobExecution::Retry { .. } => "retry",
+        JobExecution::Failed { .. } => "failed",
     }
 }
 

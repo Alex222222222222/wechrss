@@ -118,10 +118,15 @@ impl UnitOfWorkFactory {
 
     /// Begins a transaction whose repository views share one commit boundary.
     pub async fn begin(&self) -> Result<UnitOfWork<'_>, UnitOfWorkError> {
-        let jobs = PostgresJobTransaction::begin(&self.pool)
+        tracing::trace!("beginning PostgreSQL unit of work");
+        let result = PostgresJobTransaction::begin(&self.pool)
             .await
-            .map_err(UnitOfWorkError::Transaction)?;
-        Ok(UnitOfWork { jobs })
+            .map(|jobs| UnitOfWork { jobs })
+            .map_err(UnitOfWorkError::Transaction);
+        if let Err(error) = &result {
+            tracing::warn!(error = %error, "unable to begin PostgreSQL unit of work");
+        }
+        result
     }
 
     /// Samples PostgreSQL's wall clock without opening a long-lived transaction.
@@ -130,10 +135,14 @@ impl UnitOfWorkFactory {
     /// in cross-replica ordering. The query intentionally uses
     /// `clock_timestamp()` rather than a process-local clock.
     pub async fn database_now(&self) -> Result<DateTime<Utc>, UnitOfWorkError> {
-        sqlx::query_scalar("SELECT clock_timestamp()")
+        let result = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&self.pool)
             .await
-            .map_err(UnitOfWorkError::DatabaseClock)
+            .map_err(UnitOfWorkError::DatabaseClock);
+        if let Err(error) = &result {
+            tracing::warn!(error = %error, "unable to read PostgreSQL authoritative clock");
+        }
+        result
     }
 }
 
@@ -227,18 +236,34 @@ impl<'a> UnitOfWork<'a> {
 
     /// Commits all mutations made through this unit of work.
     pub async fn commit(self) -> Result<(), UnitOfWorkError> {
-        self.jobs
+        let result = self
+            .jobs
             .commit_inner()
             .await
-            .map_err(UnitOfWorkError::Transaction)
+            .map_err(UnitOfWorkError::Transaction);
+        match &result {
+            Ok(()) => tracing::trace!("committed PostgreSQL unit of work"),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to commit PostgreSQL unit of work")
+            }
+        }
+        result
     }
 
     /// Explicitly rolls back all mutations made through this unit of work.
     pub async fn rollback(self) -> Result<(), UnitOfWorkError> {
-        self.jobs
+        let result = self
+            .jobs
             .rollback_inner()
             .await
-            .map_err(UnitOfWorkError::Transaction)
+            .map_err(UnitOfWorkError::Transaction);
+        match &result {
+            Ok(()) => tracing::trace!("rolled back PostgreSQL unit of work"),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to roll back PostgreSQL unit of work")
+            }
+        }
+        result
     }
 }
 

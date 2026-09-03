@@ -63,12 +63,30 @@ where
 
     /// Issues or rotates a source token and returns the raw value once.
     pub async fn issue(&self, source_id: SourceId) -> Result<FeedToken, FeedTokenServiceError> {
-        let token = FeedToken::generate();
-        self.repository
-            .replace(source_id, token.hash())
-            .await
-            .map_err(FeedTokenServiceError::Repository)?;
-        Ok(token)
+        tracing::debug!(source_id = %source_id, "issuing feed token");
+        let result = async {
+            let token = FeedToken::generate();
+            self.repository
+                .replace(source_id, token.hash())
+                .await
+                .map_err(FeedTokenServiceError::Repository)?;
+            Ok(token)
+        }
+        .await;
+        match &result {
+            Ok(_) => tracing::info!(source_id = %source_id, "feed token issued"),
+            Err(error) if is_expected_issue_error(error) => tracing::warn!(
+                source_id = %source_id,
+                error = %error,
+                "feed token issuance was rejected"
+            ),
+            Err(error) => tracing::error!(
+                source_id = %source_id,
+                error = %error,
+                "feed token issuance failed"
+            ),
+        }
+        result
     }
 
     /// Resolves a canonical raw token to an active source.
@@ -80,20 +98,57 @@ where
         &self,
         raw_token: &str,
     ) -> Result<Option<SourceId>, FeedTokenServiceError> {
-        let token = FeedToken::parse(raw_token).map_err(|_| FeedTokenServiceError::InvalidToken)?;
-        self.repository
+        tracing::trace!("resolving feed token");
+        let token = match FeedToken::parse(raw_token) {
+            Ok(token) => token,
+            Err(_) => {
+                tracing::debug!("feed token failed canonical validation");
+                return Err(FeedTokenServiceError::InvalidToken);
+            }
+        };
+        let result = self
+            .repository
             .find_source(token.hash())
             .await
-            .map_err(FeedTokenServiceError::Repository)
+            .map_err(FeedTokenServiceError::Repository);
+        match &result {
+            Ok(Some(source_id)) => tracing::debug!(source_id = %source_id, "feed token resolved"),
+            Ok(None) => tracing::debug!("feed token was unknown or revoked"),
+            Err(error) => tracing::warn!(error = %error, "feed token lookup failed"),
+        }
+        result
     }
 
     /// Revokes the active token for a source, returning whether it existed.
     pub async fn revoke(&self, source_id: SourceId) -> Result<bool, FeedTokenServiceError> {
-        self.repository
+        tracing::debug!(source_id = %source_id, "revoking feed token");
+        let result = self
+            .repository
             .revoke(source_id)
             .await
-            .map_err(FeedTokenServiceError::Repository)
+            .map_err(FeedTokenServiceError::Repository);
+        match &result {
+            Ok(revoked) => {
+                tracing::info!(source_id = %source_id, revoked, "feed token revocation completed")
+            }
+            Err(error) => tracing::warn!(
+                source_id = %source_id,
+                error = %error,
+                "feed token revocation failed"
+            ),
+        }
+        result
     }
+}
+
+fn is_expected_issue_error(error: &FeedTokenServiceError) -> bool {
+    matches!(
+        error,
+        FeedTokenServiceError::Repository(
+            FeedTokenRepositoryError::InvalidSourceId
+                | FeedTokenRepositoryError::SourceNotFound { .. }
+        )
+    )
 }
 
 #[cfg(test)]
@@ -157,6 +212,31 @@ mod tests {
 
     fn source_id() -> SourceId {
         SourceId::from_uuid(Uuid::from_u128(1))
+    }
+
+    #[test]
+    fn missing_source_issue_is_classified_as_an_expected_rejection() {
+        let error = FeedTokenServiceError::Repository(FeedTokenRepositoryError::SourceNotFound {
+            source_id: source_id(),
+        });
+
+        assert!(is_expected_issue_error(&error));
+    }
+
+    #[test]
+    fn nil_source_issue_is_classified_as_an_expected_rejection() {
+        let error = FeedTokenServiceError::Repository(FeedTokenRepositoryError::InvalidSourceId);
+
+        assert!(is_expected_issue_error(&error));
+    }
+
+    #[test]
+    fn storage_issue_failure_is_not_classified_as_an_expected_rejection() {
+        let error = FeedTokenServiceError::Repository(FeedTokenRepositoryError::Storage(
+            "database offline".to_owned(),
+        ));
+
+        assert!(!is_expected_issue_error(&error));
     }
 
     #[tokio::test]

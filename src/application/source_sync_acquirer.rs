@@ -77,6 +77,10 @@ where
         &self,
         requested: Option<WeReadAccountId>,
     ) -> Result<Option<WeReadAccountId>, WeReadAdapterError> {
+        tracing::debug!(
+            requested_account_id = ?requested,
+            "selecting a usable WeRead account"
+        );
         let now = self
             .accounts
             .database_now()
@@ -94,15 +98,19 @@ where
                     .list()
                     .await
                     .map_err(|error| WeReadAdapterError::LeaseBackend(error.to_string()))?;
-                return Ok(choose_random_usable_account(records, now, &mut rand::rng()));
+                let selected = choose_random_usable_account(records, now, &mut rand::rng());
+                tracing::debug!(selected_account_id = ?selected, "selected a random usable WeRead account");
+                return Ok(selected);
             }
         };
 
-        Ok(record
+        let selected = record
             .filter(|record| {
                 !record.account().disabled() && record.account().access_expires_at() > now
             })
-            .map(|record| record.account().account_id()))
+            .map(|record| record.account().account_id());
+        tracing::debug!(selected_account_id = ?selected, "resolved requested WeRead account");
+        Ok(selected)
     }
 }
 
@@ -246,6 +254,11 @@ impl<R, W, A, S> BrowserSourceSyncAcquirer<R, W, A, S> {
         R: AccountLeaseStore + Clone + 'static,
         S: WeReadAccountSelector,
     {
+        tracing::debug!(
+            source_id = %source.id(),
+            requested_account_id = ?selected_account_id.or(source.account_id()).or(self.config.account_id()),
+            "opening authenticated WeRead browser session"
+        );
         let requested_account = selected_account_id
             .or(source.account_id())
             .or(self.config.account_id());
@@ -254,8 +267,14 @@ impl<R, W, A, S> BrowserSourceSyncAcquirer<R, W, A, S> {
             .account_selector
             .select_account(requested_account)
             .await
-            .map_err(SyncAcquisitionError::WeRead)?
-            .ok_or(SyncAcquisitionError::NoAccountEnrolled)?;
+            .map_err(SyncAcquisitionError::WeRead)?;
+        let Some(account_id) = account_id else {
+            tracing::warn!(
+                source_id = %source.id(),
+                "source synchronization has no usable WeRead account"
+            );
+            return Err(SyncAcquisitionError::NoAccountEnrolled);
+        };
         let owner = self.config.owner_for(self.worker_index);
         let session = self
             .dependencies
@@ -270,6 +289,7 @@ impl<R, W, A, S> BrowserSourceSyncAcquirer<R, W, A, S> {
             .await
             .map_err(map_authenticated_webdriver_error)?;
         let Some(mut session) = session else {
+            tracing::warn!(account_id = %account_id, "WeRead account lease is already held");
             return Err(SyncAcquisitionError::WeRead(
                 WeReadAdapterError::LeaseBackend(
                     "the configured WeRead account is already in use".to_owned(),
@@ -280,9 +300,15 @@ impl<R, W, A, S> BrowserSourceSyncAcquirer<R, W, A, S> {
         if let Err(error) =
             session.start_lease_heartbeat(self.config.heartbeat_for(), self.config.lease_for())
         {
+            tracing::warn!(account_id = %account_id, error = %error, "unable to start WeRead account lease heartbeat");
             let _ = session.release().await;
             return Err(SyncAcquisitionError::WeRead(error.into()));
         }
+        tracing::info!(
+            account_id = %account_id,
+            session_id = %session.session_id(),
+            "opened authenticated WeRead browser session"
+        );
         Ok(session)
     }
 
@@ -297,6 +323,11 @@ impl<R, W, A, S> BrowserSourceSyncAcquirer<R, W, A, S> {
         W: WeReadAdapter<R>,
         S: WeReadAccountSelector,
     {
+        tracing::debug!(
+            source_id = %source.id(),
+            review_id = %reference.review_id,
+            "fetching article through authenticated WeRead fallback"
+        );
         let mut session = self
             .open_authenticated_session(source, selected_account_id)
             .await?;
@@ -314,10 +345,22 @@ impl<R, W, A, S> BrowserSourceSyncAcquirer<R, W, A, S> {
         let heartbeat = session.stop_lease_heartbeat().await;
         let release = session.release().await;
         match (result, heartbeat, release) {
-            (Err(error), _, _) => Err(SyncAcquisitionError::WeRead(error)),
-            (Ok(_), Err(error), _) => Err(SyncAcquisitionError::WeRead(error.into())),
-            (Ok(_), Ok(()), Err(error)) => Err(SyncAcquisitionError::WeRead(error.into())),
-            (Ok(page), Ok(()), Ok(())) => Ok(page),
+            (Err(error), _, _) => {
+                tracing::warn!(source_id = %source.id(), review_id = %reference.review_id, error = %error, "authenticated WeRead article fallback failed");
+                Err(SyncAcquisitionError::WeRead(error))
+            }
+            (Ok(_), Err(error), _) => {
+                tracing::warn!(source_id = %source.id(), review_id = %reference.review_id, error = %error, "authenticated WeRead lease heartbeat failed after article fetch");
+                Err(SyncAcquisitionError::WeRead(error.into()))
+            }
+            (Ok(_), Ok(()), Err(error)) => {
+                tracing::warn!(source_id = %source.id(), review_id = %reference.review_id, error = %error, "authenticated WeRead session release failed after article fetch");
+                Err(SyncAcquisitionError::WeRead(error.into()))
+            }
+            (Ok(page), Ok(()), Ok(())) => {
+                tracing::info!(source_id = %source.id(), review_id = %reference.review_id, "authenticated WeRead article fallback succeeded");
+                Ok(page)
+            }
         }
     }
 }
@@ -334,6 +377,7 @@ where
         &self,
         source: &Source,
     ) -> Result<SourceSyncReferences, SyncAcquisitionError> {
+        tracing::debug!(source_id = %source.id(), book_id = %source.book_id(), "listing WeRead article references");
         let mut session = self.open_authenticated_session(source, None).await?;
         let selected_account_id = session.account_id();
         let result = async {
@@ -354,13 +398,25 @@ where
         let heartbeat = session.stop_lease_heartbeat().await;
         let release = session.release().await;
         match (result, heartbeat, release) {
-            (Err(error), _, _) => Err(SyncAcquisitionError::WeRead(error)),
-            (Ok(_), Err(error), _) => Err(SyncAcquisitionError::WeRead(error.into())),
-            (Ok(_), Ok(()), Err(error)) => Err(SyncAcquisitionError::WeRead(error.into())),
-            (Ok(references), Ok(()), Ok(())) => Ok(SourceSyncReferences::new(
-                references,
-                Some(selected_account_id),
-            )),
+            (Err(error), _, _) => {
+                tracing::warn!(source_id = %source.id(), account_id = %selected_account_id, error = %error, "WeRead article listing failed");
+                Err(SyncAcquisitionError::WeRead(error))
+            }
+            (Ok(_), Err(error), _) => {
+                tracing::warn!(source_id = %source.id(), account_id = %selected_account_id, error = %error, "WeRead account lease heartbeat failed after listing");
+                Err(SyncAcquisitionError::WeRead(error.into()))
+            }
+            (Ok(_), Ok(()), Err(error)) => {
+                tracing::warn!(source_id = %source.id(), account_id = %selected_account_id, error = %error, "WeRead session release failed after listing");
+                Err(SyncAcquisitionError::WeRead(error.into()))
+            }
+            (Ok(references), Ok(()), Ok(())) => {
+                tracing::info!(source_id = %source.id(), account_id = %selected_account_id, references = references.len(), "listed WeRead article references");
+                Ok(SourceSyncReferences::new(
+                    references,
+                    Some(selected_account_id),
+                ))
+            }
         }
     }
 
@@ -370,6 +426,7 @@ where
         reference: &WeReadArticleReference,
         selected_account_id: Option<WeReadAccountId>,
     ) -> Result<ExtractedArticlePage, SyncAcquisitionError> {
+        tracing::debug!(source_id = %source.id(), review_id = %reference.review_id, "fetching public article");
         let url = reference.article_url.clone().ok_or_else(|| {
             SyncAcquisitionError::ArticlePage(ArticlePageError::InvalidExtraction(
                 "WeRead article reference has no public URL".to_owned(),
@@ -390,7 +447,10 @@ where
             Err(error) => Err(map_public_webdriver_error(error)),
         };
         match public_result {
-            Ok(page) => Ok(page),
+            Ok(page) => {
+                tracing::info!(source_id = %source.id(), review_id = %reference.review_id, "public article fetch succeeded");
+                Ok(page)
+            }
             Err(public_error) => {
                 tracing::warn!(
                     source_id = %source.id(),
@@ -406,11 +466,11 @@ where
 }
 
 fn map_authenticated_webdriver_error(error: WebDriverError) -> SyncAcquisitionError {
-    SyncAcquisitionError::WeRead(WeReadAdapterError::Browser(error.to_string()))
+    SyncAcquisitionError::WeRead(WeReadAdapterError::Browser(error.safe_message()))
 }
 
 fn map_public_webdriver_error(error: WebDriverError) -> SyncAcquisitionError {
-    SyncAcquisitionError::ArticlePage(ArticlePageError::Browser(error.to_string()))
+    SyncAcquisitionError::ArticlePage(ArticlePageError::Browser(error.safe_message()))
 }
 
 impl From<AccountLeaseError> for SyncAcquisitionError {

@@ -141,37 +141,62 @@ pub struct RssRenderer;
 impl RssRenderer {
     /// Renders one deterministic cache candidate.
     pub fn render(&self, mut input: RenderFeedInput) -> Result<RenderedFeed, RenderError> {
-        validate_input(&input)?;
-        input.articles.sort_by(|left, right| {
-            right
-                .published_at
-                .cmp(&left.published_at)
-                .then_with(|| left.review_id.cmp(&right.review_id))
-        });
+        let source_id = input.source_id;
+        let article_count = input.articles.len();
+        tracing::debug!(
+            source_id = %source_id,
+            article_count,
+            source_revision = %input.source_revision,
+            "rendering RSS feed"
+        );
+        let result = (|| {
+            validate_input(&input)?;
+            input.articles.sort_by(|left, right| {
+                right
+                    .published_at
+                    .cmp(&left.published_at)
+                    .then_with(|| left.review_id.cmp(&right.review_id))
+            });
 
-        let mut channel = Channel::default();
-        channel.set_title(input.title);
-        channel.set_link(input.feed_url);
-        channel.set_description(input.description);
-        channel.set_items(input.articles.iter().map(to_rss_item).collect::<Vec<_>>());
-        let xml_bytes = channel
-            .write_to(Vec::new())
-            .map_err(RenderError::Serialization)?;
-        let digest = Sha256::digest(&xml_bytes);
-        let content_hash = format!("{digest:x}");
-        let etag = format!("sha256:{content_hash}");
+            let mut channel = Channel::default();
+            channel.set_title(input.title);
+            channel.set_link(input.feed_url);
+            channel.set_description(input.description);
+            channel.set_items(input.articles.iter().map(to_rss_item).collect::<Vec<_>>());
+            let xml_bytes = channel
+                .write_to(Vec::new())
+                .map_err(RenderError::Serialization)?;
+            let digest = Sha256::digest(&xml_bytes);
+            let content_hash = format!("{digest:x}");
+            let etag = format!("sha256:{content_hash}");
 
-        Ok(RenderedFeed {
-            candidate: FeedCacheCandidate::from_parts(
-                input.source_id,
-                xml_bytes,
-                etag,
-                input.generated_at,
-                input.expires_at,
-                input.source_revision,
-                content_hash,
+            Ok(RenderedFeed {
+                candidate: FeedCacheCandidate::from_parts(
+                    input.source_id,
+                    xml_bytes,
+                    etag,
+                    input.generated_at,
+                    input.expires_at,
+                    input.source_revision,
+                    content_hash,
+                ),
+            })
+        })();
+        match &result {
+            Ok(rendered) => tracing::debug!(
+                source_id = %source_id,
+                article_count,
+                output_bytes = rendered.candidate.xml_bytes().len(),
+                "RSS feed rendered"
             ),
-        })
+            Err(error) => tracing::warn!(
+                source_id = %source_id,
+                article_count,
+                error = %error,
+                "RSS feed rendering failed"
+            ),
+        }
+        result
     }
 }
 

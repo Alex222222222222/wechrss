@@ -60,9 +60,19 @@ pub fn pool_options(config: &AppConfig) -> PgPoolOptions {
 /// checks are performed by this constructor; those belong to application
 /// startup and health-check orchestration.
 pub async fn connect_pool(config: &AppConfig) -> Result<PgPool, sqlx::Error> {
-    pool_options(config)
+    tracing::debug!(
+        min_connections = config.database_pool_min_connections,
+        max_connections = config.database_pool_max_connections,
+        "connecting to PostgreSQL"
+    );
+    let result = pool_options(config)
         .connect(config.database_url.expose_secret())
-        .await
+        .await;
+    match &result {
+        Ok(_) => tracing::info!("PostgreSQL connection pool is ready"),
+        Err(error) => tracing::error!(error = %error, "PostgreSQL connection failed"),
+    }
+    result
 }
 
 /// Applies pending checked-in PostgreSQL schema migrations.
@@ -74,7 +84,13 @@ pub async fn connect_pool(config: &AppConfig) -> Result<PgPool, sqlx::Error> {
 /// whether migrations run automatically during startup or as a separately
 /// authorized release step.
 pub async fn migrate(pool: &PgPool) -> Result<(), MigrateError> {
-    MIGRATOR.run(pool).await
+    tracing::debug!("applying PostgreSQL migrations");
+    let result = MIGRATOR.run(pool).await;
+    match &result {
+        Ok(()) => tracing::info!("PostgreSQL migrations are up to date"),
+        Err(error) => tracing::error!(error = %error, "PostgreSQL migration failed"),
+    }
+    result
 }
 
 #[cfg(test)]

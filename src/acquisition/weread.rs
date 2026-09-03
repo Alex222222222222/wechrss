@@ -488,6 +488,7 @@ impl BrowserWeReadAdapter {
     where
         R: AccountLeaseStore,
     {
+        tracing::debug!(account_id = %request.account_id(), "authenticating WeRead browser request");
         request.ensure_usable().map_err(WeReadAdapterError::from)?;
         let provider = self
             .credential_provider
@@ -496,7 +497,10 @@ impl BrowserWeReadAdapter {
         let credentials = provider
             .credentials(request.account_id())
             .await
-            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+            .map_err(|error| {
+                tracing::warn!(account_id = %request.account_id(), error = %error, "unable to load stored WeRead credentials");
+                WeReadAdapterError::Browser(error.to_string())
+            })?;
         let cookie = credentials.web_cookie().ok_or_else(|| {
             WeReadAdapterError::Browser(
                 "stored WeRead credentials do not contain a web cookie".to_owned(),
@@ -505,12 +509,12 @@ impl BrowserWeReadAdapter {
         request
             .goto(WEREAD_SHELF_URL)
             .await
-            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+            .map_err(|error| WeReadAdapterError::Browser(error.safe_message()))?;
         request.ensure_usable().map_err(WeReadAdapterError::from)?;
         request
             .install_cookie_header(cookie)
             .await
-            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+            .map_err(|error| WeReadAdapterError::Browser(error.safe_message()))?;
         request.ensure_usable().map_err(WeReadAdapterError::from)?;
         // The initial shelf navigation establishes the origin required for
         // WebDriver cookie injection. Navigate to it again after installing
@@ -520,13 +524,22 @@ impl BrowserWeReadAdapter {
         request
             .goto(WEREAD_SHELF_URL)
             .await
-            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+            .map_err(|error| WeReadAdapterError::Browser(error.safe_message()))?;
         request.ensure_usable().map_err(WeReadAdapterError::from)?;
         let shelf_url = request
             .current_url()
             .await
-            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
-        ensure_authenticated_shelf_url(&shelf_url)
+            .map_err(|error| WeReadAdapterError::Browser(error.safe_message()))?;
+        let result = ensure_authenticated_shelf_url(&shelf_url);
+        match &result {
+            Ok(()) => {
+                tracing::debug!(account_id = %request.account_id(), "WeRead browser session is authenticated")
+            }
+            Err(error) => {
+                tracing::warn!(account_id = %request.account_id(), error = %error, "WeRead browser session is not authenticated")
+            }
+        }
+        result
     }
 }
 
@@ -540,6 +553,7 @@ where
         book_id: &str,
         mut request: AuthenticatedRequest<'_, R>,
     ) -> Result<Vec<WeReadArticleReference>, WeReadAdapterError> {
+        tracing::debug!(account_id = %request.account_id(), book_id, "requesting WeRead article list");
         let endpoint = article_list_endpoint(&self.endpoint, book_id)?;
         self.authenticate_request(&mut request).await?;
         if let Some(pacing) = &self.pacing {
@@ -549,9 +563,22 @@ where
         let body = request
             .fetch_text(endpoint.as_str())
             .await
-            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+            .map_err(|error| WeReadAdapterError::Browser(error.safe_message()))?;
         request.ensure_usable().map_err(WeReadAdapterError::from)?;
-        parse_article_list_body(&body)
+        let result = parse_article_list_body(&body);
+        match &result {
+            Ok(references) => tracing::info!(
+                account_id = %request.account_id(),
+                references = references.len(),
+                "parsed WeRead article list"
+            ),
+            Err(error) => tracing::warn!(
+                account_id = %request.account_id(),
+                error = %error,
+                "unable to parse WeRead article list"
+            ),
+        }
+        result
     }
 
     async fn fetch_article_content(
@@ -559,6 +586,7 @@ where
         reference: &WeReadArticleReference,
         mut request: AuthenticatedRequest<'_, R>,
     ) -> Result<ExtractedArticlePage, WeReadAdapterError> {
+        tracing::debug!(account_id = %request.account_id(), review_id = %reference.review_id, "requesting authenticated WeRead article content");
         let canonical_url = reference
             .article_url
             .clone()
@@ -572,26 +600,35 @@ where
         request
             .goto(endpoint.as_str())
             .await
-            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+            .map_err(|error| WeReadAdapterError::Browser(error.safe_message()))?;
         request.ensure_usable().map_err(WeReadAdapterError::from)?;
         let content_url = request
             .current_url()
             .await
-            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+            .map_err(|error| WeReadAdapterError::Browser(error.safe_message()))?;
         ensure_authenticated_content_url(&content_url)?;
         let html = request
             .source()
             .await
-            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+            .map_err(|error| WeReadAdapterError::Browser(error.safe_message()))?;
         request.ensure_usable().map_err(WeReadAdapterError::from)?;
-        parse_article_html_with_fallback(
+        let result = parse_article_html_with_fallback(
             &html,
             canonical_url,
             self.timezone,
             reference.title.as_deref(),
             reference.published_at,
         )
-        .map_err(map_article_content_error)
+        .map_err(map_article_content_error);
+        match &result {
+            Ok(_) => {
+                tracing::info!(account_id = %request.account_id(), review_id = %reference.review_id, "parsed authenticated WeRead article content")
+            }
+            Err(error) => {
+                tracing::warn!(account_id = %request.account_id(), review_id = %reference.review_id, error = %error, "unable to parse authenticated WeRead article content")
+            }
+        }
+        result
     }
 }
 

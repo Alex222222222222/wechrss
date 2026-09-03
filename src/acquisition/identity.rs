@@ -84,7 +84,18 @@ impl ArticleIdentityResolver for UrlArticleIdentityResolver {
         &self,
         article_url: VerifiedWechatArticleUrl,
     ) -> Result<ArticleIdentity, IdentityError> {
-        resolve_from_url(article_url)
+        let result = resolve_from_url(article_url);
+        match &result {
+            Ok(identity) => tracing::debug!(
+                book_id = %identity.book_id(),
+                method = identity.method().as_str(),
+                "resolved article identity from URL"
+            ),
+            Err(error) => {
+                tracing::debug!(error = %error, "article identity was not present in URL")
+            }
+        }
+        result
     }
 }
 
@@ -112,19 +123,48 @@ impl ArticleIdentityResolver for BrowserArticleIdentityResolver {
         &self,
         article_url: VerifiedWechatArticleUrl,
     ) -> Result<ArticleIdentity, IdentityError> {
+        tracing::debug!("resolving article identity");
         match resolve_from_url(article_url.clone()) {
-            Ok(identity) => Ok(identity),
-            Err(IdentityError::MissingIdentity) => {
-                let session = self
-                    .factory
-                    .open_public(&self.browser_pool)
-                    .await
-                    .map_err(|error| IdentityError::Browser(error.to_string()))?;
-                WebDriverIdentityResolver
-                    .resolve(article_url, session)
-                    .await
+            Ok(identity) => {
+                tracing::debug!(
+                    book_id = %identity.book_id(),
+                    method = identity.method().as_str(),
+                    "resolved article identity without browser"
+                );
+                Ok(identity)
             }
-            Err(error) => Err(error),
+            Err(IdentityError::MissingIdentity) => {
+                tracing::debug!("article identity requires a browser redirect or page inspection");
+                let session =
+                    self.factory
+                        .open_public(&self.browser_pool)
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(
+                                error_kind = error.kind(),
+                                "unable to open browser for article identity resolution"
+                            );
+                            IdentityError::Browser(error.safe_message())
+                        })?;
+                let result = WebDriverIdentityResolver
+                    .resolve(article_url, session)
+                    .await;
+                match &result {
+                    Ok(identity) => tracing::info!(
+                        book_id = %identity.book_id(),
+                        method = identity.method().as_str(),
+                        "resolved article identity with browser"
+                    ),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "browser article identity resolution failed")
+                    }
+                }
+                result
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "article identity resolution failed");
+                Err(error)
+            }
         }
     }
 }
@@ -451,16 +491,28 @@ impl WebDriverIdentityResolver {
         article_url: VerifiedWechatArticleUrl,
         mut session: PublicBrowserSession,
     ) -> Result<ArticleIdentity, IdentityError> {
+        let session_id = session.session_id();
+        tracing::debug!(session_id = %session_id, "starting browser article identity resolution");
         let result = self.resolve_without_cleanup(article_url, &session).await;
         let cleanup_result = session.close_client().await;
         match (result, cleanup_result) {
-            (Ok(identity), Ok(())) => Ok(identity),
-            (Ok(_), Err(error)) => Err(IdentityError::Browser(format!(
-                "browser cleanup failed: {error}"
-            ))),
-            (Err(error), Ok(())) => Err(error),
+            (Ok(identity), Ok(())) => {
+                tracing::info!(session_id = %session_id, book_id = %identity.book_id(), "browser article identity resolution completed");
+                Ok(identity)
+            }
+            (Ok(_), Err(error)) => {
+                tracing::warn!(session_id = %session_id, error = %error, "browser identity session cleanup failed");
+                Err(IdentityError::Browser(format!(
+                    "browser cleanup failed: {error}"
+                )))
+            }
+            (Err(error), Ok(())) => {
+                tracing::warn!(session_id = %session_id, error = %error, "browser article identity resolution failed");
+                Err(error)
+            }
             (Err(error), Err(cleanup_error)) => {
                 tracing::warn!(
+                    session_id = %session_id,
                     error = %cleanup_error,
                     "browser cleanup failed after identity resolution error"
                 );
@@ -595,7 +647,7 @@ fn is_structural_verification_page(html_text: &str) -> bool {
 }
 
 fn map_browser_error(error: WebDriverError) -> IdentityError {
-    IdentityError::Browser(error.to_string())
+    IdentityError::Browser(error.safe_message())
 }
 
 #[cfg(test)]

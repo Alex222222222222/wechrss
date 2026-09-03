@@ -245,16 +245,43 @@ where
     /// A disabled or operator-blocked source is persisted without a queued job;
     /// it can be resumed by a later explicit operator action or scheduler pass.
     pub async fn create(&self, source: NewSource) -> Result<Source, SourceServiceError> {
-        let mut unit_of_work = self.unit_of_work.begin().await?;
-        let created = unit_of_work.insert_source(source).await?;
+        let source_id = source.id;
+        tracing::debug!(
+            source_id = %source_id,
+            enabled = source.enabled,
+            scheduling_gate = ?source.scheduling_gate,
+            account_bound = source.account_id.is_some(),
+            "creating source"
+        );
+        let result = async {
+            let mut unit_of_work = self.unit_of_work.begin().await?;
+            let created = unit_of_work.insert_source(source).await?;
 
-        if created.enabled() && created.scheduling_gate().is_automatically_eligible() {
-            let job = source_sync_job(&created, Utc::now());
-            unit_of_work.enqueue_source_sync(job).await?;
+            if created.enabled() && created.scheduling_gate().is_automatically_eligible() {
+                tracing::debug!(source_id = %source_id, "enqueueing initial source synchronization");
+                let job = source_sync_job(&created, Utc::now());
+                unit_of_work.enqueue_source_sync(job).await?;
+            } else {
+                tracing::debug!(
+                    source_id = %source_id,
+                    enabled = created.enabled(),
+                    scheduling_gate = ?created.scheduling_gate(),
+                    "source does not require an initial synchronization job"
+                );
+            }
+
+            unit_of_work.commit().await?;
+            Ok(created)
         }
-
-        unit_of_work.commit().await?;
-        Ok(created)
+        .await;
+        match &result {
+            Ok(created) => tracing::info!(
+                source_id = %created.id(),
+                "source created"
+            ),
+            Err(error) => log_source_mutation_error("create", source_id, error),
+        }
+        result
     }
 
     /// Applies a partial editable source configuration in one transaction.
@@ -263,23 +290,52 @@ where
         source_id: SourceId,
         patch: SourcePatch,
     ) -> Result<Source, SourceServiceError> {
-        let mut unit_of_work = self.unit_of_work.begin().await?;
-        let updated = unit_of_work.update_source(source_id, patch).await?;
-        unit_of_work.commit().await?;
-        Ok(updated)
+        tracing::debug!(source_id = %source_id, "updating source");
+        let result = async {
+            let mut unit_of_work = self.unit_of_work.begin().await?;
+            let updated = unit_of_work.update_source(source_id, patch).await?;
+            unit_of_work.commit().await?;
+            Ok(updated)
+        }
+        .await;
+        match &result {
+            Ok(updated) => tracing::info!(source_id = %updated.id(), "source updated"),
+            Err(error) => log_source_mutation_error("update", source_id, error),
+        }
+        result
     }
 
     /// Deletes a source and its source-owned work in one transaction.
     pub async fn delete(&self, source_id: SourceId) -> Result<(), SourceServiceError> {
-        let mut unit_of_work = self.unit_of_work.begin().await?;
-        unit_of_work.delete_source(source_id).await?;
-        unit_of_work.commit().await?;
-        Ok(())
+        tracing::debug!(source_id = %source_id, "deleting source");
+        let result = async {
+            let mut unit_of_work = self.unit_of_work.begin().await?;
+            unit_of_work.delete_source(source_id).await?;
+            unit_of_work.commit().await?;
+            Ok(())
+        }
+        .await;
+        match &result {
+            Ok(()) => tracing::info!(source_id = %source_id, "source deleted"),
+            Err(error) => log_source_mutation_error("delete", source_id, error),
+        }
+        result
     }
 
     /// Reads one source by durable identity.
     pub async fn find(&self, source_id: SourceId) -> Result<Option<Source>, SourceServiceError> {
-        self.sources.find(source_id).await
+        tracing::trace!(source_id = %source_id, "looking up source");
+        let result = self.sources.find(source_id).await;
+        match &result {
+            Ok(Some(_)) => tracing::debug!(source_id = %source_id, "source found"),
+            Ok(None) => tracing::debug!(source_id = %source_id, "source was not found"),
+            Err(error) => tracing::warn!(
+                source_id = %source_id,
+                error = %error,
+                "source lookup failed"
+            ),
+        }
+        result
     }
 
     /// Reads one source by its normalized WeRead book identifier.
@@ -287,7 +343,16 @@ where
         &self,
         book_id: &str,
     ) -> Result<Option<Source>, SourceServiceError> {
-        self.sources.find_by_book_id(book_id).await
+        tracing::trace!("looking up source by book identifier");
+        let result = self.sources.find_by_book_id(book_id).await;
+        match &result {
+            Ok(Some(source)) => {
+                tracing::debug!(source_id = %source.id(), "source found by book identifier")
+            }
+            Ok(None) => tracing::debug!("source was not found by book identifier"),
+            Err(error) => tracing::warn!(error = %error, "source lookup by book identifier failed"),
+        }
+        result
     }
 
     /// Enables or disables automatic scheduling without changing feed content.
@@ -296,10 +361,26 @@ where
         source_id: SourceId,
         enabled: bool,
     ) -> Result<Source, SourceServiceError> {
-        let mut unit_of_work = self.unit_of_work.begin().await?;
-        let source = unit_of_work.set_enabled(source_id, enabled).await?;
-        unit_of_work.commit().await?;
-        Ok(source)
+        tracing::debug!(source_id = %source_id, enabled, "changing source enabled state");
+        let result = async {
+            let mut unit_of_work = self.unit_of_work.begin().await?;
+            let source = unit_of_work.set_enabled(source_id, enabled).await?;
+            unit_of_work.commit().await?;
+            Ok(source)
+        }
+        .await;
+        match &result {
+            Ok(source) => {
+                tracing::info!(source_id = %source.id(), enabled, "source enabled state changed")
+            }
+            Err(error) => tracing::warn!(
+                source_id = %source_id,
+                enabled,
+                error = %error,
+                "source enabled state change failed"
+            ),
+        }
+        result
     }
 
     /// Changes the operator-controlled scheduling gate without changing feed
@@ -309,10 +390,26 @@ where
         source_id: SourceId,
         gate: SchedulingGate,
     ) -> Result<Source, SourceServiceError> {
-        let mut unit_of_work = self.unit_of_work.begin().await?;
-        let source = unit_of_work.set_scheduling_gate(source_id, gate).await?;
-        unit_of_work.commit().await?;
-        Ok(source)
+        tracing::debug!(source_id = %source_id, gate = ?gate, "changing source scheduling gate");
+        let result = async {
+            let mut unit_of_work = self.unit_of_work.begin().await?;
+            let source = unit_of_work.set_scheduling_gate(source_id, gate).await?;
+            unit_of_work.commit().await?;
+            Ok(source)
+        }
+        .await;
+        match &result {
+            Ok(source) => {
+                tracing::info!(source_id = %source.id(), gate = ?gate, "source scheduling gate changed")
+            }
+            Err(error) => tracing::warn!(
+                source_id = %source_id,
+                gate = ?gate,
+                error = %error,
+                "source scheduling gate change failed"
+            ),
+        }
+        result
     }
 }
 
@@ -323,7 +420,39 @@ where
 {
     /// Lists all subscribed sources for the administrative panel.
     pub async fn list(&self) -> Result<Vec<Source>, SourceServiceError> {
-        self.sources.list().await
+        tracing::trace!("listing sources");
+        let result = self.sources.list().await;
+        match &result {
+            Ok(sources) => tracing::debug!(sources = sources.len(), "listed sources"),
+            Err(error) => tracing::warn!(error = %error, "source listing failed"),
+        }
+        result
+    }
+}
+
+fn log_source_mutation_error(
+    operation: &'static str,
+    source_id: SourceId,
+    error: &SourceServiceError,
+) {
+    match error {
+        SourceServiceError::Source(SourceRepositoryError::Storage(_))
+        | SourceServiceError::Job(JobRepositoryError::Storage(_))
+        | SourceServiceError::UnitOfWork(UnitOfWorkError::Transaction(_))
+        | SourceServiceError::UnitOfWork(UnitOfWorkError::DatabaseClock(_)) => {
+            tracing::error!(
+                operation,
+                source_id = %source_id,
+                error = %error,
+                "source mutation failed because persistence was unavailable"
+            )
+        }
+        _ => tracing::warn!(
+            operation,
+            source_id = %source_id,
+            error = %error,
+            "source mutation was rejected"
+        ),
     }
 }
 

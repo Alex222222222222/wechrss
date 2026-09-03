@@ -217,16 +217,51 @@ where
     C: SourceSyncAcquirer,
 {
     async fn execute(&self, lease: &JobLease, now: DateTime<Utc>) -> JobExecution {
-        match self.execute_inner(lease, now).await {
-            Ok(()) => JobExecution::Committed,
-            Err(SourceSyncExecutionError::BeforeRun(outcome)) => outcome,
+        tracing::debug!(job_id = %lease.job.id(), "starting source synchronization job");
+        let outcome = match self.execute_inner(lease, now).await {
+            Ok(()) => {
+                tracing::info!(job_id = %lease.job.id(), "source synchronization completed");
+                JobExecution::Committed
+            }
+            Err(SourceSyncExecutionError::BeforeRun(outcome)) => {
+                tracing::debug!(
+                    job_id = %lease.job.id(),
+                    outcome = source_job_outcome_kind(&outcome),
+                    "source synchronization stopped before acquisition"
+                );
+                outcome
+            }
             Err(SourceSyncExecutionError::AfterRun { context, failure }) => {
+                if is_terminal_source_sync_failure(&failure) {
+                    tracing::error!(
+                        job_id = %lease.job.id(),
+                        source_id = %context.source.id(),
+                        outcome = ?failure.outcome(),
+                        error = %failure.failure().message(),
+                        "source synchronization reached a terminal failure"
+                    );
+                } else {
+                    tracing::warn!(
+                        job_id = %lease.job.id(),
+                        source_id = %context.source.id(),
+                        outcome = ?failure.outcome(),
+                        error = %failure.failure().message(),
+                        "source synchronization encountered a recoverable failure"
+                    );
+                }
                 match self.finish_failed_run(lease, *context, failure).await {
                     Ok(()) => JobExecution::Committed,
-                    Err(()) => retry_execution(now, self.config.retry_after()),
+                    Err(()) => {
+                        tracing::error!(
+                            job_id = %lease.job.id(),
+                            "unable to persist source synchronization failure"
+                        );
+                        retry_execution(now, self.config.retry_after())
+                    }
                 }
             }
-        }
+        };
+        outcome
     }
 }
 
@@ -242,6 +277,11 @@ where
         worker_now: DateTime<Utc>,
     ) -> Result<(), SourceSyncExecutionError> {
         let source_id = validate_lease(lease).map_err(SourceSyncExecutionError::BeforeRun)?;
+        tracing::debug!(
+            job_id = %lease.job.id(),
+            source_id = %source_id,
+            "preparing source synchronization"
+        );
         let started_at = self
             .dependencies
             .unit_of_work
@@ -259,6 +299,7 @@ where
                     .next_allowed_at(started_at)
                     .or_else(|| started_at.checked_add_signed(self.config.retry_after()))
                     .unwrap_or(started_at);
+                tracing::debug!(source_id = %source_id, resume_at = %resume_at, "source synchronization deferred during quiet hours");
                 return Err(SourceSyncExecutionError::BeforeRun(
                     JobExecution::Deferred { resume_at },
                 ));
@@ -317,6 +358,12 @@ where
             }
         };
         let (references, selected_account_id) = references.into_parts();
+        tracing::debug!(
+            source_id = %context.source.id(),
+            account_id = ?selected_account_id,
+            references = references.len(),
+            "source synchronization listed article references"
+        );
         let seen = match u32::try_from(references.len()) {
             Ok(seen) => seen,
             Err(_) => {
@@ -332,6 +379,11 @@ where
         let mut observed = Vec::with_capacity(references.len());
         for reference in references {
             let Some(_url) = reference.article_url.as_ref() else {
+                tracing::debug!(
+                    source_id = %context.source.id(),
+                    review_id = %reference.review_id,
+                    "ignoring article reference without a public URL"
+                );
                 context.stats.articles_failed = context.stats.articles_failed.saturating_add(1);
                 continue;
             };
@@ -357,6 +409,12 @@ where
             {
                 Ok(page) => observed.push((reference, page, observation_version)),
                 Err(error) => {
+                    tracing::debug!(
+                        source_id = %context.source.id(),
+                        review_id = %reference.review_id,
+                        error = %error,
+                        "article acquisition failed"
+                    );
                     let failure = classify_acquisition_error(&error);
                     if failure.outcome() == SyncOutcome::Failed {
                         context.stats.articles_failed =
@@ -395,6 +453,11 @@ where
                     prepared.push(article);
                 }
                 Err(SyncServiceError::MissingPublishedAt | SyncServiceError::Article(_)) => {
+                    tracing::debug!(
+                        source_id = %context.source.id(),
+                        review_id = %reference.review_id,
+                        "article normalization failed"
+                    );
                     context.stats.articles_failed = context.stats.articles_failed.saturating_add(1);
                 }
             }
@@ -446,6 +509,8 @@ where
         prepared: Vec<crate::application::sync_service::PreparedArticle>,
         finished_at: DateTime<Utc>,
     ) -> Result<(), ()> {
+        let source_id = context.source.id();
+        let run_id = context.run_id;
         let mut unit_of_work = self
             .dependencies
             .unit_of_work
@@ -504,6 +569,7 @@ where
                 .await
                 .map_err(|_| ())?;
         }
+        let persisted_stats = stats;
         unit_of_work
             .sync_runs()
             .finish(
@@ -511,7 +577,7 @@ where
                 SyncRunCompletion {
                     outcome: SyncOutcome::Succeeded,
                     finished_at,
-                    stats,
+                    stats: persisted_stats,
                     failure: None,
                     feed_revision,
                 },
@@ -530,7 +596,18 @@ where
         )
         .await
         .map_err(|_| ())?;
-        unit_of_work.commit().await.map_err(|_| ())
+        unit_of_work.commit().await.map_err(|_| ())?;
+        tracing::info!(
+            source_id = %source_id,
+            run_id = %run_id,
+            articles_seen = persisted_stats.articles_seen,
+            articles_created = persisted_stats.articles_created,
+            articles_updated = persisted_stats.articles_updated,
+            articles_failed = persisted_stats.articles_failed,
+            feed_revision = ?feed_revision,
+            "persisted successful source synchronization"
+        );
+        Ok(())
     }
 
     async fn finish_failed_run(
@@ -539,6 +616,23 @@ where
         context: SourceSyncRunContext,
         classified: ClassifiedSyncFailure,
     ) -> Result<(), ()> {
+        if is_terminal_source_sync_failure(&classified) {
+            tracing::error!(
+                source_id = %context.source.id(),
+                run_id = %context.run_id,
+                outcome = ?classified.outcome(),
+                error = %classified.failure().message(),
+                "persisting terminal source synchronization failure"
+            );
+        } else {
+            tracing::warn!(
+                source_id = %context.source.id(),
+                run_id = %context.run_id,
+                outcome = ?classified.outcome(),
+                error = %classified.failure().message(),
+                "persisting source synchronization failure"
+            );
+        }
         let finished_at = self
             .dependencies
             .unit_of_work
@@ -679,6 +773,20 @@ enum SourceSyncExecutionError {
     },
 }
 
+fn source_job_outcome_kind(outcome: &JobExecution) -> &'static str {
+    match outcome {
+        JobExecution::Succeeded => "succeeded",
+        JobExecution::Committed => "committed",
+        JobExecution::Deferred { .. } => "deferred",
+        JobExecution::Retry { .. } => "retry",
+        JobExecution::Failed { .. } => "failed",
+    }
+}
+
+fn is_terminal_source_sync_failure(failure: &ClassifiedSyncFailure) -> bool {
+    failure.outcome() == SyncOutcome::Failed && failure.log_as_error()
+}
+
 struct SourceSyncRunContext {
     source: Source,
     run_id: uuid::Uuid,
@@ -812,6 +920,28 @@ mod tests {
             crate::acquisition::article_page::ArticlePageError::OperationTimedOut,
         ));
         assert_eq!(retryable.outcome(), SyncOutcome::RetryableFailure);
+    }
+
+    #[test]
+    fn terminal_source_sync_failures_are_selected_for_error_logging() {
+        let failure = ClassifiedSyncFailure::permanent("invalid article");
+
+        assert!(is_terminal_source_sync_failure(&failure));
+    }
+
+    #[test]
+    fn retryable_source_sync_failures_are_selected_for_warning_logging() {
+        let failure = ClassifiedSyncFailure::retryable("upstream unavailable");
+
+        assert!(!is_terminal_source_sync_failure(&failure));
+    }
+
+    #[test]
+    fn missing_account_source_sync_failures_are_selected_for_warning_logging() {
+        let failure = classify_acquisition_error(&SyncAcquisitionError::NoAccountEnrolled);
+
+        assert_eq!(failure.outcome(), SyncOutcome::Failed);
+        assert!(!is_terminal_source_sync_failure(&failure));
     }
 
     #[test]

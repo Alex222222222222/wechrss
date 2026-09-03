@@ -367,6 +367,7 @@ where
     }
 
     /// Rebuilds one source's feed without contacting upstream systems.
+    #[tracing::instrument(skip_all, fields(source_id = %source_id))]
     pub async fn rebuild(
         &self,
         source_id: SourceId,
@@ -383,6 +384,7 @@ where
     /// another builder, or a pre-publication operation fails, this method does
     /// not choose a retry/deferral outcome for the job; the caller retains that
     /// responsibility.
+    #[tracing::instrument(skip_all, fields(job_id = %lease.job.id()))]
     pub async fn rebuild_for_job(
         &self,
         lease: &JobLease,
@@ -422,13 +424,24 @@ where
             return Err(FeedRebuildError::InvalidSourceId);
         }
 
+        tracing::debug!("acquiring feed rebuild lease");
+
         let lease = match self
             .leases
             .acquire_build(source_id, &self.owner, self.config.lease_for())
             .await
         {
-            Ok(Some(lease)) => lease,
-            Ok(None) => return Ok(FeedRebuildOutcome::AlreadyActive),
+            Ok(Some(lease)) => {
+                tracing::debug!(
+                    source_id = %source_id,
+                    "acquired feed rebuild lease"
+                );
+                lease
+            }
+            Ok(None) => {
+                tracing::debug!(source_id = %source_id, "feed rebuild is already active");
+                return Ok(FeedRebuildOutcome::AlreadyActive);
+            }
             Err(FeedBuildLeaseError::SourceNotFound { source_id }) => {
                 return Err(FeedRebuildError::SourceNotFound { source_id });
             }
@@ -439,6 +452,18 @@ where
         let result = self.rebuild_with_lease(source_id, lease, completion).await;
         if result.is_err() {
             self.release_after_failure(source_id, token, &result).await;
+        }
+        match &result {
+            Ok(outcome) => tracing::info!(
+                source_id = %source_id,
+                outcome = ?outcome,
+                "feed rebuild finished"
+            ),
+            Err(error) => tracing::warn!(
+                source_id = %source_id,
+                error = %error,
+                "feed rebuild failed"
+            ),
         }
         result
     }
@@ -458,6 +483,12 @@ where
             .articles
             .list_for_feed(source_id, source.rss_item_limit())
             .await?;
+        tracing::debug!(
+            source_id = %source_id,
+            article_count = articles.len(),
+            source_revision = ?source.feed_revision(),
+            "loaded feed rebuild snapshot"
+        );
         let generated_at = self.unit_of_work.database_now().await?;
         let expires_at = generated_at
             .checked_add_signed(self.config.cache_ttl())
@@ -481,6 +512,7 @@ where
             Ok(publication) => publication,
             Err(error) => {
                 drop(unit_of_work);
+                tracing::warn!(source_id = %source_id, error = %error, "feed cache publication failed");
                 return Err(error.into());
             }
         };
@@ -495,7 +527,7 @@ where
                 .await?;
         }
         unit_of_work.commit().await?;
-        Ok(match publication {
+        let outcome = match publication {
             FeedCachePublishResult::Published(cache) => FeedRebuildOutcome::Published {
                 feed_revision: cache.feed_revision(),
             },
@@ -503,7 +535,9 @@ where
                 FeedRebuildOutcome::SourceRevisionChanged { current_revision }
             }
             FeedCachePublishResult::ExistingCacheNewer => FeedRebuildOutcome::ExistingCacheNewer,
-        })
+        };
+        tracing::debug!(source_id = %source_id, outcome = ?outcome, "published feed rebuild result");
+        Ok(outcome)
     }
 
     async fn release_after_failure(

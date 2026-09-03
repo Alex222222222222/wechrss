@@ -99,7 +99,16 @@ impl ArchiveService {
 
     /// Sanitizes one extracted HTML fragment and computes its content hash.
     pub fn archive(&self, raw_html: &str) -> ArchivedContent {
-        ArchivedContent::from_sanitized(self.sanitizer.sanitize(raw_html))
+        tracing::trace!(input_bytes = raw_html.len(), "sanitizing article HTML");
+        let archived = ArchivedContent::from_sanitized(self.sanitizer.sanitize(raw_html));
+        tracing::debug!(
+            input_bytes = raw_html.len(),
+            output_bytes = archived.html.len(),
+            external_assets = archived.external_assets.len(),
+            has_content_hash = archived.content_hash.is_some(),
+            "article HTML archived"
+        );
+        archived
     }
 }
 
