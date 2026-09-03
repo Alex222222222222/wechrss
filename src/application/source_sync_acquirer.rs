@@ -5,7 +5,10 @@
 //! rather than on browser details. This adapter is the executable bridge: it
 //! acquires one local browser permit and one durable account lease for the
 //! authenticated list request, then releases both before each public article
-//! is fetched with a clean browser session.
+//! is fetched with a clean browser session. The selected account is returned
+//! with the list references so that, if a public fetch fails, the adapter can
+//! reacquire that same account and try the authenticated WeRead content
+//! endpoint before reporting the acquisition error.
 //!
 //! Authentication uses an encrypted cookie header injected by the application
 //! authentication boundary. The account is selected at job time from the
@@ -22,14 +25,17 @@ use crate::{
     acquisition::{
         article_page::{ArticlePageError, ArticlePageFetcher, ExtractedArticlePage},
         browser_pool::{AccountLeaseError, AccountLeaseStore, BrowserPool},
-        webdriver::{WebDriverError, WebDriverFactory},
+        webdriver::{AuthenticatedBrowserSession, WebDriverError, WebDriverFactory},
         weread::{WeReadAdapter, WeReadAdapterError, WeReadArticleReference},
     },
     domain::{credentials::WeReadAccountId, source::Source},
     persistence::repositories::credential_repository::{CredentialRecord, CredentialRepository},
 };
 
-use super::{source_sync_handler::SourceSyncAcquirer, sync_service::SyncAcquisitionError};
+use super::{
+    source_sync_handler::{SourceSyncAcquirer, SourceSyncReferences},
+    sync_service::SyncAcquisitionError,
+};
 
 /// Resolves the account to use for one source-sync request.
 ///
@@ -230,21 +236,19 @@ impl<R, W, A, S> BrowserSourceSyncAcquirer<R, W, A, S> {
             worker_index,
         }
     }
-}
 
-#[async_trait::async_trait]
-impl<R, W, A, S> SourceSyncAcquirer for BrowserSourceSyncAcquirer<R, W, A, S>
-where
-    R: AccountLeaseStore + Clone + 'static,
-    W: WeReadAdapter<R>,
-    A: ArticlePageFetcher,
-    S: WeReadAccountSelector,
-{
-    async fn list_article_references(
+    async fn open_authenticated_session(
         &self,
         source: &Source,
-    ) -> Result<Vec<WeReadArticleReference>, SyncAcquisitionError> {
-        let requested_account = source.account_id().or(self.config.account_id());
+        selected_account_id: Option<WeReadAccountId>,
+    ) -> Result<AuthenticatedBrowserSession<R>, SyncAcquisitionError>
+    where
+        R: AccountLeaseStore + Clone + 'static,
+        S: WeReadAccountSelector,
+    {
+        let requested_account = selected_account_id
+            .or(source.account_id())
+            .or(self.config.account_id());
         let account_id = self
             .dependencies
             .account_selector
@@ -279,6 +283,59 @@ where
             let _ = session.release().await;
             return Err(SyncAcquisitionError::WeRead(error.into()));
         }
+        Ok(session)
+    }
+
+    async fn fetch_article_with_weread(
+        &self,
+        source: &Source,
+        reference: &WeReadArticleReference,
+        selected_account_id: Option<WeReadAccountId>,
+    ) -> Result<ExtractedArticlePage, SyncAcquisitionError>
+    where
+        R: AccountLeaseStore + Clone + 'static,
+        W: WeReadAdapter<R>,
+        S: WeReadAccountSelector,
+    {
+        let mut session = self
+            .open_authenticated_session(source, selected_account_id)
+            .await?;
+        let result: Result<ExtractedArticlePage, WeReadAdapterError> = async {
+            let request = session
+                .prepare_request(self.config.lease_for())
+                .await
+                .map_err(WeReadAdapterError::from)?;
+            self.dependencies
+                .weread
+                .fetch_article_content(reference, request)
+                .await
+        }
+        .await;
+        let heartbeat = session.stop_lease_heartbeat().await;
+        let release = session.release().await;
+        match (result, heartbeat, release) {
+            (Err(error), _, _) => Err(SyncAcquisitionError::WeRead(error)),
+            (Ok(_), Err(error), _) => Err(SyncAcquisitionError::WeRead(error.into())),
+            (Ok(_), Ok(()), Err(error)) => Err(SyncAcquisitionError::WeRead(error.into())),
+            (Ok(page), Ok(()), Ok(())) => Ok(page),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<R, W, A, S> SourceSyncAcquirer for BrowserSourceSyncAcquirer<R, W, A, S>
+where
+    R: AccountLeaseStore + Clone + 'static,
+    W: WeReadAdapter<R>,
+    A: ArticlePageFetcher,
+    S: WeReadAccountSelector,
+{
+    async fn list_article_references(
+        &self,
+        source: &Source,
+    ) -> Result<SourceSyncReferences, SyncAcquisitionError> {
+        let mut session = self.open_authenticated_session(source, None).await?;
+        let selected_account_id = session.account_id();
         let result = async {
             let references = {
                 let request = session
@@ -300,30 +357,51 @@ where
             (Err(error), _, _) => Err(SyncAcquisitionError::WeRead(error)),
             (Ok(_), Err(error), _) => Err(SyncAcquisitionError::WeRead(error.into())),
             (Ok(_), Ok(()), Err(error)) => Err(SyncAcquisitionError::WeRead(error.into())),
-            (Ok(references), Ok(()), Ok(())) => Ok(references),
+            (Ok(references), Ok(()), Ok(())) => Ok(SourceSyncReferences::new(
+                references,
+                Some(selected_account_id),
+            )),
         }
     }
 
     async fn fetch_article(
         &self,
+        source: &Source,
         reference: &WeReadArticleReference,
+        selected_account_id: Option<WeReadAccountId>,
     ) -> Result<ExtractedArticlePage, SyncAcquisitionError> {
         let url = reference.article_url.clone().ok_or_else(|| {
             SyncAcquisitionError::ArticlePage(ArticlePageError::InvalidExtraction(
                 "WeRead article reference has no public URL".to_owned(),
             ))
         })?;
-        let session = self
+        let public_result = self
             .dependencies
             .webdriver
             .open_public(&self.dependencies.browser_pool)
-            .await
-            .map_err(map_public_webdriver_error)?;
-        self.dependencies
-            .article_pages
-            .fetch(url, session)
-            .await
-            .map_err(SyncAcquisitionError::ArticlePage)
+            .await;
+        let public_result = match public_result {
+            Ok(session) => self
+                .dependencies
+                .article_pages
+                .fetch(url, session)
+                .await
+                .map_err(SyncAcquisitionError::ArticlePage),
+            Err(error) => Err(map_public_webdriver_error(error)),
+        };
+        match public_result {
+            Ok(page) => Ok(page),
+            Err(public_error) => {
+                tracing::warn!(
+                    source_id = %source.id(),
+                    review_id = %reference.review_id,
+                    error = %public_error,
+                    "public article fetch failed; trying authenticated WeRead content fallback"
+                );
+                self.fetch_article_with_weread(source, reference, selected_account_id)
+                    .await
+            }
+        }
     }
 }
 
@@ -343,14 +421,27 @@ impl From<AccountLeaseError> for SyncAcquisitionError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        body::{to_bytes, Body},
+        extract::State,
+        http::{Method, Request, Response, StatusCode},
+        Router,
+    };
+    use serde_json::{json, Value};
+    use tokio::net::TcpListener;
+
     use super::*;
     use crate::{
         acquisition::{
             article_page::{ArticlePageError, ArticlePageFetcher},
             browser_pool::{AccountLeaseStore, BrowserPool},
             webdriver::{AuthenticatedRequest, PublicBrowserSession},
+            weread::{WeReadCredentialProvider, WeReadCredentialProviderError},
         },
         config::BrowserEngine,
+        domain::credentials::WeReadCredentials,
         domain::source::{NewSource, Source},
         persistence::repositories::{
             account_lease_repository::MemoryAccountLeaseRepository,
@@ -412,6 +503,201 @@ mod tests {
             requested: Option<WeReadAccountId>,
         ) -> Result<Option<WeReadAccountId>, WeReadAdapterError> {
             Ok(requested.or(self.account_id))
+        }
+    }
+
+    #[derive(Clone)]
+    struct AlternatingAccountSelector {
+        first: WeReadAccountId,
+        second: WeReadAccountId,
+        calls: Arc<Mutex<Vec<Option<WeReadAccountId>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WeReadAccountSelector for AlternatingAccountSelector {
+        async fn select_account(
+            &self,
+            requested: Option<WeReadAccountId>,
+        ) -> Result<Option<WeReadAccountId>, WeReadAdapterError> {
+            let call_index = {
+                let mut calls = self.calls.lock().unwrap();
+                let call_index = calls.len();
+                calls.push(requested);
+                call_index
+            };
+            Ok(requested.or(Some(if call_index == 0 {
+                self.first
+            } else {
+                self.second
+            })))
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingFallbackAdapter {
+        reference: WeReadArticleReference,
+        list_account: Arc<Mutex<Option<WeReadAccountId>>>,
+        fallback_account: Arc<Mutex<Option<WeReadAccountId>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl<R> WeReadAdapter<R> for RecordingFallbackAdapter
+    where
+        R: AccountLeaseStore,
+    {
+        async fn list_articles(
+            &self,
+            _book_id: &str,
+            request: AuthenticatedRequest<'_, R>,
+        ) -> Result<Vec<WeReadArticleReference>, WeReadAdapterError> {
+            *self.list_account.lock().unwrap() = Some(request.account_id());
+            Ok(vec![self.reference.clone()])
+        }
+
+        async fn fetch_article_content(
+            &self,
+            reference: &WeReadArticleReference,
+            request: AuthenticatedRequest<'_, R>,
+        ) -> Result<ExtractedArticlePage, WeReadAdapterError> {
+            *self.fallback_account.lock().unwrap() = Some(request.account_id());
+            Ok(ExtractedArticlePage {
+                canonical_url: reference
+                    .article_url
+                    .clone()
+                    .expect("the fallback test reference should have a public URL"),
+                title: "Fallback title".to_owned(),
+                author: None,
+                summary: None,
+                published_at: Some(Utc::now()),
+                content_html: "<p>Fallback body</p>".to_owned(),
+                cover_url: None,
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FallbackWebDriverState {
+        current_url: Mutex<String>,
+        navigations: Mutex<Vec<String>>,
+        page_source: String,
+    }
+
+    async fn fallback_webdriver_handler(
+        State(state): State<Arc<FallbackWebDriverState>>,
+        request: Request<Body>,
+    ) -> Response<Body> {
+        let method = request.method().clone();
+        let path = request.uri().path().to_owned();
+        if method == Method::POST && path.ends_with("/session") {
+            return webdriver_response(json!({
+                "sessionId": "fallback-session",
+                "capabilities": {}
+            }));
+        }
+        if method == Method::POST && path.ends_with("/url") {
+            let body = to_bytes(request.into_body(), 1_000_000)
+                .await
+                .expect("WebDriver navigation body should be readable");
+            let payload: Value =
+                serde_json::from_slice(&body).expect("WebDriver navigation body should be JSON");
+            let target = payload
+                .get("url")
+                .and_then(Value::as_str)
+                .expect("WebDriver navigation should contain a URL")
+                .to_owned();
+            state.navigations.lock().unwrap().push(target.clone());
+            *state.current_url.lock().unwrap() = target;
+            return webdriver_response(Value::Null);
+        }
+        if method == Method::GET && path.ends_with("/url") {
+            return webdriver_response(json!(state.current_url.lock().unwrap().clone()));
+        }
+        if method == Method::GET && path.ends_with("/source") {
+            return webdriver_response(json!(state.page_source.clone()));
+        }
+        if method == Method::DELETE && path.contains("/session/") {
+            return webdriver_response(Value::Null);
+        }
+        webdriver_response(Value::Null)
+    }
+
+    fn webdriver_response(value: Value) -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "value": value }).to_string()))
+            .expect("test WebDriver response should be valid")
+    }
+
+    async fn start_fallback_webdriver() -> (
+        url::Url,
+        Arc<FallbackWebDriverState>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test WebDriver listener should bind");
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let state = Arc::new(FallbackWebDriverState {
+            current_url: Mutex::new("https://weread.qq.com/web/shelf".to_owned()),
+            navigations: Mutex::new(Vec::new()),
+            page_source: r#"
+                <html><head><meta property="og:title" content="Fallback title"></head>
+                <body><div id="js_content"><p>WeRead content</p></div></body></html>
+            "#
+            .to_owned(),
+        });
+        let app = Router::new()
+            .fallback(fallback_webdriver_handler)
+            .with_state(Arc::clone(&state));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test WebDriver server should run");
+        });
+        (
+            endpoint.parse().expect("test WebDriver URL should parse"),
+            state,
+            server,
+        )
+    }
+
+    #[derive(Clone)]
+    struct FallbackCredentialProvider;
+
+    #[async_trait::async_trait]
+    impl WeReadCredentialProvider for FallbackCredentialProvider {
+        async fn credentials(
+            &self,
+            _account_id: WeReadAccountId,
+        ) -> Result<WeReadCredentials, WeReadCredentialProviderError> {
+            WeReadCredentials::new(
+                "access",
+                "refresh",
+                Utc::now() + Duration::hours(1),
+                Utc::now(),
+            )
+            .expect("test credentials should be valid")
+            .with_web_cookie("wr_vid=test; wr_skey=test")
+            .map_err(|_| WeReadCredentialProviderError::Unavailable)
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockedPublicFetcher;
+
+    #[async_trait::async_trait]
+    impl ArticlePageFetcher for BlockedPublicFetcher {
+        async fn fetch(
+            &self,
+            _url: crate::domain::source::VerifiedWechatArticleUrl,
+            session: PublicBrowserSession,
+        ) -> Result<ExtractedArticlePage, ArticlePageError> {
+            session
+                .close()
+                .await
+                .expect("the failed public session should be cleaned up");
+            Err(ArticlePageError::VerificationRequired)
         }
     }
 
@@ -699,6 +985,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_article_failure_falls_back_to_authenticated_weread_content() {
+        let (webdriver_url, state, server) = start_fallback_webdriver().await;
+        let repository = MemoryAccountLeaseRepository::new(Utc::now());
+        let selected_account = account_id();
+        let config = BrowserSourceSyncAcquirerConfig::new(
+            None,
+            "source-sync-fallback-test",
+            Duration::seconds(30),
+            Duration::seconds(5),
+        )
+        .expect("test acquisition policy should be valid");
+        let acquirer = BrowserSourceSyncAcquirer::new(
+            BrowserSourceSyncAcquirerDependencies {
+                browser_pool: BrowserPool::new(1).expect("test pool should be valid"),
+                webdriver: WebDriverFactory::new(webdriver_url, BrowserEngine::Firefox),
+                account_leases: repository.clone(),
+                weread: crate::acquisition::weread::BrowserWeReadAdapter::new(
+                    "https://weread.qq.com/api/mp/cover"
+                        .parse()
+                        .expect("test endpoint should be valid"),
+                )
+                .expect("test endpoint should be accepted")
+                .with_credential_provider(Arc::new(FallbackCredentialProvider)),
+                article_pages: BlockedPublicFetcher,
+                account_selector: StaticAccountSelector {
+                    account_id: Some(selected_account),
+                },
+            },
+            config,
+            0,
+        );
+        let reference = WeReadArticleReference::new(
+            "MP_WXS_book-1_article-1",
+            Some(
+                "https://mp.weixin.qq.com/s/article-1"
+                    .parse()
+                    .expect("test article URL should be valid"),
+            ),
+            Some("List title".to_owned()),
+        )
+        .expect("test reference should be valid");
+
+        let page = acquirer
+            .fetch_article(&source(None), &reference, Some(selected_account))
+            .await
+            .expect("authenticated content should recover a blocked public article");
+
+        assert_eq!(page.title, "Fallback title");
+        assert_eq!(page.content_html, "<p>WeRead content</p>");
+        assert_eq!(
+            state.navigations.lock().unwrap().clone(),
+            vec![
+                "https://weread.qq.com/web/shelf".to_owned(),
+                "https://weread.qq.com/web/shelf".to_owned(),
+                "https://weread.qq.com/web/mp/content?reviewId=MP_WXS_book-1_article-1".to_owned(),
+            ]
+        );
+        assert!(repository
+            .acquire(selected_account, "after-fallback", Duration::seconds(30))
+            .await
+            .expect("the fallback lease should be released")
+            .is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn authenticated_fallback_reuses_the_account_selected_for_listing() {
+        let (webdriver_url, _state, server) = start_fallback_webdriver().await;
+        let repository = MemoryAccountLeaseRepository::new(Utc::now());
+        let first_account = account_id();
+        let second_account = WeReadAccountId::from_uuid(Uuid::from_u128(2));
+        let list_account = Arc::new(Mutex::new(None));
+        let fallback_account = Arc::new(Mutex::new(None));
+        let selector_calls = Arc::new(Mutex::new(Vec::new()));
+        let reference = WeReadArticleReference::new(
+            "MP_WXS_book-1_article-1",
+            Some(
+                "https://mp.weixin.qq.com/s/article-1"
+                    .parse()
+                    .expect("test article URL should be valid"),
+            ),
+            Some("List title".to_owned()),
+        )
+        .expect("test reference should be valid");
+        let config = BrowserSourceSyncAcquirerConfig::new(
+            None,
+            "source-sync-account-context-test",
+            Duration::seconds(30),
+            Duration::seconds(5),
+        )
+        .expect("test acquisition policy should be valid");
+        let acquirer = BrowserSourceSyncAcquirer::new(
+            BrowserSourceSyncAcquirerDependencies {
+                browser_pool: BrowserPool::new(1).expect("test pool should be valid"),
+                webdriver: WebDriverFactory::new(webdriver_url, BrowserEngine::Firefox),
+                account_leases: repository,
+                weread: RecordingFallbackAdapter {
+                    reference,
+                    list_account: Arc::clone(&list_account),
+                    fallback_account: Arc::clone(&fallback_account),
+                },
+                article_pages: BlockedPublicFetcher,
+                account_selector: AlternatingAccountSelector {
+                    first: first_account,
+                    second: second_account,
+                    calls: Arc::clone(&selector_calls),
+                },
+            },
+            config,
+            0,
+        );
+
+        let selected = acquirer
+            .list_article_references(&source(None))
+            .await
+            .expect("listing should select the first account");
+        let (references, selected_account) = selected.into_parts();
+        acquirer
+            .fetch_article(&source(None), &references[0], selected_account)
+            .await
+            .expect("the fallback should use the selected account");
+
+        assert_eq!(*list_account.lock().unwrap(), Some(first_account));
+        assert_eq!(*fallback_account.lock().unwrap(), Some(first_account));
+        assert_eq!(
+            *selector_calls.lock().unwrap(),
+            vec![None, Some(first_account)]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn missing_public_url_is_rejected_before_opening_a_public_browser() {
         let reference = WeReadArticleReference::new("review-1", None, Some("title".to_owned()))
             .expect("reference should be valid");
@@ -706,7 +1124,7 @@ mod tests {
             MemoryAccountLeaseRepository::new(chrono::Utc::now()),
             account_id(),
         )
-        .fetch_article(&reference)
+        .fetch_article(&source(None), &reference, None)
         .await;
 
         assert!(matches!(

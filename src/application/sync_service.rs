@@ -2,8 +2,9 @@
 //!
 //! This service executes a claimed source-sync job. It acquires the distributed
 //! WeRead account lease for authenticated article-list and URL-recovery work,
-//! then releases that account session before fetching public article pages in
-//! clean, ephemeral browser sessions without credentials.
+//! then releases that account session before first fetching public article
+//! pages in clean, ephemeral browser sessions without credentials. A failed
+//! public fetch may reacquire the source account for WeRead's content fallback.
 //!
 //! Browser acquisition, waits, and normalization happen outside database
 //! transactions while an independent heartbeat task maintains the job and, when
@@ -24,8 +25,8 @@
 //! the acquisition pacing policy. If quiet hours begin mid-job, the current
 //! bounded operation may finish, then the job exits with a non-failure
 //! `deferred` outcome whose `run_after` is the next allowed instant.
-//! Credentials are scoped to the account/list acquisition step; the article
-//! page adapter must not receive or require them.
+//! Credentials are scoped to the authenticated WeRead adapter; the public
+//! article page adapter must not receive or require them.
 //!
 //! The executable preparation slice is consumed by
 //! [`super::source_sync_handler::SourceSyncJobHandler`]: list metadata is used
@@ -128,6 +129,11 @@ pub fn classify_acquisition_error(error: &SyncAcquisitionError) -> ClassifiedSyn
             SyncOutcome::RiskControlled,
             SyncFailureClass::RiskControlled,
             "WeRead request was risk-controlled",
+        ),
+        SyncAcquisitionError::WeRead(WeReadAdapterError::VerificationRequired) => (
+            SyncOutcome::Blocked,
+            SyncFailureClass::Blocked,
+            "authenticated WeRead article acquisition was blocked",
         ),
         SyncAcquisitionError::WeRead(WeReadAdapterError::InvalidArticleUrl)
         | SyncAcquisitionError::WeRead(WeReadAdapterError::InvalidReviewId) => (
@@ -482,5 +488,19 @@ mod tests {
             assert_eq!(classified.failure().class(), class);
             assert_eq!(classified.failure().message(), message);
         }
+    }
+
+    #[test]
+    fn classifies_authenticated_weread_verification_as_blocked() {
+        let classified = classify_acquisition_error(&SyncAcquisitionError::WeRead(
+            WeReadAdapterError::VerificationRequired,
+        ));
+
+        assert_eq!(classified.outcome(), SyncOutcome::Blocked);
+        assert_eq!(classified.failure().class(), SyncFailureClass::Blocked);
+        assert_eq!(
+            classified.failure().message(),
+            "authenticated WeRead article acquisition was blocked"
+        );
     }
 }

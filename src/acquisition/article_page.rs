@@ -206,6 +206,23 @@ fn parse_article_html(
     canonical_url: VerifiedWechatArticleUrl,
     timezone: Tz,
 ) -> Result<ExtractedArticlePage, ArticlePageError> {
+    parse_article_html_with_fallback(html, canonical_url, timezone, None, None)
+}
+
+/// Parses an article page while optionally supplying metadata from an
+/// authenticated upstream list response.
+///
+/// WeRead's authenticated MP content endpoint is a rendered article page, but
+/// its title or publication timestamp can be absent in some responses. The
+/// list response is trusted only as a metadata fallback; the HTML body still
+/// has to contain a non-empty article element.
+pub(crate) fn parse_article_html_with_fallback(
+    html: &str,
+    canonical_url: VerifiedWechatArticleUrl,
+    timezone: Tz,
+    fallback_title: Option<&str>,
+    fallback_published_at: Option<DateTime<Utc>>,
+) -> Result<ExtractedArticlePage, ArticlePageError> {
     let document = Html::parse_document(html);
     if is_verification_page(&document) {
         return Err(ArticlePageError::VerificationRequired);
@@ -216,6 +233,12 @@ fn parse_article_html(
     )
     .or_else(|| first_attribute(&document, "meta[property='og:title']", "content"))
     .or_else(|| first_text(&document, &["title"]))
+    .or_else(|| {
+        fallback_title
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
     .ok_or_else(|| ArticlePageError::InvalidExtraction("article title is missing".into()))?;
     let content = first_element(&document, "#js_content")
         .or_else(|| first_element(&document, ".rich_media_content"))
@@ -230,7 +253,8 @@ fn parse_article_html(
 
     let published_at = first_text(&document, &["#publish_time"])
         .map(|value| parse_publication_time(&value, timezone))
-        .transpose()?;
+        .transpose()?
+        .or(fallback_published_at);
 
     Ok(ExtractedArticlePage {
         canonical_url,
@@ -537,6 +561,40 @@ mod tests {
 
         let page = parse_article_html(html, article_url(), chrono_tz::Asia::Shanghai).unwrap();
         assert!(page.content_html.contains("Rich media body"));
+    }
+
+    #[test]
+    fn uses_list_title_when_authenticated_content_omits_title() {
+        let html = r#"<div id="js_content"><p>Body</p></div>"#;
+        let page = parse_article_html_with_fallback(
+            html,
+            article_url(),
+            chrono_tz::Asia::Shanghai,
+            Some("List title"),
+            None,
+        )
+        .expect("list title should fill the content-page metadata gap");
+
+        assert_eq!(page.title, "List title");
+    }
+
+    #[test]
+    fn uses_list_publication_time_when_authenticated_content_omits_time() {
+        let html = r#"
+            <h1 class="rich_media_title">Title</h1>
+            <div id="js_content"><p>Body</p></div>
+        "#;
+        let published_at = DateTime::from_timestamp(1_700_000_000, 0);
+        let page = parse_article_html_with_fallback(
+            html,
+            article_url(),
+            chrono_tz::Asia::Shanghai,
+            None,
+            published_at,
+        )
+        .expect("list publication time should fill the content-page metadata gap");
+
+        assert_eq!(page.published_at, published_at);
     }
 
     #[test]

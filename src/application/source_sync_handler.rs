@@ -2,8 +2,9 @@
 //!
 //! The handler owns the boundary between acquisition and persistence. The
 //! injected [`SourceSyncAcquirer`] is responsible for authenticated WeRead
-//! list access and credential-free public article fetching; it never receives
-//! a database transaction. Acquired pages are normalized outside a
+//! list access, credential-free public article fetching, and an authenticated
+//! WeRead content fallback; it never receives a database transaction. Acquired
+//! pages are normalized outside a
 //! transaction, and the final article upserts, source revision/schedule,
 //! sync-run completion, optional feed-rebuild enqueue, and fenced job outcome
 //! commit together through [`UnitOfWorkFactory`].
@@ -27,6 +28,7 @@ use crate::{
         worker::{JobExecution, JobHandler},
     },
     domain::{
+        credentials::WeReadAccountId,
         job::JobType,
         pacing::QuietHours,
         source::{SchedulingGate, Source, SourceId},
@@ -43,24 +45,61 @@ use crate::{
     },
 };
 
+/// Article references and the account selected for their synchronization job.
+///
+/// The account is carried separately from the article metadata so an
+/// unbound source keeps the same random account when an article falls back
+/// from public WeChat HTML to authenticated WeRead content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSyncReferences {
+    references: Vec<WeReadArticleReference>,
+    account_id: Option<WeReadAccountId>,
+}
+
+impl SourceSyncReferences {
+    /// Creates a reference batch with the account selected for its job.
+    pub fn new(
+        references: Vec<WeReadArticleReference>,
+        account_id: Option<WeReadAccountId>,
+    ) -> Self {
+        Self {
+            references,
+            account_id,
+        }
+    }
+
+    /// Splits the batch for the synchronization loop.
+    pub fn into_parts(self) -> (Vec<WeReadArticleReference>, Option<WeReadAccountId>) {
+        (self.references, self.account_id)
+    }
+}
+
 /// Acquisition port consumed by one source-sync job.
 ///
 /// Implementations should keep authenticated list/session work inside
-/// `list_article_references` and pass only validated public-page results back
-/// through `fetch_article`. The latter operation is deliberately given no
-/// account or browser-pool credential capability by this interface.
+/// `list_article_references` and return the account selected for that job.
+/// The handler passes that account back through `fetch_article` so a public
+/// page failure can reacquire the same account lease for authenticated
+/// fallback work.
 #[async_trait::async_trait]
 pub trait SourceSyncAcquirer: Send + Sync {
     /// Lists the current normalized WeRead article references for one source.
+    /// The result also carries the account selected for this synchronization
+    /// job, when the implementation uses authenticated account selection.
     async fn list_article_references(
         &self,
         source: &Source,
-    ) -> Result<Vec<WeReadArticleReference>, SyncAcquisitionError>;
+    ) -> Result<SourceSyncReferences, SyncAcquisitionError>;
 
-    /// Fetches and extracts one public article page without credentials.
+    /// Fetches and extracts one article, using public HTML first and an
+    /// authenticated WeRead content fallback when necessary.
+    /// `account_id` is the account selected while listing the source and must
+    /// be reused by authenticated fallback implementations.
     async fn fetch_article(
         &self,
+        source: &Source,
         reference: &WeReadArticleReference,
+        account_id: Option<WeReadAccountId>,
     ) -> Result<ExtractedArticlePage, SyncAcquisitionError>;
 }
 
@@ -277,6 +316,7 @@ where
                 });
             }
         };
+        let (references, selected_account_id) = references.into_parts();
         let seen = match u32::try_from(references.len()) {
             Ok(seen) => seen,
             Err(_) => {
@@ -309,7 +349,12 @@ where
                     });
                 }
             };
-            match self.dependencies.acquirer.fetch_article(&reference).await {
+            match self
+                .dependencies
+                .acquirer
+                .fetch_article(&context.source, &reference, selected_account_id)
+                .await
+            {
                 Ok(page) => observed.push((reference, page, observation_version)),
                 Err(error) => {
                     let failure = classify_acquisition_error(&error);

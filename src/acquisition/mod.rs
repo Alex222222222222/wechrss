@@ -9,10 +9,10 @@
 //! verification pages, authentication expiry, and risk-control responses must
 //! be mapped to typed errors from the shared error taxonomy.
 //!
-//! WeRead credentials are scoped to authenticated account and article-list
-//! operations. Public article content is fetched by [`article_page`] without
-//! credentials, so a content-page fetch must not trigger login or depend on a
-//! persisted account session.
+//! WeRead credentials are scoped to authenticated account, article-list, and
+//! content-fallback operations. Public article content is attempted through
+//! [`article_page`] without credentials first; a failed public fetch may use
+//! the same account session to retrieve WeRead's authenticated MP content.
 //! Authenticated and public browser sessions are separate capabilities. Public
 //! sessions use clean ephemeral profiles and accept only verified WeChat URLs.
 //!

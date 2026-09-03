@@ -14,7 +14,7 @@ use werrss::{
     application::{
         source_sync_handler::{
             SourceSyncAcquirer, SourceSyncJobHandler, SourceSyncJobHandlerConfig,
-            SourceSyncJobHandlerDependencies,
+            SourceSyncJobHandlerDependencies, SourceSyncReferences,
         },
         sync_service::SyncAcquisitionError,
         worker::{JobExecution, JobHandler},
@@ -70,7 +70,7 @@ impl SourceSyncAcquirer for FakeAcquirer {
     async fn list_article_references(
         &self,
         _source: &werrss::domain::source::Source,
-    ) -> Result<Vec<WeReadArticleReference>, SyncAcquisitionError> {
+    ) -> Result<SourceSyncReferences, SyncAcquisitionError> {
         if let Some(list_started) = &self.list_started {
             list_started.notify_one();
         }
@@ -82,13 +82,15 @@ impl SourceSyncAcquirer for FakeAcquirer {
                 WeReadAdapterError::AuthenticationExpired { code: 401 },
             ))
         } else {
-            Ok(self.references.clone())
+            Ok(SourceSyncReferences::new(self.references.clone(), None))
         }
     }
 
     async fn fetch_article(
         &self,
+        _source: &werrss::domain::source::Source,
         reference: &WeReadArticleReference,
+        _account_id: Option<werrss::domain::credentials::WeReadAccountId>,
     ) -> Result<ExtractedArticlePage, SyncAcquisitionError> {
         if let Some(fetch_started) = &self.fetch_started {
             fetch_started.notify_one();

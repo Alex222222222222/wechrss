@@ -808,6 +808,17 @@ where
             .map_err(|error| WebDriverError::Command(error.to_string()))
     }
 
+    /// Captures the authenticated browser's current rendered page source.
+    pub(crate) async fn source(&self) -> Result<String, WebDriverError> {
+        self.session
+            .client
+            .as_ref()
+            .ok_or(WebDriverError::NotConnected)?
+            .source()
+            .await
+            .map_err(|error| WebDriverError::Command(error.to_string()))
+    }
+
     /// Installs a validated WeRead cookie header into the current browser
     /// origin. The caller must navigate to `weread.qq.com` first because
     /// WebDriver rejects cookies added while no matching origin is loaded.
@@ -974,6 +985,7 @@ mod tests {
         cookie_domains: Mutex<Vec<Option<String>>>,
         raw_fetch_urls: Mutex<Vec<String>>,
         raw_fetch_body: String,
+        page_source: String,
         current_url: Mutex<String>,
         redirect_shelf_to_login: bool,
     }
@@ -1035,6 +1047,9 @@ mod tests {
             }
             if method == Method::POST && path.ends_with("/execute/sync") {
                 return webdriver_json_response(json!(r#"{"data":[]}"#));
+            }
+            if method == Method::GET && path.ends_with("/source") {
+                return webdriver_json_response(json!(self.state.page_source.clone()));
             }
             if method == Method::POST && path.ends_with("/execute/async") {
                 let target = body
@@ -1313,6 +1328,7 @@ mod tests {
             cookie_domains: Mutex::new(Vec::new()),
             raw_fetch_urls: Mutex::new(Vec::new()),
             raw_fetch_body: r#"{"reviewId":"MP_WXS_book-1_article-1","title":"Cover title","name":"Account","pic":"https://mmbiz.qpic.cn/cover.jpg"}"#.to_owned(),
+            page_source: String::new(),
             current_url: Mutex::new(TEST_WEREAD_SHELF_URL.to_owned()),
             redirect_shelf_to_login: false,
         });
@@ -1380,6 +1396,7 @@ mod tests {
             cookie_domains: Mutex::new(Vec::new()),
             raw_fetch_urls: Mutex::new(Vec::new()),
             raw_fetch_body: r#"{"data":[]}"#.to_owned(),
+            page_source: String::new(),
             current_url: Mutex::new(TEST_WEREAD_SHELF_URL.to_owned()),
             redirect_shelf_to_login: true,
         });
@@ -1425,6 +1442,88 @@ mod tests {
                 TEST_WEREAD_SHELF_URL.to_owned(),
             ]
         );
+        session
+            .release()
+            .await
+            .expect("the test account lease should be released");
+    }
+
+    #[tokio::test]
+    async fn weread_content_fetch_extracts_js_content_in_the_authenticated_session() {
+        use crate::acquisition::weread::{
+            BrowserWeReadAdapter, WeReadAdapter, WeReadArticleReference,
+        };
+
+        let state = Arc::new(WeReadBrowserState {
+            navigations: Mutex::new(Vec::new()),
+            cookie_domains: Mutex::new(Vec::new()),
+            raw_fetch_urls: Mutex::new(Vec::new()),
+            raw_fetch_body: String::new(),
+            page_source: r#"
+                <html><head>
+                  <meta property="og:title" content="Content title">
+                </head><body>
+                  <div id="js_content"><p>Authenticated body</p></div>
+                </body></html>
+            "#
+            .to_owned(),
+            current_url: Mutex::new(TEST_WEREAD_SHELF_URL.to_owned()),
+            redirect_shelf_to_login: false,
+        });
+        let repository = crate::persistence::repositories::account_lease_repository::
+            MemoryAccountLeaseRepository::new(chrono::Utc::now());
+        let account_id =
+            crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(1));
+        let pool = BrowserPool::new(1).unwrap();
+        let mut session = pool
+            .open_authenticated(
+                repository,
+                account_id,
+                "worker-a",
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .expect("the test worker should acquire the account")
+            .attach_client(weread_driver(Arc::clone(&state)).await);
+        let request = session
+            .prepare_request(chrono::Duration::seconds(30))
+            .await
+            .unwrap();
+        let reference = WeReadArticleReference::new(
+            "MP_WXS_book-1_article-1",
+            Some(
+                "https://mp.weixin.qq.com/s/article-1"
+                    .parse()
+                    .expect("test article URL should be valid"),
+            ),
+            Some("List title".to_owned()),
+        )
+        .unwrap();
+        let adapter = BrowserWeReadAdapter::new(
+            "https://weread.qq.com/api/mp/cover"
+                .parse()
+                .expect("test endpoint should be valid"),
+        )
+        .unwrap()
+        .with_credential_provider(Arc::new(TestWeReadCredentialProvider));
+
+        let page = adapter
+            .fetch_article_content(&reference, request)
+            .await
+            .expect("authenticated content should parse");
+
+        assert_eq!(page.title, "Content title");
+        assert_eq!(page.content_html, "<p>Authenticated body</p>");
+        assert_eq!(
+            state.navigations.lock().unwrap().clone(),
+            vec![
+                TEST_WEREAD_SHELF_URL.to_owned(),
+                TEST_WEREAD_SHELF_URL.to_owned(),
+                "https://weread.qq.com/web/mp/content?reviewId=MP_WXS_book-1_article-1".to_owned(),
+            ]
+        );
+        assert!(state.raw_fetch_urls.lock().unwrap().is_empty());
         session
             .release()
             .await

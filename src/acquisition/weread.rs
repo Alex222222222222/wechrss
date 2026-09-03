@@ -1,10 +1,10 @@
 //! WeRead account and article-list protocol adapter boundary.
 //!
 //! This module defines the authenticated protocol port for QR/login state,
-//! refresh-token lifecycle, article-list responses, detail-URL recovery, and
-//! current/legacy response-shape parsing. It does not fetch rendered article
-//! content: that is the separate public operation in [`super::article_page`]
-//! and intentionally needs no credentials.
+//! refresh-token lifecycle, article-list responses, detail-URL recovery,
+//! current/legacy response-shape parsing, and rendered article-content
+//! fallback. Public article fetching remains a separate credential-free
+//! operation in [`super::article_page`] and is attempted before this fallback.
 //!
 //! A caller must obtain the one-request capability from
 //! [`super::webdriver::AuthenticatedBrowserSession::prepare_request`] before
@@ -20,8 +20,8 @@
 //! response, normalizes review records, and rejects unsupported or unsafe
 //! values before they reach persistence. The concrete browser adapter below
 //! keeps the authenticated WebDriver capability private and reads the
-//! endpoint response as raw text; it does not parse browser-rendered JSON
-//! viewer text.
+//! endpoint response as raw text and captures rendered HTML for the content
+//! fallback; it does not parse browser-rendered JSON viewer text.
 //! QR exchange remains outside this protocol adapter; credential refresh is
 //! handled by the application authentication lifecycle.
 
@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use serde_json::{Map, Value};
 use thiserror::Error;
 use url::Url;
@@ -39,6 +40,7 @@ use crate::domain::{
 };
 
 use super::{
+    article_page::{parse_article_html_with_fallback, ArticlePageError, ExtractedArticlePage},
     browser_pool::{AccountLeaseError, AccountLeaseStore},
     pacing::PacingController,
     webdriver::AuthenticatedRequest,
@@ -47,6 +49,7 @@ use super::{
 const WEREAD_HOST: &str = "weread.qq.com";
 const WEREAD_ARTICLE_LIST_PATH: &str = "/web/mp/articles";
 const WEREAD_ARTICLE_COVER_PATH: &str = "/api/mp/cover";
+const WEREAD_ARTICLE_CONTENT_PATH: &str = "/web/mp/content";
 const WEREAD_SHELF_PATH: &str = "/web/shelf";
 const WEREAD_SHELF_URL: &str = "https://weread.qq.com/web/shelf";
 const WEREAD_AUTHENTICATION_EXPIRED_CODE: i64 = -2012;
@@ -114,6 +117,9 @@ pub enum WeReadAdapterError {
         /// Stable upstream business error code.
         code: i64,
     },
+    /// The authenticated content page requires environment verification.
+    #[error("WeRead article content requires environment verification")]
+    VerificationRequired,
     /// The upstream response did not match a supported shape.
     #[error("WeRead protocol error: {0}")]
     Protocol(String),
@@ -419,6 +425,7 @@ pub struct BrowserWeReadAdapter {
     endpoint: Url,
     pacing: Option<PacingController>,
     credential_provider: Option<Arc<dyn WeReadCredentialProvider>>,
+    timezone: Tz,
 }
 
 impl std::fmt::Debug for BrowserWeReadAdapter {
@@ -428,6 +435,7 @@ impl std::fmt::Debug for BrowserWeReadAdapter {
             .field("endpoint", &self.endpoint)
             .field("pacing", &self.pacing)
             .field("credential_provider", &self.credential_provider.is_some())
+            .field("timezone", &self.timezone)
             .finish()
     }
 }
@@ -445,6 +453,7 @@ impl BrowserWeReadAdapter {
             endpoint,
             pacing: None,
             credential_provider: None,
+            timezone: chrono_tz::UTC,
         })
     }
 
@@ -460,23 +469,25 @@ impl BrowserWeReadAdapter {
         self
     }
 
+    /// Sets the timezone used when the authenticated content page exposes a
+    /// local publication timestamp.
+    pub const fn with_timezone(mut self, timezone: Tz) -> Self {
+        self.timezone = timezone;
+        self
+    }
+
     /// Returns the configured endpoint without exposing browser credentials.
     pub fn endpoint(&self) -> &Url {
         &self.endpoint
     }
-}
 
-#[async_trait]
-impl<R> WeReadAdapter<R> for BrowserWeReadAdapter
-where
-    R: AccountLeaseStore,
-{
-    async fn list_articles(
+    async fn authenticate_request<R>(
         &self,
-        book_id: &str,
-        mut request: AuthenticatedRequest<'_, R>,
-    ) -> Result<Vec<WeReadArticleReference>, WeReadAdapterError> {
-        let endpoint = article_list_endpoint(&self.endpoint, book_id)?;
+        request: &mut AuthenticatedRequest<'_, R>,
+    ) -> Result<(), WeReadAdapterError>
+    where
+        R: AccountLeaseStore,
+    {
         request.ensure_usable().map_err(WeReadAdapterError::from)?;
         let provider = self
             .credential_provider
@@ -504,7 +515,8 @@ where
         // The initial shelf navigation establishes the origin required for
         // WebDriver cookie injection. Navigate to it again after installing
         // credentials so WeRead can apply the cookies and redirect an
-        // unauthenticated account to its login page before listing articles.
+        // unauthenticated account to its login page before any protected
+        // operation is attempted.
         request
             .goto(WEREAD_SHELF_URL)
             .await
@@ -514,7 +526,22 @@ where
             .current_url()
             .await
             .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
-        ensure_authenticated_shelf_url(&shelf_url)?;
+        ensure_authenticated_shelf_url(&shelf_url)
+    }
+}
+
+#[async_trait]
+impl<R> WeReadAdapter<R> for BrowserWeReadAdapter
+where
+    R: AccountLeaseStore,
+{
+    async fn list_articles(
+        &self,
+        book_id: &str,
+        mut request: AuthenticatedRequest<'_, R>,
+    ) -> Result<Vec<WeReadArticleReference>, WeReadAdapterError> {
+        let endpoint = article_list_endpoint(&self.endpoint, book_id)?;
+        self.authenticate_request(&mut request).await?;
         if let Some(pacing) = &self.pacing {
             pacing.wait(crate::domain::pacing::DelayKind::Request).await;
         }
@@ -525,6 +552,53 @@ where
             .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
         request.ensure_usable().map_err(WeReadAdapterError::from)?;
         parse_article_list_body(&body)
+    }
+
+    async fn fetch_article_content(
+        &self,
+        reference: &WeReadArticleReference,
+        mut request: AuthenticatedRequest<'_, R>,
+    ) -> Result<ExtractedArticlePage, WeReadAdapterError> {
+        let canonical_url = reference
+            .article_url
+            .clone()
+            .ok_or(WeReadAdapterError::InvalidArticleUrl)?;
+        let endpoint = article_content_endpoint(&reference.review_id)?;
+        self.authenticate_request(&mut request).await?;
+        if let Some(pacing) = &self.pacing {
+            pacing.wait(crate::domain::pacing::DelayKind::Request).await;
+        }
+        request.ensure_usable().map_err(WeReadAdapterError::from)?;
+        request
+            .goto(endpoint.as_str())
+            .await
+            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+        request.ensure_usable().map_err(WeReadAdapterError::from)?;
+        let content_url = request
+            .current_url()
+            .await
+            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+        ensure_authenticated_content_url(&content_url)?;
+        let html = request
+            .source()
+            .await
+            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+        request.ensure_usable().map_err(WeReadAdapterError::from)?;
+        parse_article_html_with_fallback(
+            &html,
+            canonical_url,
+            self.timezone,
+            reference.title.as_deref(),
+            reference.published_at,
+        )
+        .map_err(map_article_content_error)
+    }
+}
+
+fn map_article_content_error(error: ArticlePageError) -> WeReadAdapterError {
+    match error {
+        ArticlePageError::VerificationRequired => WeReadAdapterError::VerificationRequired,
+        error => WeReadAdapterError::Protocol(error.to_string()),
     }
 }
 
@@ -537,6 +611,23 @@ fn ensure_authenticated_shelf_url(url: &Url) -> Result<(), WeReadAdapterError> {
         && url.fragment().is_none()
         && url.port().is_none_or(|port| port == 443);
     if is_shelf {
+        Ok(())
+    } else {
+        Err(WeReadAdapterError::AuthenticationExpired {
+            code: WEREAD_AUTHENTICATION_EXPIRED_CODE,
+        })
+    }
+}
+
+fn ensure_authenticated_content_url(url: &Url) -> Result<(), WeReadAdapterError> {
+    let is_content = url.scheme() == "https"
+        && url.host_str() == Some(WEREAD_HOST)
+        && (url.path() == WEREAD_ARTICLE_CONTENT_PATH || url.path() == "/web/mp/content/")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+        && url.port().is_none_or(|port| port == 443);
+    if is_content {
         Ok(())
     } else {
         Err(WeReadAdapterError::AuthenticationExpired {
@@ -590,6 +681,19 @@ fn article_list_endpoint(endpoint: &Url, book_id: &str) -> Result<Url, WeReadAda
     Ok(endpoint)
 }
 
+fn article_content_endpoint(review_id: &str) -> Result<Url, WeReadAdapterError> {
+    let review_id = review_id.trim();
+    if review_id.is_empty() {
+        return Err(WeReadAdapterError::InvalidReviewId);
+    }
+    let mut endpoint = Url::parse("https://weread.qq.com/web/mp/content")
+        .expect("static WeRead article-content URL must parse");
+    endpoint
+        .query_pairs_mut()
+        .append_pair("reviewId", review_id);
+    Ok(endpoint)
+}
+
 fn parse_article_list_body(body: &str) -> Result<Vec<WeReadArticleReference>, WeReadAdapterError> {
     let payload = serde_json::from_str::<Value>(body)
         .map_err(|error| WeReadAdapterError::Protocol(format!("response was not JSON: {error}")))?;
@@ -608,6 +712,20 @@ where
         book_id: &str,
         request: AuthenticatedRequest<'_, R>,
     ) -> Result<Vec<WeReadArticleReference>, WeReadAdapterError>;
+
+    /// Fetches and extracts one article through the authenticated WeRead
+    /// content endpoint. Implementations that only support listing may retain
+    /// the default error; the runtime uses this operation only as a fallback
+    /// after public article extraction fails.
+    async fn fetch_article_content(
+        &self,
+        _reference: &WeReadArticleReference,
+        _request: AuthenticatedRequest<'_, R>,
+    ) -> Result<ExtractedArticlePage, WeReadAdapterError> {
+        Err(WeReadAdapterError::Protocol(
+            "authenticated WeRead article-content fallback is not supported".to_owned(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -955,6 +1073,54 @@ mod tests {
         assert_eq!(
             endpoint.as_str(),
             "https://weread.qq.com/api/mp/cover?count=1&bookId=right"
+        );
+    }
+
+    #[test]
+    fn builds_an_encoded_authenticated_content_endpoint() {
+        let endpoint = article_content_endpoint(" review/id with spaces ")
+            .expect("a non-empty review ID should produce an endpoint");
+        assert_eq!(
+            endpoint.as_str(),
+            "https://weread.qq.com/web/mp/content?reviewId=review%2Fid+with+spaces"
+        );
+    }
+
+    #[test]
+    fn rejects_an_empty_authenticated_content_review_id() {
+        assert_eq!(
+            article_content_endpoint("  "),
+            Err(WeReadAdapterError::InvalidReviewId)
+        );
+    }
+
+    #[test]
+    fn accepts_only_the_authenticated_content_path_after_navigation() {
+        for value in [
+            "https://weread.qq.com/web/mp/content?reviewId=review",
+            "https://weread.qq.com/web/mp/content/?reviewId=review",
+        ] {
+            let url = value.parse().expect("test URL should parse");
+            assert!(ensure_authenticated_content_url(&url).is_ok());
+        }
+    }
+
+    #[test]
+    fn treats_a_content_login_redirect_as_expired_authentication() {
+        let url: Url = "https://weread.qq.com/web/login".parse().unwrap();
+        assert_eq!(
+            ensure_authenticated_content_url(&url),
+            Err(WeReadAdapterError::AuthenticationExpired {
+                code: WEREAD_AUTHENTICATION_EXPIRED_CODE,
+            })
+        );
+    }
+
+    #[test]
+    fn preserves_verification_errors_from_authenticated_content_parsing() {
+        assert_eq!(
+            map_article_content_error(ArticlePageError::VerificationRequired),
+            WeReadAdapterError::VerificationRequired
         );
     }
 

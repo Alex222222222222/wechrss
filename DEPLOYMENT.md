@@ -132,8 +132,11 @@ fresh authenticated browser session, revisits `https://weread.qq.com/web/shelf`
 after injection, and only fetches the article endpoint when that same session
 remains on the shelf rather than being redirected to login. The runtime holds a PostgreSQL account
 lease while the authenticated request is active and releases it before
-opening a clean public session for article content. Authentication material is
-never sent to public WeChat pages. The configured WeRead article
+opening a clean public session for article content. If public article
+extraction fails, it reacquires the selected account lease, opens a fresh
+authenticated session, visits `/web/mp/content?reviewId=...`, and extracts the
+rendered `#js_content` element. Authentication material is never sent to
+public WeChat pages. The configured WeRead article
 URL is restricted by configuration validation to the HTTPS
 `weread.qq.com/api/mp/cover` or `weread.qq.com/web/mp/articles` endpoint without
 credentials, fragments, or a non-default port. The cover endpoint is the

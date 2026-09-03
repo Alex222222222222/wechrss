@@ -645,6 +645,7 @@ impl RuntimeSupervisor {
         let weread = BrowserWeReadAdapter::new(self.config.weread_article_list_url.clone())
             .map_err(RuntimeSupervisorError::WeReadEndpoint)?
             .with_pacing(pacing.clone())
+            .with_timezone(self.config.timezone)
             .with_credential_provider(Arc::new(RuntimeWeReadCredentialProvider {
                 auth: self.build_auth_service()?,
             }));

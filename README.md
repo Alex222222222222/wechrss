@@ -108,7 +108,7 @@ keys in a secret manager or an ignored local environment file.
 | `BROWSER_VIEWPORT_HEIGHT` | `2000` | Browser viewport height in CSS pixels. Valid range: `1`–`8192`. |
 | `BROWSER_EXTRA_ARGS` | Empty | Optional whitespace-separated browser arguments. At most 32 arguments are accepted, each must begin with `-`, and controlled browser arguments such as User-Agent, window size, persistent-profile paths, and headless mode cannot be overridden. |
 | `WEREAD_ACCOUNT_ID` | Unset | Optional stable WeRead account UUID used as the default panel-enrolled account. When unset, an unbound source-sync job randomly selects an enabled, unexpired account enrolled through the admin panel from PostgreSQL. A source-specific account ID takes precedence. |
-| `WEREAD_ARTICLE_LIST_URL` | `https://weread.qq.com/api/mp/cover` | HTTPS WeRead article endpoint. The default `/api/mp/cover` response returns the latest article for the book; `/web/mp/articles` remains accepted for compatible deployments. Source synchronization first opens `https://weread.qq.com/web/shelf` in the same authenticated browser session, verifies it did not redirect to login, and then fetches the endpoint response as raw text. Credentials, fragments, and non-default ports are rejected. |
+| `WEREAD_ARTICLE_LIST_URL` | `https://weread.qq.com/api/mp/cover` | HTTPS WeRead article-list endpoint. The default `/api/mp/cover` response returns the latest article for the book; `/web/mp/articles` remains accepted for compatible deployments. Source synchronization first opens `https://weread.qq.com/web/shelf` in the same authenticated browser session, verifies it did not redirect to login, and fetches the list response as raw text. If public WeChat article extraction fails, it reacquires an account lease and uses `/web/mp/content?reviewId=...` in an authenticated session, extracting `#js_content`. Credentials, fragments, and non-default ports are rejected. |
 
 ### Workers, jobs, and leases
 
@@ -282,6 +282,15 @@ enrolled cookie header through `AuthService` and injects it into a fresh
 authenticated browser session. See
 [`AuthService`](src/application/auth_service.rs) and the
 [authentication architecture](ARCHITECTURE.md#source-scheduling-and-account-leases).
+
+For each article, source synchronization first tries the public WeChat URL in
+a clean browser session. When that fetch fails, the worker reacquires the
+selected account lease, opens the WeRead shelf, and visits
+`/web/mp/content?reviewId=...` in the authenticated session. The rendered page
+source is parsed from `#js_content`; title and publication time may fall back
+to metadata from the authenticated list response. The public URL is still
+required as the canonical RSS item URL, and the authenticated session is
+never used to visit a public WeChat page.
 
 Scheduler and worker roles can start before any WeRead account is enrolled.
 When a due source-sync job finds no enabled, unexpired account, it records a
