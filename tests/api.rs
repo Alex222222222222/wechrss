@@ -41,7 +41,7 @@ use werrss::{
         unit_of_work::UnitOfWorkFactory,
     },
     rss::renderer::{RenderArticle, RenderFeedInput, RssRenderer},
-    web::{admin::admin_router, api::feed_router, auth::AdminAuthenticator},
+    web::{admin::admin_router_with_server_root_url, api::feed_router, auth::AdminAuthenticator},
 };
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -845,15 +845,14 @@ async fn admin_source_scheduling_and_feed_token_endpoints(pool: PgPool) {
         .await
         .expect("feed token request should complete");
     assert_eq!(feed_token.status(), StatusCode::OK);
-    let feed_path = serde_json::from_slice::<serde_json::Value>(
+    let feed_body = serde_json::from_slice::<serde_json::Value>(
         &to_bytes(feed_token.into_body(), usize::MAX).await.unwrap(),
     )
-    .unwrap()["feed_path"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    .unwrap();
+    let feed_path = feed_body["feed_path"].as_str().unwrap().to_owned();
     assert!(feed_path.starts_with("/feeds/"));
     assert!(feed_path.ends_with(".xml"));
+    assert!(feed_body["feed_url"].is_null());
 
     let missing_feed_token = app
         .clone()
@@ -866,6 +865,46 @@ async fn admin_source_scheduling_and_feed_token_endpoints(pool: PgPool) {
         .await
         .expect("missing source token request should complete");
     assert_eq!(missing_feed_token.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_feed_token_includes_absolute_url_when_server_root_url_is_configured(pool: PgPool) {
+    let app = admin_app_with_server_root_url(&pool, Some("https://feeds.example.test/werrss/"));
+    let (cookie, csrf_token) = admin_session(&app).await;
+    let source = create_admin_source(
+        &app,
+        &cookie,
+        &csrf_token,
+        serde_json::json!({
+            "book_id": "book-absolute-feed-url",
+            "display_name": "Absolute feed URL source",
+            "article_url": "https://mp.weixin.qq.com/s/absolute-feed-url"
+        }),
+    )
+    .await;
+    let source_id = source["id"].as_str().unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/api/admin/sources/{source_id}/feed-token"),
+            &cookie,
+            Some(&csrf_token),
+            Some(serde_json::json!({})),
+        ))
+        .await
+        .expect("feed token request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+            .expect("feed token response should be JSON");
+    let feed_path = body["feed_path"]
+        .as_str()
+        .expect("feed path should be returned");
+    assert_eq!(
+        body["feed_url"],
+        format!("https://feeds.example.test/werrss{feed_path}")
+    );
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -1501,13 +1540,17 @@ fn admin_request_with_method(
 }
 
 fn admin_app(pool: &PgPool) -> axum::Router {
+    admin_app_with_server_root_url(pool, None)
+}
+
+fn admin_app_with_server_root_url(pool: &PgPool, root: Option<&str>) -> axum::Router {
     let auth = AdminAuthenticator::new(
         "admin".to_owned(),
         SecretString::new("correct horse".to_owned().into_boxed_str()),
         SecretString::new("independent signing key".to_owned().into_boxed_str()),
     )
     .expect("test admin auth should be valid");
-    admin_router(
+    admin_router_with_server_root_url(
         auth,
         SourceService::new(
             PostgresSourceRepository::new(pool.clone()),
@@ -1532,6 +1575,7 @@ fn admin_app(pool: &PgPool) -> axum::Router {
             )
             .expect("test auth configuration should be valid"),
         ),
+        root.map(|value| value.parse().expect("test server root URL should parse")),
     )
     .layer(Extension(ConnectInfo(std::net::SocketAddr::from((
         [127, 0, 0, 1],

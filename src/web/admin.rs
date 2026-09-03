@@ -68,13 +68,35 @@ pub fn admin_router(
     sync_runs: PostgresSyncRunRepository,
     weread_auth: AdminAuthService,
 ) -> Router {
-    admin_router_with_identity_resolver(
+    admin_router_with_identity_resolver_and_server_root_url(
         auth,
         sources,
         feed_tokens,
         sync_runs,
         weread_auth,
         Arc::new(UrlArticleIdentityResolver),
+        None,
+    )
+}
+
+/// Builds the administration routes with the URL-only identity resolver and
+/// an optional public server root used for generated feed links.
+pub fn admin_router_with_server_root_url(
+    auth: AdminAuthenticator,
+    sources: AdminSourceService,
+    feed_tokens: AdminTokenService,
+    sync_runs: PostgresSyncRunRepository,
+    weread_auth: AdminAuthService,
+    server_root_url: Option<url::Url>,
+) -> Router {
+    admin_router_with_identity_resolver_and_server_root_url(
+        auth,
+        sources,
+        feed_tokens,
+        sync_runs,
+        weread_auth,
+        Arc::new(UrlArticleIdentityResolver),
+        server_root_url,
     )
 }
 
@@ -89,6 +111,28 @@ pub fn admin_router_with_identity_resolver(
     weread_auth: AdminAuthService,
     identity_resolver: Arc<dyn ArticleIdentityResolver>,
 ) -> Router {
+    admin_router_with_identity_resolver_and_server_root_url(
+        auth,
+        sources,
+        feed_tokens,
+        sync_runs,
+        weread_auth,
+        identity_resolver,
+        None,
+    )
+}
+
+/// Builds the administration routes with a configured identity resolver and
+/// optional public server root for generated feed links.
+pub fn admin_router_with_identity_resolver_and_server_root_url(
+    auth: AdminAuthenticator,
+    sources: AdminSourceService,
+    feed_tokens: AdminTokenService,
+    sync_runs: PostgresSyncRunRepository,
+    weread_auth: AdminAuthService,
+    identity_resolver: Arc<dyn ArticleIdentityResolver>,
+    server_root_url: Option<url::Url>,
+) -> Router {
     let state = Arc::new(AdminApiState {
         auth,
         sources,
@@ -96,6 +140,7 @@ pub fn admin_router_with_identity_resolver(
         sync_runs,
         weread_auth,
         identity_resolver,
+        server_root_url,
     });
     Router::new()
         .route("/", get(root_redirect))
@@ -149,6 +194,7 @@ struct AdminApiState {
     sync_runs: PostgresSyncRunRepository,
     weread_auth: AdminAuthService,
     identity_resolver: Arc<dyn ArticleIdentityResolver>,
+    server_root_url: Option<url::Url>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -867,10 +913,28 @@ async fn issue_feed_token(
     };
     match state.feed_tokens.issue(source_id).await {
         Ok(token) => {
-            Json(json!({ "feed_path": format!("/feeds/{}.xml", token.as_str()) })).into_response()
+            let feed_path = format!("/feeds/{}.xml", token.as_str());
+            let feed_url = state
+                .server_root_url
+                .as_ref()
+                .map(|root| absolute_feed_url(root, &feed_path));
+            Json(json!({
+                "feed_path": feed_path,
+                "feed_url": feed_url,
+            }))
+            .into_response()
         }
         Err(error) => feed_token_error_response(error),
     }
+}
+
+fn absolute_feed_url(root: &url::Url, feed_path: &str) -> String {
+    let mut base = root.clone();
+    let path = base.path().trim_end_matches('/');
+    base.set_path(&format!("{path}/"));
+    base.join(feed_path.trim_start_matches('/'))
+        .expect("static feed path should join with a valid server root URL")
+        .to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1242,6 +1306,18 @@ mod tests {
             },
         ));
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn absolute_feed_url_appends_to_a_server_root_path() {
+        let root = "https://feeds.example.test/werrss"
+            .parse::<url::Url>()
+            .expect("test server root URL should parse");
+
+        assert_eq!(
+            absolute_feed_url(&root, "/feeds/token.xml"),
+            "https://feeds.example.test/werrss/feeds/token.xml"
+        );
     }
 
     fn provisioning_request(

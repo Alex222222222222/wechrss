@@ -52,7 +52,14 @@ use crate::{
         },
         unit_of_work::UnitOfWorkFactory,
     },
-    web::{admin::admin_router_with_identity_resolver, api::feed_router, auth::AdminAuthenticator},
+    web::{
+        admin::{
+            admin_router_with_identity_resolver_and_server_root_url,
+            admin_router_with_server_root_url,
+        },
+        api::feed_router,
+        auth::AdminAuthenticator,
+    },
 };
 
 use super::{
@@ -500,21 +507,23 @@ impl RuntimeSupervisor {
                 .with_profile(browser_profile);
                 let identity_resolver =
                     Arc::new(BrowserArticleIdentityResolver::new(webdriver, browser_pool));
-                router = router.merge(admin_router_with_identity_resolver(
+                router = router.merge(admin_router_with_identity_resolver_and_server_root_url(
                     auth,
                     sources,
                     feed_tokens,
                     sync_runs,
                     weread_auth,
                     identity_resolver,
+                    self.config.server_root_url.clone(),
                 ));
             } else {
-                router = router.merge(crate::web::admin::admin_router(
+                router = router.merge(admin_router_with_server_root_url(
                     auth,
                     sources,
                     feed_tokens,
                     sync_runs,
                     weread_auth,
+                    self.config.server_root_url.clone(),
                 ));
             }
         }

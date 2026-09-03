@@ -97,9 +97,9 @@ account exists. The source is then considered again on its next scheduling
 interval. `APP_ROLES=all` can therefore start before the administrator fills
 the WeRead authentication form.
 `SERVER_ROOT_URL` must be set to the public HTTP(S) root URL that generated RSS
-channels should use. Browser-session capacity and worker replica count
-must be intentional; increasing API replicas for RSS traffic must not
-automatically increase upstream fetch concurrency.
+channels and admin-generated feed links should use. Browser-session capacity and
+worker replica count must be intentional; increasing API replicas for RSS traffic
+must not automatically increase upstream fetch concurrency.
 
 ### Authenticated WeRead source synchronization
 

@@ -136,7 +136,7 @@ sync.
 | `RSS_CACHE_TTL_SECONDS` | `1800` | Freshness period for a persisted RSS document. It must be positive. |
 | `RSS_STALE_WHILE_REVALIDATE_SECONDS` | `60` | Additional period during which stale RSS may be served while a rebuild is requested. It may be zero and is capped at 24 hours. |
 | `RSS_CACHE_MISS_WAIT_MS` | `5000` | Bounded wait associated with a cache miss before retry advice is returned. Valid range: `1`–`60000` milliseconds. |
-| `SERVER_ROOT_URL` | Unset | Public HTTP(S) root URL used to build generated RSS channel links. It is required when the worker role is enabled. |
+| `SERVER_ROOT_URL` | Unset | Public HTTP(S) root URL used to build generated RSS channel links and absolute feed links shown by the admin panel. It is required when the worker role is enabled. |
 | `FEED_BUILD_LEASE_SECONDS` | `600` | Duration of a distributed feed-build lease. It must exceed its heartbeat interval. |
 | `FEED_BUILD_HEARTBEAT_SECONDS` | `60` | Maximum interval between feed-build lease heartbeats. It must be less than `FEED_BUILD_LEASE_SECONDS`. |
 
@@ -306,7 +306,9 @@ request. The panel is available at `/admin` and uses these API routes:
   `/admin/sources/{id}`;
 - `POST /api/admin/sources/{id}/enabled` and `/gate` for operator controls;
 - `POST /api/admin/sources/{id}/feed-token` to create/rotate a copyable feed
-  link; and
+  link. The response always includes `feed_path` and `feed_url`; `feed_url` is
+  absolute when `SERVER_ROOT_URL` is configured and `null` otherwise, and is
+  the value displayed by the panel; and
 - `GET /api/admin/sources/{id}/sync-runs` for synchronization history;
 - `POST /api/admin/weread/accounts` to enroll an already-issued WeRead cookie
   header and expiry; and
