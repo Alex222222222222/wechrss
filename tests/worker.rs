@@ -56,6 +56,7 @@ struct RecordingHandler {
     outcome: JobExecution,
 }
 
+#[async_trait::async_trait]
 impl JobHandler for RecordingHandler {
     async fn execute(&self, lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
         self.seen.lock().await.push(lease.job.job_type());
@@ -68,6 +69,7 @@ struct ShutdownHandler {
     shutdown: watch::Sender<bool>,
 }
 
+#[async_trait::async_trait]
 impl JobHandler for ShutdownHandler {
     async fn execute(&self, _lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
         self.shutdown
@@ -84,6 +86,7 @@ struct ShutdownAfterCallsHandler {
     stop_after: usize,
 }
 
+#[async_trait::async_trait]
 impl JobHandler for ShutdownAfterCallsHandler {
     async fn execute(&self, _lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
@@ -107,6 +110,7 @@ struct CommittingHandler {
     repository: MemoryJobRepository,
 }
 
+#[async_trait::async_trait]
 impl JobHandler for CommittingHandler {
     async fn execute(&self, lease: &JobLease, now: DateTime<Utc>) -> JobExecution {
         let mut transaction = self
@@ -131,6 +135,7 @@ impl JobHandler for CommittingHandler {
     }
 }
 
+#[async_trait::async_trait]
 impl JobHandler for CloseSenderHandler {
     async fn execute(&self, _lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
         self.calls.fetch_add(1, Ordering::Relaxed);

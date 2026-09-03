@@ -112,6 +112,7 @@ impl RecordingHandler {
     }
 }
 
+#[async_trait::async_trait]
 impl JobHandler for RecordingHandler {
     async fn execute(
         &self,

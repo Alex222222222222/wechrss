@@ -160,18 +160,21 @@ pub struct JobEnqueueView<'u, 'a> {
     transaction: &'u mut PostgresJobTransaction<'a>,
 }
 
+#[async_trait::async_trait]
 impl JobEnqueueTransaction for JobEnqueueView<'_, '_> {
     async fn enqueue_job(&mut self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError> {
         JobEnqueueTransaction::enqueue_job(&mut *self.transaction, spec).await
     }
 }
 
+#[async_trait::async_trait]
 impl JobOutcomeTransaction for JobOutcomeView<'_, '_> {
     async fn apply_outcome(&mut self, outcome: JobOutcome) -> Result<Job, JobRepositoryError> {
         JobOutcomeTransaction::apply_outcome(&mut *self.transaction, outcome).await
     }
 }
 
+#[async_trait::async_trait]
 impl JobOutcomeTransaction for UnitOfWork<'_> {
     async fn apply_outcome(&mut self, outcome: JobOutcome) -> Result<Job, JobRepositoryError> {
         self.job_outcomes().apply_outcome(outcome).await

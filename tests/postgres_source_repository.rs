@@ -2,7 +2,9 @@ use chrono::{Duration, TimeZone, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 use werrss::{
-    domain::source::{FeedRevision, NewSource, SchedulingGate, SourceId, VerifiedWechatArticleUrl},
+    domain::source::{
+        FeedRevision, NewSource, SchedulingGate, SourceId, SourcePatch, VerifiedWechatArticleUrl,
+    },
     persistence::{
         repositories::source_repository::{
             PostgresSourceRepository, SourceRepository, SourceRepositoryError,
@@ -66,6 +68,89 @@ async fn postgres_source_can_be_created_read_and_lookup_by_book_id(pool: PgPool)
         .rollback()
         .await
         .expect("duplicate transaction should roll back");
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn postgres_source_rejects_blank_non_null_article_url(pool: PgPool) {
+    let error = sqlx::query(
+        "INSERT INTO sources (id, book_id, display_name, article_url) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind("book-blank-url")
+    .bind("Blank URL source")
+    .bind("   ")
+    .execute(&pool)
+    .await
+    .expect_err("blank article URLs should violate the schema constraint");
+
+    assert!(matches!(
+        error,
+        sqlx::Error::Database(database_error)
+            if database_error.constraint() == Some("sources_article_url_check")
+    ));
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn postgres_concurrent_source_patches_merge_after_row_lock(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_spec(source_id, "book-concurrent")).await;
+
+    let first_factory = factory.clone();
+    let second_factory = factory.clone();
+    let first = async move {
+        let mut unit_of_work = first_factory
+            .begin()
+            .await
+            .expect("first unit of work should begin");
+        unit_of_work
+            .source()
+            .update(
+                source_id,
+                SourcePatch {
+                    display_name: Some("First update".to_owned()),
+                    ..SourcePatch::default()
+                },
+            )
+            .await
+            .expect("first patch should succeed");
+        unit_of_work
+            .commit()
+            .await
+            .expect("first patch should commit");
+    };
+    let second = async move {
+        let mut unit_of_work = second_factory
+            .begin()
+            .await
+            .expect("second unit of work should begin");
+        unit_of_work
+            .source()
+            .update(
+                source_id,
+                SourcePatch {
+                    book_id: Some("book-after".to_owned()),
+                    ..SourcePatch::default()
+                },
+            )
+            .await
+            .expect("second patch should succeed");
+        unit_of_work
+            .commit()
+            .await
+            .expect("second patch should commit");
+    };
+
+    tokio::join!(first, second);
+
+    let persisted = PostgresSourceRepository::new(pool)
+        .find(source_id)
+        .await
+        .expect("source lookup should succeed")
+        .expect("source should remain present");
+    assert_eq!(persisted.book_id(), "book-after");
+    assert_eq!(persisted.display_name(), "First update");
+    assert_eq!(persisted.feed_revision(), FeedRevision::from_u64(2));
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -208,9 +293,11 @@ fn source_spec(source_id: SourceId, book_id: &str) -> NewSource {
         id: source_id,
         book_id: book_id.to_owned(),
         display_name: "Test source".to_owned(),
-        article_url: "https://mp.weixin.qq.com/s/test"
-            .parse::<VerifiedWechatArticleUrl>()
-            .expect("test URL should be valid"),
+        article_url: Some(
+            "https://mp.weixin.qq.com/s/test"
+                .parse::<VerifiedWechatArticleUrl>()
+                .expect("test URL should be valid"),
+        ),
         enabled: true,
         sync_interval: Duration::hours(1),
         rss_item_limit: 20,

@@ -16,8 +16,8 @@
 //!
 //! Non-responsibilities: resolving article URLs, browser access, credential
 //! storage, feed-token generation, job execution, or deciding quiet hours.
-//! The caller must pass an article URL that has already been resolved and
-//! verified by the acquisition boundary.
+//! When present, an article URL must already be resolved and verified by the
+//! acquisition boundary; book-only sources persist a NULL URL.
 //!
 //! Cache interaction: feed-visible source changes must call
 //! `bump_feed_revision` in the same transaction as their source update. The
@@ -40,7 +40,7 @@ use uuid::Uuid;
 
 use crate::domain::source::{
     FeedRevision, NewSource, SchedulingGate, Source, SourceError, SourceId, SourceParts,
-    VerifiedWechatArticleUrl,
+    SourcePatch, VerifiedWechatArticleUrl,
 };
 
 use super::job_repository::{JobRepositoryError, PostgresJobTransaction};
@@ -84,7 +84,7 @@ pub enum SourceRepositoryError {
 }
 
 /// Pool-backed source reads.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait SourceRepository: Send + Sync {
     /// Returns all sources in deterministic display-name order.
     async fn list(&self) -> Result<Vec<Source>, SourceRepositoryError>;
@@ -119,6 +119,7 @@ impl PostgresSourceRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl SourceRepository for PostgresSourceRepository {
     async fn list(&self) -> Result<Vec<Source>, SourceRepositoryError> {
         sqlx::query(&format!(
@@ -163,7 +164,7 @@ impl SourceRepository for PostgresSourceRepository {
 }
 
 /// Operations on source rows inside the shared application transaction.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait SourceTransactionRepository {
     /// Inserts a validated source at feed revision zero.
     async fn insert(&mut self, source: NewSource) -> Result<Source, SourceRepositoryError>;
@@ -176,11 +177,33 @@ pub trait SourceTransactionRepository {
         enabled: bool,
     ) -> Result<Source, SourceRepositoryError>;
 
+    /// Applies a partial source configuration and advances feed revision when
+    /// the rendered feed can change.
+    async fn update(
+        &mut self,
+        source_id: SourceId,
+        patch: SourcePatch,
+    ) -> Result<Source, SourceRepositoryError>;
+
+    /// Deletes a source and its source-owned jobs and dependent rows.
+    async fn delete(&mut self, source_id: SourceId) -> Result<(), SourceRepositoryError>;
+
     /// Changes the scheduling gate without changing feed revision.
     async fn set_scheduling_gate(
         &mut self,
         source_id: SourceId,
         gate: SchedulingGate,
+    ) -> Result<Source, SourceRepositoryError>;
+
+    /// Finds and locks the latest source row for a finalization transaction.
+    ///
+    /// Source synchronization acquires a source snapshot before doing network
+    /// work. Finalization must re-read the row under the transaction lock so a
+    /// concurrent operator edit, especially a sync-interval change, is not
+    /// followed by a schedule calculated from stale state.
+    async fn find_for_update(
+        &mut self,
+        source_id: SourceId,
     ) -> Result<Source, SourceRepositoryError>;
 
     /// Updates scheduling timestamps without changing feed revision.
@@ -221,6 +244,7 @@ impl<'borrow, 'pool> PostgresSourceTransaction<'borrow, 'pool> {
     }
 }
 
+#[async_trait::async_trait]
 impl SourceTransactionRepository for PostgresSourceTransaction<'_, '_> {
     async fn insert(&mut self, source: NewSource) -> Result<Source, SourceRepositoryError> {
         let source = Source::new(source)?;
@@ -241,7 +265,7 @@ impl SourceTransactionRepository for PostgresSourceTransaction<'_, '_> {
             .bind(source.id().as_uuid())
             .bind(source.book_id())
             .bind(source.display_name())
-            .bind(source.article_url().as_str())
+            .bind(source.article_url().map(VerifiedWechatArticleUrl::as_str))
             .bind(source.account_id().map(|account| account.as_uuid()))
             .bind(source.enabled())
             .bind(source.scheduling_gate().as_str())
@@ -272,7 +296,75 @@ impl SourceTransactionRepository for PostgresSourceTransaction<'_, '_> {
         .await
         .map_err(storage_error)?
         .ok_or(SourceRepositoryError::NotFound { source_id })
+            .and_then(decode_source)
+    }
+
+    async fn update(
+        &mut self,
+        source_id: SourceId,
+        patch: SourcePatch,
+    ) -> Result<Source, SourceRepositoryError> {
+        validate_source_id(source_id)?;
+        let transaction = self.transaction()?;
+        let current = sqlx::query(&format!(
+            "SELECT {SOURCE_COLUMNS} FROM sources WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(source_id.as_uuid())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(storage_error)?
+        .ok_or(SourceRepositoryError::NotFound { source_id })
+        .and_then(decode_source)?;
+        let updated = current.apply_patch(patch)?;
+        let sync_interval_seconds = duration_seconds(updated.sync_interval())?;
+        let feed_revision = persisted_revision(updated.feed_revision())?;
+        sqlx::query(&format!(
+            "UPDATE sources SET book_id = $2, display_name = $3, article_url = $4, account_id = $5, feed_revision = $6, sync_interval_seconds = $7, rss_item_limit = $8, priority = $9, max_attempts = $10, updated_at = clock_timestamp() WHERE id = $1 RETURNING {SOURCE_COLUMNS}"
+        ))
+        .bind(source_id.as_uuid())
+        .bind(updated.book_id())
+        .bind(updated.display_name())
+        .bind(updated.article_url().map(VerifiedWechatArticleUrl::as_str))
+        .bind(updated.account_id().map(|account| account.as_uuid()))
+        .bind(feed_revision)
+        .bind(sync_interval_seconds)
+        .bind(i64::from(updated.rss_item_limit()))
+        .bind(updated.priority())
+        .bind(i64::from(updated.max_attempts()))
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(|error| map_update_error(error, updated.book_id()))
         .and_then(decode_source)
+    }
+
+    async fn delete(&mut self, source_id: SourceId) -> Result<(), SourceRepositoryError> {
+        validate_source_id(source_id)?;
+        let transaction = self.transaction()?;
+        let exists =
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM sources WHERE id = $1 FOR UPDATE")
+                .bind(source_id.as_uuid())
+                .fetch_optional(&mut **transaction)
+                .await
+                .map_err(storage_error)?;
+        if exists.is_none() {
+            return Err(SourceRepositoryError::NotFound { source_id });
+        }
+
+        // jobs.source_id intentionally has no foreign key because jobs can be
+        // created before a source transaction is committed. Remove every
+        // source-owned job explicitly; other source-owned tables cascade from
+        // the source row below.
+        sqlx::query("DELETE FROM jobs WHERE source_id = $1")
+            .bind(source_id.as_uuid())
+            .execute(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+        sqlx::query("DELETE FROM sources WHERE id = $1")
+            .bind(source_id.as_uuid())
+            .execute(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+        Ok(())
     }
 
     async fn set_scheduling_gate(
@@ -288,6 +380,23 @@ impl SourceTransactionRepository for PostgresSourceTransaction<'_, '_> {
         ))
         .bind(source_id.as_uuid())
         .bind(gate)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(storage_error)?
+        .ok_or(SourceRepositoryError::NotFound { source_id })
+        .and_then(decode_source)
+    }
+
+    async fn find_for_update(
+        &mut self,
+        source_id: SourceId,
+    ) -> Result<Source, SourceRepositoryError> {
+        validate_source_id(source_id)?;
+        let transaction = self.transaction()?;
+        sqlx::query(&format!(
+            "SELECT {SOURCE_COLUMNS} FROM sources WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(source_id.as_uuid())
         .fetch_optional(&mut **transaction)
         .await
         .map_err(storage_error)?
@@ -390,10 +499,14 @@ fn decode_source(row: PgRow) -> Result<Source, SourceRepositoryError> {
         book_id: row.try_get("book_id").map_err(storage_error)?,
         display_name: row.try_get("display_name").map_err(storage_error)?,
         article_url: row
-            .try_get::<String, _>("article_url")
+            .try_get::<Option<String>, _>("article_url")
             .map_err(storage_error)?
-            .parse::<VerifiedWechatArticleUrl>()
-            .map_err(SourceRepositoryError::Domain)?,
+            .map(|value| {
+                value
+                    .parse::<VerifiedWechatArticleUrl>()
+                    .map_err(SourceRepositoryError::Domain)
+            })
+            .transpose()?,
         enabled: row.try_get("enabled").map_err(storage_error)?,
         sync_interval,
         rss_item_limit,
@@ -459,6 +572,17 @@ fn persisted_revision(revision: FeedRevision) -> Result<i64, SourceRepositoryErr
 }
 
 fn map_insert_error(error: sqlx::Error, book_id: &str) -> SourceRepositoryError {
+    if let sqlx::Error::Database(database_error) = &error {
+        if database_error.constraint() == Some("sources_book_id_idx") {
+            return SourceRepositoryError::BookIdConflict {
+                book_id: book_id.to_owned(),
+            };
+        }
+    }
+    storage_error(error)
+}
+
+fn map_update_error(error: sqlx::Error, book_id: &str) -> SourceRepositoryError {
     if let sqlx::Error::Database(database_error) = &error {
         if database_error.constraint() == Some("sources_book_id_idx") {
             return SourceRepositoryError::BookIdConflict {

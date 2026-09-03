@@ -1,7 +1,8 @@
 //! Source use cases.
 //!
 //! Purpose: coordinate source creation and reads plus operator-controlled
-//! enable/disable and scheduling-gate changes.
+//! enable/disable, editable configuration, deletion, and scheduling-gate
+//! changes.
 //!
 //! A source URL is resolved through acquisition interfaces before persistence.
 //! Source configuration changes must invalidate the associated feed cache and
@@ -13,15 +14,14 @@
 //! in a shared persistence `UnitOfWork`. Operator actions explicitly clear
 //! `authentication_required` or `risk_controlled`; merely reaching another due
 //! timestamp must not clear those states. Feed-token lifecycle is owned by its
-//! separate application service; deletion and feed-cache invalidation are still
-//! future service operations.
+//! separate application service.
 //!
 //! Non-responsibilities: direct SQL, browser selectors, article fetching, or
 //! rendering RSS bytes. PostgreSQL concurrency and duplicate-source handling
 //! belong to repositories and transactions. The source repository now provides
 //! the transaction-scoped primitive. This first executable slice composes
 //! validated source persistence with an atomic initial-job policy; feed-token
-//! and feed-cache lifecycle work remains separate.
+//! lifecycle remains separate.
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -30,7 +30,7 @@ use thiserror::Error;
 use crate::{
     domain::{
         job::{JobType, NewJob},
-        source::{NewSource, SchedulingGate, Source, SourceId},
+        source::{NewSource, SchedulingGate, Source, SourceId, SourcePatch},
     },
     persistence::{
         repositories::{
@@ -64,7 +64,7 @@ pub enum SourceServiceError {
 /// read behavior unit-testable. The PostgreSQL repository is one adapter; an
 /// administrative API or another persistence implementation can provide a
 /// different adapter without changing this service.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait SourceReader: Clone + Send + Sync {
     /// Finds one source by durable identity.
     async fn find(&self, source_id: SourceId) -> Result<Option<Source>, SourceServiceError>;
@@ -74,7 +74,7 @@ pub trait SourceReader: Clone + Send + Sync {
 }
 
 /// Application-facing source listing port used by administrative clients.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait SourceLister: Clone + Send + Sync {
     /// Lists sources in the repository's deterministic order.
     async fn list(&self) -> Result<Vec<Source>, SourceServiceError>;
@@ -86,10 +86,20 @@ pub trait SourceLister: Clone + Send + Sync {
 /// operation to callers other than the enclosing service. Source creation and
 /// its initial job therefore remain one atomic unit, while tests can exercise
 /// the orchestration with an in-memory implementation.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait SourceUnitOfWork {
     /// Inserts one validated source.
     async fn insert_source(&mut self, source: NewSource) -> Result<Source, SourceServiceError>;
+
+    /// Applies a partial editable source configuration.
+    async fn update_source(
+        &mut self,
+        source_id: SourceId,
+        patch: SourcePatch,
+    ) -> Result<Source, SourceServiceError>;
+
+    /// Deletes one source and its source-owned work.
+    async fn delete_source(&mut self, source_id: SourceId) -> Result<(), SourceServiceError>;
 
     /// Enqueues one source-sync job in the current transaction.
     async fn enqueue_source_sync(&mut self, job: NewJob) -> Result<(), SourceServiceError>;
@@ -115,7 +125,7 @@ pub trait SourceUnitOfWork {
 }
 
 /// Application-facing factory for source lifecycle transactions.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait SourceUnitOfWorkFactory: Clone + Send + Sync {
     /// Transaction type created by this factory.
     type Transaction<'a>: SourceUnitOfWork + 'a
@@ -126,6 +136,7 @@ pub trait SourceUnitOfWorkFactory: Clone + Send + Sync {
     async fn begin(&self) -> Result<Self::Transaction<'_>, SourceServiceError>;
 }
 
+#[async_trait::async_trait]
 impl SourceReader for PostgresSourceRepository {
     async fn find(&self, source_id: SourceId) -> Result<Option<Source>, SourceServiceError> {
         Ok(SourceRepository::find(self, source_id).await?)
@@ -136,12 +147,14 @@ impl SourceReader for PostgresSourceRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl SourceLister for PostgresSourceRepository {
     async fn list(&self) -> Result<Vec<Source>, SourceServiceError> {
         Ok(SourceRepository::list(self).await?)
     }
 }
 
+#[async_trait::async_trait]
 impl SourceUnitOfWorkFactory for UnitOfWorkFactory {
     type Transaction<'a> = UnitOfWork<'a>;
 
@@ -150,10 +163,25 @@ impl SourceUnitOfWorkFactory for UnitOfWorkFactory {
     }
 }
 
+#[async_trait::async_trait]
 impl SourceUnitOfWork for UnitOfWork<'_> {
     async fn insert_source(&mut self, source: NewSource) -> Result<Source, SourceServiceError> {
         let mut sources = self.source();
         Ok(sources.insert(source).await?)
+    }
+
+    async fn update_source(
+        &mut self,
+        source_id: SourceId,
+        patch: SourcePatch,
+    ) -> Result<Source, SourceServiceError> {
+        let mut sources = self.source();
+        Ok(sources.update(source_id, patch).await?)
+    }
+
+    async fn delete_source(&mut self, source_id: SourceId) -> Result<(), SourceServiceError> {
+        let mut sources = self.source();
+        Ok(sources.delete(source_id).await?)
     }
 
     async fn enqueue_source_sync(&mut self, job: NewJob) -> Result<(), SourceServiceError> {
@@ -229,6 +257,26 @@ where
         Ok(created)
     }
 
+    /// Applies a partial editable source configuration in one transaction.
+    pub async fn update(
+        &self,
+        source_id: SourceId,
+        patch: SourcePatch,
+    ) -> Result<Source, SourceServiceError> {
+        let mut unit_of_work = self.unit_of_work.begin().await?;
+        let updated = unit_of_work.update_source(source_id, patch).await?;
+        unit_of_work.commit().await?;
+        Ok(updated)
+    }
+
+    /// Deletes a source and its source-owned work in one transaction.
+    pub async fn delete(&self, source_id: SourceId) -> Result<(), SourceServiceError> {
+        let mut unit_of_work = self.unit_of_work.begin().await?;
+        unit_of_work.delete_source(source_id).await?;
+        unit_of_work.commit().await?;
+        Ok(())
+    }
+
     /// Reads one source by durable identity.
     pub async fn find(&self, source_id: SourceId) -> Result<Option<Source>, SourceServiceError> {
         self.sources.find(source_id).await
@@ -297,6 +345,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::domain::source::FeedRevision;
     use chrono::Duration;
     use tokio::sync::Mutex;
     use uuid::Uuid;
@@ -306,6 +355,7 @@ mod tests {
         source: Arc<Mutex<Option<Source>>>,
     }
 
+    #[async_trait::async_trait]
     impl SourceReader for FakeSourceReader {
         async fn find(&self, source_id: SourceId) -> Result<Option<Source>, SourceServiceError> {
             Ok(self
@@ -348,8 +398,10 @@ mod tests {
         state: Arc<Mutex<FakeState>>,
         pending_sources: Vec<Source>,
         pending_jobs: Vec<NewJob>,
+        pending_deletions: Vec<SourceId>,
     }
 
+    #[async_trait::async_trait]
     impl SourceUnitOfWorkFactory for FakeUnitOfWorkFactory {
         type Transaction<'a> = FakeUnitOfWork;
 
@@ -358,10 +410,12 @@ mod tests {
                 state: Arc::clone(&self.state),
                 pending_sources: Vec::new(),
                 pending_jobs: Vec::new(),
+                pending_deletions: Vec::new(),
             })
         }
     }
 
+    #[async_trait::async_trait]
     impl SourceUnitOfWork for FakeUnitOfWork {
         async fn insert_source(&mut self, source: NewSource) -> Result<Source, SourceServiceError> {
             let source = Source::new(source).map_err(|error| {
@@ -369,6 +423,42 @@ mod tests {
             })?;
             self.pending_sources.push(source.clone());
             Ok(source)
+        }
+
+        async fn update_source(
+            &mut self,
+            source_id: SourceId,
+            patch: SourcePatch,
+        ) -> Result<Source, SourceServiceError> {
+            self.replace_source(source_id, |source| {
+                source.apply_patch(patch).map_err(|error| {
+                    SourceServiceError::Source(SourceRepositoryError::Domain(error))
+                })
+            })
+            .await
+        }
+
+        async fn delete_source(&mut self, source_id: SourceId) -> Result<(), SourceServiceError> {
+            let exists = self
+                .pending_sources
+                .iter()
+                .any(|source| source.id() == source_id)
+                || self
+                    .state
+                    .lock()
+                    .await
+                    .sources
+                    .iter()
+                    .any(|source| source.id() == source_id);
+            if !exists {
+                return Err(SourceServiceError::Source(
+                    SourceRepositoryError::NotFound { source_id },
+                ));
+            }
+            self.pending_sources
+                .retain(|source| source.id() != source_id);
+            self.pending_deletions.push(source_id);
+            Ok(())
         }
 
         async fn enqueue_source_sync(&mut self, job: NewJob) -> Result<(), SourceServiceError> {
@@ -400,6 +490,12 @@ mod tests {
 
         async fn commit(self) -> Result<(), SourceServiceError> {
             let mut state = self.state.lock().await;
+            for source_id in &self.pending_deletions {
+                state.sources.retain(|source| source.id() != *source_id);
+                state
+                    .jobs
+                    .retain(|job| job.source_id != Some(source_id.as_uuid()));
+            }
             for source in self.pending_sources {
                 if let Some(existing) = state
                     .sources
@@ -467,7 +563,7 @@ mod tests {
             id: source.id(),
             book_id: source.book_id().to_owned(),
             display_name: source.display_name().to_owned(),
-            article_url: source.article_url().clone(),
+            article_url: source.article_url().cloned(),
             enabled,
             sync_interval: source.sync_interval(),
             rss_item_limit: source.rss_item_limit(),
@@ -485,9 +581,11 @@ mod tests {
             id: SourceId::from_uuid(Uuid::from_u128(id)),
             book_id: book_id.to_owned(),
             display_name: "Example".to_owned(),
-            article_url: "https://mp.weixin.qq.com/s/example"
-                .parse()
-                .expect("test URL should be valid"),
+            article_url: Some(
+                "https://mp.weixin.qq.com/s/example"
+                    .parse()
+                    .expect("test URL should be valid"),
+            ),
             enabled: true,
             sync_interval: Duration::hours(1),
             rss_item_limit: 20,
@@ -605,6 +703,118 @@ mod tests {
         let state = factory.state.lock().await;
         assert_eq!(state.commits, 3);
         assert_eq!(state.sources, vec![gated]);
+    }
+
+    #[tokio::test]
+    async fn editable_source_changes_advance_revision_and_delete_source_owned_work() {
+        let factory = FakeUnitOfWorkFactory::default();
+        let service = SourceService::new(FakeSourceReader::default(), factory.clone());
+        let source_id = SourceId::from_uuid(Uuid::from_u128(5));
+
+        let created = service
+            .create(new_source(5, "book-before"))
+            .await
+            .expect("source should be created");
+        let updated = service
+            .update(
+                source_id,
+                SourcePatch {
+                    book_id: Some(" book-after ".to_owned()),
+                    display_name: Some(" Renamed source ".to_owned()),
+                    article_url: Some(None),
+                    sync_interval: Some(Duration::hours(2)),
+                    rss_item_limit: Some(10),
+                    account_id: Some(Some(
+                        crate::domain::credentials::WeReadAccountId::from_uuid(Uuid::from_u128(6)),
+                    )),
+                    priority: Some(20),
+                    max_attempts: Some(5),
+                },
+            )
+            .await
+            .expect("source update should succeed");
+
+        assert_eq!(updated.book_id(), "book-after");
+        assert_eq!(updated.display_name(), "Renamed source");
+        assert_eq!(updated.article_url(), None);
+        assert_eq!(updated.sync_interval(), Duration::hours(2));
+        assert_eq!(updated.rss_item_limit(), 10);
+        assert_eq!(updated.priority(), 20);
+        assert_eq!(updated.max_attempts(), 5);
+        assert_eq!(updated.feed_revision(), FeedRevision::from_u64(1));
+        assert_eq!(updated.next_fetch_at(), created.next_fetch_at());
+
+        let scheduling_only = service
+            .update(
+                source_id,
+                SourcePatch {
+                    sync_interval: Some(Duration::hours(3)),
+                    priority: Some(30),
+                    max_attempts: Some(6),
+                    ..SourcePatch::default()
+                },
+            )
+            .await
+            .expect("scheduling-only update should succeed");
+        assert_eq!(scheduling_only.feed_revision(), FeedRevision::from_u64(1));
+        assert_eq!(scheduling_only.account_id(), updated.account_id());
+
+        service
+            .delete(source_id)
+            .await
+            .expect("source deletion should succeed");
+        let state = factory.state.lock().await;
+        assert!(state.sources.is_empty());
+        assert!(state.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_source_update_and_missing_delete_do_not_commit() {
+        let factory = FakeUnitOfWorkFactory::default();
+        let service = SourceService::new(FakeSourceReader::default(), factory.clone());
+        let source_id = SourceId::from_uuid(Uuid::from_u128(7));
+        service
+            .create(new_source(7, "book-validation"))
+            .await
+            .expect("source should be created");
+
+        let invalid = service
+            .update(
+                source_id,
+                SourcePatch {
+                    book_id: Some("   ".to_owned()),
+                    display_name: Some("still named".to_owned()),
+                    article_url: Some(None),
+                    sync_interval: Some(Duration::hours(1)),
+                    rss_item_limit: Some(20),
+                    account_id: Some(None),
+                    priority: Some(0),
+                    max_attempts: Some(3),
+                },
+            )
+            .await
+            .expect_err("empty book ID should be rejected");
+        assert!(matches!(
+            invalid,
+            SourceServiceError::Source(SourceRepositoryError::Domain(
+                crate::domain::source::SourceError::EmptyBookId
+            ))
+        ));
+
+        let missing = service
+            .delete(SourceId::from_uuid(Uuid::from_u128(8)))
+            .await
+            .expect_err("missing source should not be deleted");
+        assert!(matches!(
+            missing,
+            SourceServiceError::Source(SourceRepositoryError::NotFound { source_id })
+                if source_id == SourceId::from_uuid(Uuid::from_u128(8))
+        ));
+
+        let state = factory.state.lock().await;
+        assert_eq!(state.sources.len(), 1);
+        assert_eq!(state.jobs.len(), 1);
+        assert_eq!(state.commits, 1);
     }
 
     #[test]

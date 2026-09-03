@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use werrss::{
     application::source_service::{SourceService, SourceServiceError},
-    domain::source::{NewSource, SchedulingGate, SourceId, VerifiedWechatArticleUrl},
+    domain::source::{NewSource, SchedulingGate, SourceId, SourcePatch, VerifiedWechatArticleUrl},
     persistence::repositories::source_repository::SourceRepositoryError,
     persistence::unit_of_work::UnitOfWorkFactory,
 };
@@ -95,6 +95,88 @@ async fn source_service_does_not_enqueue_for_disabled_or_blocked_sources(pool: P
     .await
     .expect("job count should be queryable");
     assert_eq!(job_count, 0);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn source_service_persists_a_book_only_source_with_a_null_article_url(pool: PgPool) {
+    let service = service(&pool);
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let created = service
+        .create(NewSource {
+            article_url: None,
+            ..source_spec(source_id, "book-service-only")
+        })
+        .await
+        .expect("book-only source creation should succeed");
+
+    assert_eq!(created.article_url(), None);
+    assert_eq!(
+        service
+            .find(source_id)
+            .await
+            .expect("source lookup should succeed")
+            .expect("source should exist")
+            .article_url(),
+        None
+    );
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT article_url FROM sources WHERE id = $1")
+            .bind(source_id.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .expect("article URL should be queryable");
+    assert_eq!(stored, None);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn source_service_updates_and_deletes_source_owned_jobs(pool: PgPool) {
+    let service = service(&pool);
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let created = service
+        .create(source_spec(source_id, "book-service-edit"))
+        .await
+        .expect("source creation should succeed");
+
+    let updated = service
+        .update(
+            source_id,
+            SourcePatch {
+                book_id: Some(" book-service-edited ".to_owned()),
+                display_name: Some(" Edited source ".to_owned()),
+                article_url: Some(None),
+                sync_interval: Some(Duration::hours(2)),
+                rss_item_limit: Some(10),
+                priority: Some(20),
+                max_attempts: Some(5),
+                ..SourcePatch::default()
+            },
+        )
+        .await
+        .expect("source update should succeed");
+    assert_eq!(updated.book_id(), "book-service-edited");
+    assert_eq!(updated.display_name(), "Edited source");
+    assert_eq!(updated.article_url(), None);
+    assert_eq!(
+        updated.feed_revision(),
+        werrss::domain::source::FeedRevision::from_u64(1)
+    );
+    assert_eq!(updated.next_fetch_at(), created.next_fetch_at());
+
+    service
+        .delete(source_id)
+        .await
+        .expect("source deletion should succeed");
+    assert!(service
+        .find(source_id)
+        .await
+        .expect("deleted source lookup should succeed")
+        .is_none());
+    let remaining_jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE source_id = $1")
+        .bind(source_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("source jobs should be queryable");
+    assert_eq!(remaining_jobs, 0);
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -226,9 +308,11 @@ fn source_spec(source_id: SourceId, book_id: &str) -> NewSource {
         id: source_id,
         book_id: book_id.to_owned(),
         display_name: "Service test source".to_owned(),
-        article_url: "https://mp.weixin.qq.com/s/service-test"
-            .parse::<VerifiedWechatArticleUrl>()
-            .expect("test URL should be valid"),
+        article_url: Some(
+            "https://mp.weixin.qq.com/s/service-test"
+                .parse::<VerifiedWechatArticleUrl>()
+                .expect("test URL should be valid"),
+        ),
         enabled: true,
         sync_interval: Duration::hours(1),
         rss_item_limit: 20,

@@ -301,6 +301,9 @@ CSRF token; send that token as `X-CSRF-Token` on every state-changing admin
 request. The panel is available at `/admin` and uses these API routes:
 
 - `GET /api/admin/sources` and `POST /api/admin/sources` for source management;
+- `GET /api/admin/sources/{id}` to inspect a source and `PUT`/`DELETE` on the
+  same path to edit or remove it; the panel exposes this at
+  `/admin/sources/{id}`;
 - `POST /api/admin/sources/{id}/enabled` and `/gate` for operator controls;
 - `POST /api/admin/sources/{id}/feed-token` to create/rotate a copyable feed
   link; and
@@ -311,6 +314,16 @@ request. The panel is available at `/admin` and uses these API routes:
   header without changing source references; and
 - `GET /api/admin/weread/accounts/{account_id}` to inspect non-secret account
   status.
+
+Sources can be created with either a `book_id` or an `article_url` (or both).
+When only an article URL is supplied, the API resolves its WeRead book ID from
+the long URL or through the configured clean browser sidecar for a short
+`/s/...` link. A supplied book ID always wins. The display name is optional:
+the resolved public-account name is preferred, then the book ID is used as a
+stable fallback. An article URL is stored when supplied; book-only sources
+store no URL. `account_id` is also optional and, when present, pins future
+source synchronization to that WeRead account; otherwise the worker selects
+an enabled, unexpired account at run time.
 
 There is no user-management endpoint. Put the application behind TLS in a
 deployment so the session cookie and credentials are protected in transit.
@@ -385,3 +398,18 @@ The integration command may create isolated databases for each
 limits documented for the nextest workflow. Keep credentials in the shell or
 an ignored local development file, never in README examples or committed
 reports.
+
+For the complete test suite, install `cargo-nextest` and use the repository's
+checked-in `.config/nextest.toml` configuration:
+
+```sh
+cargo install cargo-nextest --locked
+cargo nextest run --locked --tests -j 16
+```
+
+The global `-j 16` keeps database-independent tests fast, while the
+configuration places the API and PostgreSQL-backed test binaries in a group
+limited to sixteen concurrent isolated-database setups. This keeps the
+database workload bounded independently if the global test concurrency is
+raised later. The cap can be lowered in `.config/nextest.toml` for a smaller
+or shared PostgreSQL service.

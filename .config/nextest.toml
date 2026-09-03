@@ -1,0 +1,8 @@
+# Keep database-backed tests bounded independently from the global nextest
+# setting; the trusted development service permits up to sixteen setups.
+[test-groups.postgres]
+max-threads = 16
+
+[[profile.default.overrides]]
+filter = "binary(api) | binary(postgres_*) | binary(runtime_supervisor)"
+test-group = "postgres"

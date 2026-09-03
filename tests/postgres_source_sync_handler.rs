@@ -1,9 +1,10 @@
 //! PostgreSQL integration coverage for source-sync job finalization.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use chrono::{Duration, TimeZone, Utc};
 use sqlx::{PgPool, Row};
+use tokio::sync::Notify;
 use uuid::Uuid;
 use werrss::{
     acquisition::{
@@ -21,7 +22,7 @@ use werrss::{
     domain::{
         job::{JobType, NewJob},
         pacing::QuietHours,
-        source::{NewSource, SchedulingGate, SourceId, VerifiedWechatArticleUrl},
+        source::{NewSource, SchedulingGate, SourceId, SourcePatch, VerifiedWechatArticleUrl},
         sync::SyncOutcome,
     },
     persistence::{
@@ -40,6 +41,10 @@ struct FakeAcquirer {
     timeout_articles: Vec<String>,
     blocked_articles: Vec<String>,
     authentication_error: bool,
+    list_started: Option<Arc<Notify>>,
+    list_release: Option<Arc<Notify>>,
+    fetch_started: Option<Arc<Notify>>,
+    fetch_release: Option<Arc<Notify>>,
 }
 
 impl FakeAcquirer {
@@ -52,15 +57,26 @@ impl FakeAcquirer {
             timeout_articles: Vec::new(),
             blocked_articles: Vec::new(),
             authentication_error: false,
+            list_started: None,
+            list_release: None,
+            fetch_started: None,
+            fetch_release: None,
         }
     }
 }
 
+#[async_trait::async_trait]
 impl SourceSyncAcquirer for FakeAcquirer {
     async fn list_article_references(
         &self,
         _source: &werrss::domain::source::Source,
     ) -> Result<Vec<WeReadArticleReference>, SyncAcquisitionError> {
+        if let Some(list_started) = &self.list_started {
+            list_started.notify_one();
+        }
+        if let Some(list_release) = &self.list_release {
+            list_release.notified().await;
+        }
         if self.authentication_error {
             Err(SyncAcquisitionError::WeRead(
                 WeReadAdapterError::AuthenticationExpired { code: 401 },
@@ -74,6 +90,12 @@ impl SourceSyncAcquirer for FakeAcquirer {
         &self,
         reference: &WeReadArticleReference,
     ) -> Result<ExtractedArticlePage, SyncAcquisitionError> {
+        if let Some(fetch_started) = &self.fetch_started {
+            fetch_started.notify_one();
+        }
+        if let Some(fetch_release) = &self.fetch_release {
+            fetch_release.notified().await;
+        }
         if self
             .blocked_articles
             .iter()
@@ -294,6 +316,10 @@ async fn authentication_failure_gates_the_source_and_does_not_retry_the_job(pool
             timeout_articles: Vec::new(),
             blocked_articles: Vec::new(),
             authentication_error: true,
+            list_started: None,
+            list_release: None,
+            fetch_started: None,
+            fetch_release: None,
         },
         SourceSyncJobHandlerConfig::default(),
     );
@@ -316,6 +342,137 @@ async fn authentication_failure_gates_the_source_and_does_not_retry_the_job(pool
         .await
         .unwrap();
     assert_eq!(job_status, "failed");
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn authentication_failure_clears_transient_schedule_without_restoring_stale_due_time(
+    pool: PgPool,
+) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_id).await;
+    enqueue_source_sync(&pool, source_id).await;
+    let lease = claim(&pool, Utc.timestamp_opt(1_700_000_000, 0).single().unwrap()).await;
+    let list_started = Arc::new(Notify::new());
+    let list_release = Arc::new(Notify::new());
+    let handler = handler(
+        pool.clone(),
+        FakeAcquirer {
+            authentication_error: true,
+            list_started: Some(list_started.clone()),
+            list_release: Some(list_release.clone()),
+            ..FakeAcquirer::successful(
+                reference(
+                    "review-auth-schedule",
+                    "https://mp.weixin.qq.com/s/auth-schedule",
+                ),
+                page("https://mp.weixin.qq.com/s/auth-schedule", "Auth schedule"),
+            )
+        },
+        SourceSyncJobHandlerConfig::default(),
+    );
+
+    let execution = tokio::spawn(async move { handler.execute(&lease, Utc::now()).await });
+    list_started.notified().await;
+
+    let next_fetch_at = Utc.with_ymd_and_hms(2030, 2, 3, 4, 5, 6).single().unwrap();
+    let cooldown_until = next_fetch_at + Duration::minutes(10);
+    let reservation_until = next_fetch_at + Duration::minutes(20);
+    let mut update = factory.begin().await.unwrap();
+    update
+        .source()
+        .update_schedule(
+            source_id,
+            next_fetch_at,
+            Some(cooldown_until),
+            Some(reservation_until),
+        )
+        .await
+        .unwrap();
+    update.commit().await.unwrap();
+
+    list_release.notify_one();
+    assert_eq!(execution.await.unwrap(), JobExecution::Committed);
+
+    let source = sqlx::query(
+        "SELECT scheduling_gate, next_fetch_at, failure_cooldown_until, schedule_reserved_until FROM sources WHERE id = $1",
+    )
+    .bind(source_id.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        source.get::<String, _>("scheduling_gate"),
+        "authentication_required"
+    );
+    assert_eq!(
+        source.get::<chrono::DateTime<Utc>, _>("next_fetch_at"),
+        next_fetch_at
+    );
+    assert!(source
+        .get::<Option<chrono::DateTime<Utc>>, _>("failure_cooldown_until")
+        .is_none());
+    assert!(source
+        .get::<Option<chrono::DateTime<Utc>>, _>("schedule_reserved_until")
+        .is_none());
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn source_sync_finalization_uses_a_sync_interval_edited_during_fetch(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_id).await;
+    let job_id = enqueue_source_sync(&pool, source_id).await;
+    let lease = claim(&pool, Utc.timestamp_opt(1_700_000_000, 0).single().unwrap()).await;
+    let fetch_started = Arc::new(Notify::new());
+    let fetch_release = Arc::new(Notify::new());
+    let handler = handler(
+        pool.clone(),
+        FakeAcquirer {
+            fetch_started: Some(fetch_started.clone()),
+            fetch_release: Some(fetch_release.clone()),
+            ..FakeAcquirer::successful(
+                reference(
+                    "review-interval-edit",
+                    "https://mp.weixin.qq.com/s/interval-edit",
+                ),
+                page("https://mp.weixin.qq.com/s/interval-edit", "Interval edit"),
+            )
+        },
+        SourceSyncJobHandlerConfig::default(),
+    );
+
+    let execution = tokio::spawn(async move { handler.execute(&lease, Utc::now()).await });
+    fetch_started.notified().await;
+
+    let mut update = factory.begin().await.unwrap();
+    update
+        .source()
+        .update(
+            source_id,
+            SourcePatch {
+                sync_interval: Some(Duration::hours(2)),
+                ..SourcePatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    update.commit().await.unwrap();
+
+    fetch_release.notify_one();
+    assert_eq!(execution.await.unwrap(), JobExecution::Committed);
+
+    let schedule = sqlx::query(
+        "SELECT sources.next_fetch_at, sync_runs.finished_at FROM sources JOIN sync_runs ON sync_runs.job_id = $1 WHERE sources.id = $2",
+    )
+    .bind(job_id)
+    .bind(source_id.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let next_fetch_at = schedule.get::<chrono::DateTime<Utc>, _>("next_fetch_at");
+    let finished_at = schedule.get::<chrono::DateTime<Utc>, _>("finished_at");
+    assert_eq!(next_fetch_at, finished_at + Duration::hours(2));
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -399,7 +556,7 @@ async fn create_source(factory: &UnitOfWorkFactory, source_id: SourceId) {
             id: source_id,
             book_id: format!("book-{source_id}"),
             display_name: "Test source".to_owned(),
-            article_url: "https://mp.weixin.qq.com/s/source".parse().unwrap(),
+            article_url: Some("https://mp.weixin.qq.com/s/source".parse().unwrap()),
             enabled: true,
             sync_interval: Duration::hours(1),
             rss_item_limit: 20,

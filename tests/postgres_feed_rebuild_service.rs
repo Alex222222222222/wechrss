@@ -368,9 +368,11 @@ async fn create_source(factory: &UnitOfWorkFactory, source_id: SourceId) {
             id: source_id,
             book_id: format!("book-{source_id}"),
             display_name: "Integration source".to_owned(),
-            article_url: "https://mp.weixin.qq.com/s/source"
-                .parse::<VerifiedWechatArticleUrl>()
-                .expect("source URL should be valid"),
+            article_url: Some(
+                "https://mp.weixin.qq.com/s/source"
+                    .parse::<VerifiedWechatArticleUrl>()
+                    .expect("source URL should be valid"),
+            ),
             enabled: true,
             sync_interval: Duration::hours(1),
             rss_item_limit: 20,

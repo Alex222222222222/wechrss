@@ -21,6 +21,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
+    acquisition::identity::{ArticleIdentityResolver, IdentityError, UrlArticleIdentityResolver},
     application::{
         auth_service::{
             AuthService, AuthServiceError, CredentialProvision, ManualCredentialRefresher,
@@ -31,7 +32,7 @@ use crate::{
     },
     domain::{
         credentials::WeReadAccountId,
-        source::{NewSource, SchedulingGate, Source, SourceId},
+        source::{NewSource, SchedulingGate, Source, SourceId, SourcePatch},
         sync::SyncRun,
     },
     persistence::repositories::{
@@ -67,18 +68,41 @@ pub fn admin_router(
     sync_runs: PostgresSyncRunRepository,
     weread_auth: AdminAuthService,
 ) -> Router {
+    admin_router_with_identity_resolver(
+        auth,
+        sources,
+        feed_tokens,
+        sync_runs,
+        weread_auth,
+        Arc::new(UrlArticleIdentityResolver),
+    )
+}
+
+/// Builds the administration routes with a configured article identity
+/// resolver. Runtime deployments should provide the browser-backed resolver;
+/// the compatibility constructor above remains useful for long URLs and tests.
+pub fn admin_router_with_identity_resolver(
+    auth: AdminAuthenticator,
+    sources: AdminSourceService,
+    feed_tokens: AdminTokenService,
+    sync_runs: PostgresSyncRunRepository,
+    weread_auth: AdminAuthService,
+    identity_resolver: Arc<dyn ArticleIdentityResolver>,
+) -> Router {
     let state = Arc::new(AdminApiState {
         auth,
         sources,
         feed_tokens,
         sync_runs,
         weread_auth,
+        identity_resolver,
     });
     Router::new()
         .route("/", get(root_redirect))
         .route("/admin/login", get(login_page))
         .route("/admin", get(admin_page))
         .route("/admin/", get(admin_page))
+        .route("/admin/sources/{source_id}", get(source_page))
         .route("/admin/weread/accounts", get(weread_accounts_page))
         .route(
             "/admin/weread/accounts/{account_id}",
@@ -101,6 +125,10 @@ pub fn admin_router(
             post(set_weread_account_enabled),
         )
         .route("/api/admin/sources", get(list_sources).post(create_source))
+        .route(
+            "/api/admin/sources/{source_id}",
+            get(get_source).put(update_source).delete(delete_source),
+        )
         .route("/api/admin/sources/{source_id}/enabled", post(set_enabled))
         .route("/api/admin/sources/{source_id}/gate", post(set_gate))
         .route(
@@ -120,6 +148,7 @@ struct AdminApiState {
     feed_tokens: AdminTokenService,
     sync_runs: PostgresSyncRunRepository,
     weread_auth: AdminAuthService,
+    identity_resolver: Arc<dyn ArticleIdentityResolver>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -550,17 +579,56 @@ async fn list_sources(State(state): State<Arc<AdminApiState>>, headers: HeaderMa
     }
 }
 
+async fn get_source(
+    State(state): State<Arc<AdminApiState>>,
+    Path(source_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(error) = authenticate(&state.auth, &headers) {
+        return auth_error_response(error);
+    }
+    let source_id = match parse_source_id(&source_id) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    match state.sources.find(source_id).await {
+        Ok(Some(source)) => Json(SourceResponse::from(source)).into_response(),
+        Ok(None) => not_found("source"),
+        Err(error) => application_error_response(error),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateSourceRequest {
-    book_id: String,
-    display_name: String,
-    article_url: String,
+    book_id: Option<String>,
+    display_name: Option<String>,
+    article_url: Option<String>,
     sync_interval_seconds: Option<i64>,
     rss_item_limit: Option<u32>,
     account_id: Option<Uuid>,
     priority: Option<i32>,
     max_attempts: Option<u32>,
     enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateSourceRequest {
+    /// Omitted fields retain their existing value; an empty string is passed
+    /// through to domain validation so clients receive a useful error.
+    book_id: Option<String>,
+    display_name: Option<String>,
+    /// `None` means retain the URL, while `Some(None)` clears it. The custom
+    /// deserializer preserves that distinction for explicit JSON `null`.
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    article_url: Option<Option<String>>,
+    sync_interval_seconds: Option<i64>,
+    rss_item_limit: Option<u32>,
+    /// `None` means retain the binding, while `Some(None)` clears it. The
+    /// custom deserializer preserves that distinction for explicit JSON null.
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    account_id: Option<Option<Uuid>>,
+    priority: Option<i32>,
+    max_attempts: Option<u32>,
 }
 
 async fn create_source(
@@ -575,13 +643,46 @@ async fn create_source(
     if let Err(error) = csrf(&state.auth, &session, &headers) {
         return auth_error_response(error);
     }
-    let article_url = match request
-        .article_url
-        .parse::<crate::domain::source::VerifiedWechatArticleUrl>()
-    {
+    let article_url = match parse_article_url(request.article_url.as_deref()) {
         Ok(article_url) => article_url,
-        Err(error) => return validation_error(error.to_string()),
+        Err(error) => return validation_error(error),
     };
+    let supplied_book_id = request
+        .book_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if supplied_book_id.is_none() && article_url.is_none() {
+        return validation_error("book_id or article_url must be provided");
+    }
+    let identity = if supplied_book_id.is_none() {
+        match state
+            .identity_resolver
+            .resolve(article_url.clone().expect("article URL was checked"))
+            .await
+        {
+            Ok(identity) => Some(identity),
+            Err(error) => return identity_error_response(error),
+        }
+    } else {
+        None
+    };
+    let book_id = supplied_book_id
+        .or_else(|| identity.as_ref().map(|value| value.book_id().to_owned()))
+        .expect("book ID or identity must exist");
+    let display_name = request
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            identity
+                .as_ref()
+                .and_then(|value| value.account_name().map(str::to_owned))
+        })
+        .unwrap_or_else(|| book_id.clone());
     let sync_interval = match Duration::try_seconds(request.sync_interval_seconds.unwrap_or(3_600))
     {
         Some(value) => value,
@@ -590,8 +691,8 @@ async fn create_source(
     let account_id = request.account_id.map(WeReadAccountId::from_uuid);
     let source = NewSource {
         id: SourceId::from_uuid(Uuid::new_v4()),
-        book_id: request.book_id,
-        display_name: request.display_name,
+        book_id,
+        display_name,
         article_url,
         enabled: request.enabled.unwrap_or(true),
         sync_interval,
@@ -606,6 +707,94 @@ async fn create_source(
         Ok(source) => (StatusCode::CREATED, Json(SourceResponse::from(source))).into_response(),
         Err(error) => application_error_response(error),
     }
+}
+
+async fn update_source(
+    State(state): State<Arc<AdminApiState>>,
+    Path(source_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateSourceRequest>,
+) -> Response {
+    let _session = match protected_mutation(&state, &headers) {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    let source_id = match parse_source_id(&source_id) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    let article_url = match request.article_url {
+        None => None,
+        Some(value) => match parse_article_url(value.as_deref()) {
+            Ok(article_url) => Some(article_url),
+            Err(error) => return validation_error(error),
+        },
+    };
+    let sync_interval = match request.sync_interval_seconds {
+        Some(value) => match Duration::try_seconds(value) {
+            Some(value) => Some(value),
+            None => {
+                return validation_error("sync_interval_seconds is outside the supported range")
+            }
+        },
+        None => None,
+    };
+    let account_id = request
+        .account_id
+        .map(|value| value.map(WeReadAccountId::from_uuid));
+    let patch = SourcePatch {
+        book_id: request.book_id,
+        display_name: request.display_name,
+        article_url,
+        sync_interval,
+        rss_item_limit: request.rss_item_limit,
+        account_id,
+        priority: request.priority,
+        max_attempts: request.max_attempts,
+    };
+    match state.sources.update(source_id, patch).await {
+        Ok(source) => Json(SourceResponse::from(source)).into_response(),
+        Err(error) => application_error_response(error),
+    }
+}
+
+async fn delete_source(
+    State(state): State<Arc<AdminApiState>>,
+    Path(source_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let _session = match protected_mutation(&state, &headers) {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    let source_id = match parse_source_id(&source_id) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    match state.sources.delete(source_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => application_error_response(error),
+    }
+}
+
+fn parse_article_url(
+    value: Option<&str>,
+) -> Result<Option<crate::domain::source::VerifiedWechatArticleUrl>, String> {
+    match value {
+        Some(value) if !value.trim().is_empty() => value
+            .parse::<crate::domain::source::VerifiedWechatArticleUrl>()
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        _ => Ok(None),
+    }
+}
+
+fn deserialize_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -732,6 +921,28 @@ async fn admin_page(State(state): State<Arc<AdminApiState>>, headers: HeaderMap)
     }
 }
 
+async fn source_page(
+    State(state): State<Arc<AdminApiState>>,
+    Path(source_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match authenticate(&state.auth, &headers) {
+        Ok(session) => session,
+        Err(_) => {
+            return (StatusCode::SEE_OTHER, [(header::LOCATION, "/admin/login")]).into_response()
+        }
+    };
+    let source_id = match parse_source_id(&source_id) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    match state.sources.find(source_id).await {
+        Ok(Some(source)) => ui::source_page(&session, &source).into_response(),
+        Ok(None) => not_found("source"),
+        Err(error) => application_error_response(error),
+    }
+}
+
 fn protected_mutation(
     state: &AdminApiState,
     headers: &HeaderMap,
@@ -779,7 +990,7 @@ struct SourceResponse {
     id: SourceId,
     book_id: String,
     display_name: String,
-    article_url: String,
+    article_url: Option<String>,
     enabled: bool,
     sync_interval_seconds: i64,
     rss_item_limit: u32,
@@ -799,7 +1010,7 @@ impl From<Source> for SourceResponse {
             id: source.id(),
             book_id: source.book_id().to_owned(),
             display_name: source.display_name().to_owned(),
-            article_url: source.article_url().to_string(),
+            article_url: source.article_url().map(ToString::to_string),
             enabled: source.enabled(),
             sync_interval_seconds: source.sync_interval().num_seconds(),
             rss_item_limit: source.rss_item_limit(),
@@ -876,6 +1087,18 @@ fn validation_error(message: impl Into<String>) -> Response {
         Json(json!({ "error": message.into() })),
     )
         .into_response()
+}
+
+fn identity_error_response(error: IdentityError) -> Response {
+    let status = match error {
+        IdentityError::Browser(_) => StatusCode::SERVICE_UNAVAILABLE,
+        IdentityError::InvalidArticleUrl(_)
+        | IdentityError::InvalidBiz
+        | IdentityError::MissingIdentity
+        | IdentityError::UnsafeRedirect
+        | IdentityError::VerificationRequired => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    (status, Json(json!({ "error": error.to_string() }))).into_response()
 }
 
 fn auth_service_error_response(error: AuthServiceError) -> Response {

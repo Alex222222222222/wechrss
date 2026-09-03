@@ -85,6 +85,7 @@ impl<S, A, L, U> FeedRebuildJobHandler<S, A, L, U> {
     }
 }
 
+#[async_trait::async_trait]
 impl<S, A, L, U> JobHandler for FeedRebuildJobHandler<S, A, L, U>
 where
     S: SourceReader,

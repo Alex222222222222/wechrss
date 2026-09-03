@@ -265,7 +265,7 @@ pub enum FeedRebuildError {
 }
 
 /// Transaction-scoped feed-cache publication capability.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait FeedRebuildUnitOfWork: JobOutcomeTransaction {
     /// Publishes/releases the build lease as part of this transaction. The
     /// inherited outcome port can complete a claimed worker job before commit.
@@ -283,10 +283,10 @@ pub trait FeedRebuildUnitOfWork: JobOutcomeTransaction {
 }
 
 /// Factory for the shared transaction used by a rebuild.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait FeedRebuildUnitOfWorkFactory: Clone + Send + Sync {
     /// Transaction type borrowed from this factory.
-    type Transaction<'a>: FeedRebuildUnitOfWork + 'a
+    type Transaction<'a>: FeedRebuildUnitOfWork + Send + 'a
     where
         Self: 'a;
 
@@ -297,6 +297,7 @@ pub trait FeedRebuildUnitOfWorkFactory: Clone + Send + Sync {
     async fn database_now(&self) -> Result<DateTime<Utc>, UnitOfWorkError>;
 }
 
+#[async_trait::async_trait]
 impl FeedRebuildUnitOfWork for UnitOfWork<'_> {
     async fn publish_feed(
         &mut self,
@@ -313,6 +314,7 @@ impl FeedRebuildUnitOfWork for UnitOfWork<'_> {
     }
 }
 
+#[async_trait::async_trait]
 impl FeedRebuildUnitOfWorkFactory for UnitOfWorkFactory {
     type Transaction<'a> = UnitOfWork<'a>;
 
@@ -572,6 +574,7 @@ mod tests {
         source: Arc<Mutex<Option<Source>>>,
     }
 
+    #[async_trait::async_trait]
     impl SourceReader for FakeSources {
         async fn find(&self, source_id: SourceId) -> Result<Option<Source>, SourceServiceError> {
             Ok(self
@@ -601,6 +604,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeArticles;
 
+    #[async_trait::async_trait]
     impl ArticleRepository for FakeArticles {
         async fn find(
             &self,
@@ -653,6 +657,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl FeedRebuildUnitOfWorkFactory for FakeUnitOfWorkFactory {
         type Transaction<'a> = FakeUnitOfWork;
 
@@ -670,6 +675,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl JobOutcomeTransaction for FakeUnitOfWork {
         async fn apply_outcome(&mut self, outcome: JobOutcome) -> Result<Job, JobRepositoryError> {
             self.job_outcomes.lock().await.push(outcome);
@@ -687,6 +693,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl FeedRebuildUnitOfWork for FakeUnitOfWork {
         async fn publish_feed(
             &mut self,
@@ -725,7 +732,7 @@ mod tests {
             id: source_id(),
             book_id: "book-1".to_owned(),
             display_name: "Test feed".to_owned(),
-            article_url: "https://mp.weixin.qq.com/s/test".parse().unwrap(),
+            article_url: Some("https://mp.weixin.qq.com/s/test".parse().unwrap()),
             enabled: true,
             sync_interval: Duration::hours(1),
             rss_item_limit: 20,

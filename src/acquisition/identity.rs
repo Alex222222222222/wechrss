@@ -31,7 +31,8 @@
 //! 4. [`extract_identity_from_html`] tries the final URL before progressively
 //!    narrower page-source fallbacks; and
 //! 5. the application converts the result into a `NewSource` and persists it
-//!    in its normal source/job transaction.
+//!    in its normal source/job transaction. A caller that already has a
+//!    `book_id` may omit the article URL entirely.
 //!
 //! Failure behavior is explicit: malformed Base64 is not silently converted
 //! to a made-up book ID, an unsafe redirect is rejected, a structurally
@@ -46,10 +47,6 @@
 //! subject to the source repository's unique constraint, so concurrent source
 //! creation still resolves through the durable database transaction.
 //!
-//! TODO(implementation): add an application service that composes this
-//! resolver with `SourceService::create`; keep that composition outside this
-//! module so browser cleanup and source/job commit policy remain testable.
-
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use percent_encoding::percent_decode_str;
 use regex::Regex;
@@ -59,7 +56,78 @@ use url::Url;
 
 use crate::domain::source::{SourceError, VerifiedWechatArticleUrl};
 
-use super::webdriver::{PublicBrowserSession, WebDriverError};
+use super::{
+    browser_pool::BrowserPool,
+    webdriver::{PublicBrowserSession, WebDriverError, WebDriverFactory},
+};
+
+/// Application boundary for resolving the public-account identity behind an
+/// article URL.
+#[async_trait::async_trait]
+pub trait ArticleIdentityResolver: Send + Sync {
+    /// Resolves the canonical WeRead book ID and optional display metadata.
+    async fn resolve(
+        &self,
+        article_url: VerifiedWechatArticleUrl,
+    ) -> Result<ArticleIdentity, IdentityError>;
+}
+
+/// Resolver used by callers that only accept long URLs containing `__biz` or
+/// `biz`. Short links are deliberately reported as unresolved instead of
+/// silently being stored without a stable identity.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UrlArticleIdentityResolver;
+
+#[async_trait::async_trait]
+impl ArticleIdentityResolver for UrlArticleIdentityResolver {
+    async fn resolve(
+        &self,
+        article_url: VerifiedWechatArticleUrl,
+    ) -> Result<ArticleIdentity, IdentityError> {
+        resolve_from_url(article_url)
+    }
+}
+
+/// Resolver that first handles long URLs locally and then uses a clean public
+/// browser session for short `/s/...` URLs.
+#[derive(Clone)]
+pub struct BrowserArticleIdentityResolver {
+    factory: WebDriverFactory,
+    browser_pool: BrowserPool,
+}
+
+impl BrowserArticleIdentityResolver {
+    /// Creates a resolver over the process-wide browser capacity and profile.
+    pub fn new(factory: WebDriverFactory, browser_pool: BrowserPool) -> Self {
+        Self {
+            factory,
+            browser_pool,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ArticleIdentityResolver for BrowserArticleIdentityResolver {
+    async fn resolve(
+        &self,
+        article_url: VerifiedWechatArticleUrl,
+    ) -> Result<ArticleIdentity, IdentityError> {
+        match resolve_from_url(article_url.clone()) {
+            Ok(identity) => Ok(identity),
+            Err(IdentityError::MissingIdentity) => {
+                let session = self
+                    .factory
+                    .open_public(&self.browser_pool)
+                    .await
+                    .map_err(|error| IdentityError::Browser(error.to_string()))?;
+                WebDriverIdentityResolver
+                    .resolve(article_url, session)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
 
 /// The fallback that produced an identity value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

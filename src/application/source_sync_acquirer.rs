@@ -232,6 +232,7 @@ impl<R, W, A, S> BrowserSourceSyncAcquirer<R, W, A, S> {
     }
 }
 
+#[async_trait::async_trait]
 impl<R, W, A, S> SourceSyncAcquirer for BrowserSourceSyncAcquirer<R, W, A, S>
 where
     R: AccountLeaseStore + Clone + 'static,
@@ -243,28 +244,14 @@ where
         &self,
         source: &Source,
     ) -> Result<Vec<WeReadArticleReference>, SyncAcquisitionError> {
-        let account_id = match self.config.account_id() {
-            Some(configured) => {
-                if source
-                    .account_id()
-                    .is_some_and(|source_account| source_account != configured)
-                {
-                    return Err(SyncAcquisitionError::WeRead(
-                        WeReadAdapterError::LeaseBackend(
-                            "source account is not available in the configured account".to_owned(),
-                        ),
-                    ));
-                }
-                configured
-            }
-            None => self
-                .dependencies
-                .account_selector
-                .select_account(source.account_id())
-                .await
-                .map_err(SyncAcquisitionError::WeRead)?
-                .ok_or(SyncAcquisitionError::NoAccountEnrolled)?,
-        };
+        let requested_account = source.account_id().or(self.config.account_id());
+        let account_id = self
+            .dependencies
+            .account_selector
+            .select_account(requested_account)
+            .await
+            .map_err(SyncAcquisitionError::WeRead)?
+            .ok_or(SyncAcquisitionError::NoAccountEnrolled)?;
         let owner = self.config.owner_for(self.worker_index);
         let session = self
             .dependencies
@@ -385,6 +372,7 @@ mod tests {
     #[derive(Clone)]
     struct UnusedWeReadAdapter;
 
+    #[async_trait::async_trait]
     impl<R> WeReadAdapter<R> for UnusedWeReadAdapter
     where
         R: AccountLeaseStore,
@@ -401,6 +389,7 @@ mod tests {
     #[derive(Clone)]
     struct UnusedArticlePageFetcher;
 
+    #[async_trait::async_trait]
     impl ArticlePageFetcher for UnusedArticlePageFetcher {
         async fn fetch(
             &self,
@@ -688,21 +677,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_account_override_cannot_escape_the_configured_profile() {
+    async fn source_account_override_wins_over_configured_default() {
         let configured_account = account_id();
         let source_account = WeReadAccountId::from_uuid(Uuid::from_u128(2));
-        let result = acquirer(
-            MemoryAccountLeaseRepository::new(chrono::Utc::now()),
-            configured_account,
-        )
-        .list_article_references(&source(Some(source_account)))
-        .await;
+        let repository = MemoryAccountLeaseRepository::new(chrono::Utc::now());
+        let _held = repository
+            .acquire(source_account, "another-worker", Duration::seconds(30))
+            .await
+            .unwrap()
+            .expect("the source account should be held by the competing worker");
+        let result = acquirer(repository, configured_account)
+            .list_article_references(&source(Some(source_account)))
+            .await;
 
         assert!(matches!(
             result,
             Err(SyncAcquisitionError::WeRead(
                 WeReadAdapterError::LeaseBackend(message)
-            )) if message.contains("not available")
+            )) if message.contains("already in use")
         ));
     }
 

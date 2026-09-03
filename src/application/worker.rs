@@ -91,7 +91,7 @@ pub enum JobExecution {
 }
 
 /// Handler capability used by one worker pass.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait JobHandler: Send + Sync {
     /// Runs one claimed job at the supplied compatibility/test timestamp.
     ///
@@ -270,7 +270,7 @@ pub enum WorkerRun {
 }
 
 /// Transaction that can apply and commit one worker outcome.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait WorkerOutcomeTransaction: JobOutcomeTransaction {
     /// Commits all changes made through this outcome transaction.
     async fn commit(self) -> Result<(), WorkerPersistenceError>
@@ -279,10 +279,10 @@ pub trait WorkerOutcomeTransaction: JobOutcomeTransaction {
 }
 
 /// Factory for transaction-scoped worker outcomes.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait WorkerOutcomeFactory: Send + Sync {
     /// Transaction type borrowed from this factory's persistence backend.
-    type Transaction<'a>: WorkerOutcomeTransaction + 'a
+    type Transaction<'a>: WorkerOutcomeTransaction + Send + 'a
     where
         Self: 'a;
 
@@ -290,9 +290,10 @@ pub trait WorkerOutcomeFactory: Send + Sync {
     async fn begin(&self) -> Result<Self::Transaction<'_>, WorkerPersistenceError>;
 }
 
+#[async_trait::async_trait]
 impl<T> WorkerOutcomeTransaction for T
 where
-    T: JobRepositoryTransaction,
+    T: JobRepositoryTransaction + Send,
 {
     async fn commit(self) -> Result<(), WorkerPersistenceError> {
         JobRepositoryTransaction::commit(self)
@@ -301,6 +302,7 @@ where
     }
 }
 
+#[async_trait::async_trait]
 impl WorkerOutcomeTransaction for UnitOfWork<'_> {
     async fn commit(self) -> Result<(), WorkerPersistenceError> {
         UnitOfWork::commit(self)
@@ -309,6 +311,7 @@ impl WorkerOutcomeTransaction for UnitOfWork<'_> {
     }
 }
 
+#[async_trait::async_trait]
 impl<R> WorkerOutcomeFactory for R
 where
     R: JobRepository,
@@ -325,6 +328,7 @@ where
     }
 }
 
+#[async_trait::async_trait]
 impl WorkerOutcomeFactory for UnitOfWorkFactory {
     type Transaction<'a>
         = UnitOfWork<'a>
@@ -575,6 +579,7 @@ mod tests {
         delay: StdDuration,
     }
 
+    #[async_trait::async_trait]
     impl JobHandler for FixedHandler {
         async fn execute(&self, _lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
             self.calls.fetch_add(1, Ordering::Relaxed);

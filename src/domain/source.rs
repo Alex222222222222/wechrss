@@ -1,7 +1,7 @@
 //! Source domain model.
 //!
 //! A source represents one subscribed WeChat public account. It contains the
-//! normalized `book_id`, display name, originating article URL, enabled state,
+//! normalized `book_id`, display name, optional originating article URL, enabled state,
 //! sync interval, RSS item limit, stable WeRead account relationship, monotonic
 //! feed revision, scheduling timestamps, and scheduling gate.
 //!
@@ -108,7 +108,7 @@ pub enum SourceError {
     /// A source must have a display name for feed metadata and administration.
     #[error("source display_name must not be empty")]
     EmptyDisplayName,
-    /// The source article URL is required for identity and public-page access.
+    /// A URL value object cannot be constructed from an empty string.
     #[error("source article_url must not be empty")]
     EmptyArticleUrl,
     /// The source article URL must identify an allowed public WeChat page.
@@ -282,8 +282,8 @@ pub struct NewSource {
     pub book_id: String,
     /// Human-readable source name.
     pub display_name: String,
-    /// Verified originating public WeChat article URL.
-    pub article_url: VerifiedWechatArticleUrl,
+    /// Verified originating public WeChat article URL, when one was supplied.
+    pub article_url: Option<VerifiedWechatArticleUrl>,
     /// Whether automatic synchronization is enabled.
     pub enabled: bool,
     /// Interval used by successful synchronization scheduling.
@@ -302,6 +302,53 @@ pub struct NewSource {
     pub max_attempts: u32,
 }
 
+/// Feed and scheduling configuration that replaces the mutable fields of an
+/// existing source while preserving its durable ID and scheduler state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceUpdate {
+    /// Normalized WeRead book identifier.
+    pub book_id: String,
+    /// Human-readable source name.
+    pub display_name: String,
+    /// Verified originating public WeChat article URL, if configured.
+    pub article_url: Option<VerifiedWechatArticleUrl>,
+    /// Interval used by successful synchronization scheduling.
+    pub sync_interval: Duration,
+    /// Maximum number of articles included in an RSS document.
+    pub rss_item_limit: u32,
+    /// Account used for authenticated list acquisition, if configured.
+    pub account_id: Option<WeReadAccountId>,
+    /// Scheduling priority copied to source-sync jobs.
+    pub priority: i32,
+    /// Retry failure budget copied to source-sync jobs.
+    pub max_attempts: u32,
+}
+
+/// Partial source configuration used by administrative edits.
+///
+/// `None` means that a field was omitted and must retain its current value.
+/// The nested options for `article_url` and `account_id` additionally allow a
+/// caller to distinguish omission from explicitly clearing a nullable field.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourcePatch {
+    /// Replacement WeRead book identifier, when supplied.
+    pub book_id: Option<String>,
+    /// Replacement human-readable source name, when supplied.
+    pub display_name: Option<String>,
+    /// Replacement URL, explicit `None` to clear, or omitted.
+    pub article_url: Option<Option<VerifiedWechatArticleUrl>>,
+    /// Replacement synchronization interval, when supplied.
+    pub sync_interval: Option<Duration>,
+    /// Replacement maximum RSS item count, when supplied.
+    pub rss_item_limit: Option<u32>,
+    /// Replacement account binding, explicit `None` to clear, or omitted.
+    pub account_id: Option<Option<WeReadAccountId>>,
+    /// Replacement scheduling priority, when supplied.
+    pub priority: Option<i32>,
+    /// Replacement retry failure budget, when supplied.
+    pub max_attempts: Option<u32>,
+}
+
 impl NewSource {
     /// Returns a compact development/default source specification.
     #[cfg(test)]
@@ -310,9 +357,11 @@ impl NewSource {
             id: SourceId::from_uuid(Uuid::from_u128(1)),
             book_id: "book-1".to_owned(),
             display_name: "Example".to_owned(),
-            article_url: "https://mp.weixin.qq.com/s/example"
-                .parse()
-                .expect("test URL should be valid"),
+            article_url: Some(
+                "https://mp.weixin.qq.com/s/example"
+                    .parse()
+                    .expect("test URL should be valid"),
+            ),
             enabled: true,
             sync_interval: Duration::hours(1),
             rss_item_limit: 20,
@@ -331,7 +380,7 @@ pub struct Source {
     id: SourceId,
     book_id: String,
     display_name: String,
-    article_url: VerifiedWechatArticleUrl,
+    article_url: Option<VerifiedWechatArticleUrl>,
     enabled: bool,
     sync_interval: Duration,
     rss_item_limit: u32,
@@ -354,7 +403,7 @@ pub(crate) struct SourceParts {
     pub(crate) id: SourceId,
     pub(crate) book_id: String,
     pub(crate) display_name: String,
-    pub(crate) article_url: VerifiedWechatArticleUrl,
+    pub(crate) article_url: Option<VerifiedWechatArticleUrl>,
     pub(crate) enabled: bool,
     pub(crate) sync_interval: Duration,
     pub(crate) rss_item_limit: u32,
@@ -416,6 +465,57 @@ impl Source {
         Ok(source)
     }
 
+    /// Applies operator-editable source fields without resetting scheduler
+    /// timestamps, transient gates, or accumulated feed state.
+    ///
+    /// A changed book ID, display name, article URL, or RSS item limit can
+    /// change the rendered feed and therefore advances the feed revision. The
+    /// caller persists the returned value atomically with the update.
+    pub fn apply_update(&self, update: SourceUpdate) -> Result<Self, SourceError> {
+        let mut updated = self.clone();
+        updated.book_id = update.book_id.trim().to_owned();
+        updated.display_name = update.display_name.trim().to_owned();
+        updated.article_url = update.article_url;
+        updated.sync_interval = update.sync_interval;
+        updated.rss_item_limit = update.rss_item_limit;
+        updated.account_id = update.account_id;
+        updated.priority = update.priority;
+        updated.max_attempts = update.max_attempts;
+        updated.validate()?;
+
+        let feed_visible_change = updated.book_id != self.book_id
+            || updated.display_name != self.display_name
+            || updated.article_url != self.article_url
+            || updated.rss_item_limit != self.rss_item_limit;
+        if feed_visible_change {
+            updated.advance_feed_revision()?;
+        }
+        Ok(updated)
+    }
+
+    /// Applies a partial operator update to the current source.
+    ///
+    /// Persistence adapters must call this after acquiring their row lock so
+    /// omitted fields are merged with the latest committed source state.
+    pub fn apply_patch(&self, patch: SourcePatch) -> Result<Self, SourceError> {
+        self.apply_update(SourceUpdate {
+            book_id: patch.book_id.unwrap_or_else(|| self.book_id().to_owned()),
+            display_name: patch
+                .display_name
+                .unwrap_or_else(|| self.display_name().to_owned()),
+            article_url: patch
+                .article_url
+                .unwrap_or_else(|| self.article_url().cloned()),
+            sync_interval: patch.sync_interval.unwrap_or_else(|| self.sync_interval()),
+            rss_item_limit: patch
+                .rss_item_limit
+                .unwrap_or_else(|| self.rss_item_limit()),
+            account_id: patch.account_id.unwrap_or_else(|| self.account_id()),
+            priority: patch.priority.unwrap_or_else(|| self.priority()),
+            max_attempts: patch.max_attempts.unwrap_or_else(|| self.max_attempts()),
+        })
+    }
+
     fn validate(&self) -> Result<(), SourceError> {
         if self.id.as_uuid().is_nil() {
             return Err(SourceError::InvalidId);
@@ -462,9 +562,9 @@ impl Source {
         &self.display_name
     }
 
-    /// Returns the source article URL used for identity acquisition.
-    pub fn article_url(&self) -> &VerifiedWechatArticleUrl {
-        &self.article_url
+    /// Returns the optional source article URL used for identity acquisition.
+    pub fn article_url(&self) -> Option<&VerifiedWechatArticleUrl> {
+        self.article_url.as_ref()
     }
 
     /// Returns whether automatic synchronization is enabled.
@@ -650,20 +750,101 @@ mod tests {
         let mut spec = new_source();
         spec.book_id = " book-1 ".to_owned();
         spec.display_name = " Example ".to_owned();
-        spec.article_url = " https://mp.weixin.qq.com/s/example "
-            .parse()
-            .expect("valid URL");
+        spec.article_url = Some(
+            " https://mp.weixin.qq.com/s/example "
+                .parse()
+                .expect("valid URL"),
+        );
 
         let source = Source::new(spec).expect("valid source should be created");
         assert_eq!(source.book_id(), "book-1");
         assert_eq!(source.display_name(), "Example");
         assert_eq!(
-            source.article_url().as_str(),
-            "https://mp.weixin.qq.com/s/example"
+            source.article_url().map(VerifiedWechatArticleUrl::as_str),
+            Some("https://mp.weixin.qq.com/s/example")
         );
         assert_eq!(source.priority(), 10);
         assert_eq!(source.max_attempts(), 3);
         assert_eq!(source.feed_revision(), FeedRevision::zero());
+    }
+
+    #[test]
+    fn source_creation_allows_book_only_sources_without_an_article_url() {
+        let mut spec = new_source();
+        spec.article_url = None;
+
+        let source = Source::new(spec).expect("book-only source should be valid");
+
+        assert_eq!(source.article_url(), None);
+    }
+
+    #[test]
+    fn source_updates_trim_values_preserve_scheduler_state_and_avoid_idempotent_revision_bumps() {
+        let source = Source::new(new_source()).expect("valid source should be created");
+        let updated = source
+            .apply_update(SourceUpdate {
+                book_id: " book-1 ".to_owned(),
+                display_name: " Renamed ".to_owned(),
+                article_url: None,
+                sync_interval: Duration::hours(2),
+                rss_item_limit: 10,
+                account_id: None,
+                priority: 20,
+                max_attempts: 5,
+            })
+            .expect("valid source update should be applied");
+
+        assert_eq!(updated.book_id(), "book-1");
+        assert_eq!(updated.display_name(), "Renamed");
+        assert_eq!(updated.article_url(), None);
+        assert_eq!(updated.sync_interval(), Duration::hours(2));
+        assert_eq!(updated.feed_revision(), FeedRevision::from_u64(1));
+        assert_eq!(updated.next_fetch_at(), source.next_fetch_at());
+
+        let repeated = updated
+            .apply_update(SourceUpdate {
+                book_id: "book-1".to_owned(),
+                display_name: "Renamed".to_owned(),
+                article_url: None,
+                sync_interval: Duration::hours(2),
+                rss_item_limit: 10,
+                account_id: None,
+                priority: 20,
+                max_attempts: 5,
+            })
+            .expect("repeating a valid source update should succeed");
+        assert_eq!(repeated.feed_revision(), updated.feed_revision());
+    }
+
+    #[test]
+    fn source_patches_retain_omitted_values_and_clear_nullable_values() {
+        let mut spec = new_source();
+        let account_id = WeReadAccountId::from_uuid(Uuid::from_u128(9));
+        spec.account_id = Some(account_id);
+        let source = Source::new(spec).expect("valid source should be created");
+
+        let renamed = source
+            .apply_patch(SourcePatch {
+                display_name: Some("Renamed".to_owned()),
+                ..SourcePatch::default()
+            })
+            .expect("partial source update should be valid");
+        assert_eq!(renamed.display_name(), "Renamed");
+        assert_eq!(renamed.book_id(), source.book_id());
+        assert_eq!(renamed.article_url(), source.article_url());
+        assert_eq!(renamed.sync_interval(), source.sync_interval());
+        assert_eq!(renamed.account_id(), Some(account_id));
+
+        let cleared = renamed
+            .apply_patch(SourcePatch {
+                article_url: Some(None),
+                account_id: Some(None),
+                ..SourcePatch::default()
+            })
+            .expect("nullable source fields should be clearable");
+        assert_eq!(cleared.article_url(), None);
+        assert_eq!(cleared.account_id(), None);
+        assert_eq!(cleared.display_name(), "Renamed");
     }
 
     #[test]

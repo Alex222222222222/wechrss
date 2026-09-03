@@ -418,6 +418,7 @@ impl BrowserWeReadAdapter {
     }
 }
 
+#[async_trait]
 impl<R> WeReadAdapter<R> for BrowserWeReadAdapter
 where
     R: AccountLeaseStore,
@@ -516,7 +517,7 @@ fn parse_article_list_body(body: &str) -> Result<Vec<WeReadArticleReference>, We
 }
 
 /// Port for authenticated WeRead account/list operations.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait WeReadAdapter<R>: Send + Sync
 where
     R: AccountLeaseStore,
@@ -547,6 +548,7 @@ mod tests {
 
     struct FakeAdapter;
 
+    #[async_trait]
     impl<R> WeReadAdapter<R> for FakeAdapter
     where
         R: AccountLeaseStore,

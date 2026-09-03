@@ -6,6 +6,11 @@ WeRead account persistence is added by the forward `0002_weread_accounts.sql`
 migration. This project has not published a release yet, so either file may
 still be revised before the first release if its contract changes.
 
+The forward `0003_optional_source_article_url.sql` migration allows a source
+to be created from a known WeRead `book_id` without inventing a public article
+URL. Existing URLs remain unchanged and new URLs are still validated by the
+domain before persistence.
+
 The initial schema provides:
 
 - the active non-failure `deferred` job state;

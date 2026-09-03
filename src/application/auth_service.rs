@@ -769,6 +769,7 @@ where
     }
 }
 
+#[async_trait]
 impl<S, L, R, C> JobHandler for CredentialRefreshJobHandler<S, L, R, C>
 where
     S: CredentialRepository,

@@ -519,6 +519,12 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
         .await
         .expect("repeated account delete request should complete");
     assert_eq!(deleted_again.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_source_mutations_require_csrf(pool: PgPool) {
+    let app = admin_app(&pool);
+    let (cookie, _) = admin_session(&app).await;
 
     let missing_csrf = app
         .clone()
@@ -533,6 +539,13 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
         .await
         .expect("mutation request should complete");
     assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_source_update_endpoints(pool: PgPool) {
+    let app = admin_app(&pool);
+    let (cookie, csrf_token) = admin_session(&app).await;
+    let csrf = csrf_token.as_str();
 
     let created = app
         .clone()
@@ -550,6 +563,253 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
     let created_body: serde_json::Value =
         serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
     let source_id = created_body["id"].as_str().unwrap().to_owned();
+
+    let source_detail = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/api/admin/sources/{source_id}"),
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("source detail request should complete");
+    assert_eq!(source_detail.status(), StatusCode::OK);
+    let source_detail_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(source_detail.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(source_detail_body["book_id"], "book-admin");
+    assert_eq!(source_detail_body["display_name"], "Admin source");
+
+    let source_page = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/admin/sources/{source_id}"),
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("source page request should complete");
+    assert_eq!(source_page.status(), StatusCode::OK);
+    let source_page_body =
+        String::from_utf8_lossy(&to_bytes(source_page.into_body(), usize::MAX).await.unwrap())
+            .to_string();
+    assert!(source_page_body.contains("<h1>Edit source</h1>"));
+    assert!(source_page_body.contains("name=\"book_id\" value=\"book-admin\""));
+
+    let updated = app
+        .clone()
+        .oneshot(admin_request_with_method(
+            &format!("/api/admin/sources/{source_id}"),
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({
+                "book_id": " book-updated ",
+                "display_name": " Updated source ",
+                "article_url": null,
+                "account_id": null,
+                "sync_interval_seconds": 7200,
+                "rss_item_limit": 10,
+                "priority": 4,
+                "max_attempts": 5
+            })),
+            "PUT",
+        ))
+        .await
+        .expect("source update request should complete");
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(updated.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(updated_body["book_id"], "book-updated");
+    assert_eq!(updated_body["display_name"], "Updated source");
+    assert!(updated_body["article_url"].is_null());
+    assert_eq!(updated_body["sync_interval_seconds"], 7200);
+    assert_eq!(updated_body["rss_item_limit"], 10);
+    assert!(updated_body["account_id"].is_null());
+    assert_eq!(updated_body["priority"], 4);
+    assert_eq!(updated_body["max_attempts"], 5);
+    assert_eq!(updated_body["feed_revision"], 1);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_source_creation_infers_identity_from_article_url(pool: PgPool) {
+    let app = admin_app(&pool);
+    let (cookie, csrf_token) = admin_session(&app).await;
+    let csrf = csrf_token.as_str();
+
+    let inferred = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/sources",
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({
+                "article_url": "https://mp.weixin.qq.com/s/inferred?__biz=MTIzNDU%3D&mid=1"
+            })),
+        ))
+        .await
+        .expect("source identity inference request should complete");
+    assert_eq!(inferred.status(), StatusCode::CREATED);
+    let inferred_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(inferred.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(inferred_body["book_id"], "MP_WXS_12345");
+    assert_eq!(inferred_body["display_name"], "MP_WXS_12345");
+    assert_eq!(
+        inferred_body["article_url"],
+        "https://mp.weixin.qq.com/s/inferred?__biz=MTIzNDU%3D&mid=1"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_source_creation_prefers_explicit_book_id(pool: PgPool) {
+    let app = admin_app(&pool);
+    let (cookie, csrf_token) = admin_session(&app).await;
+    let csrf = csrf_token.as_str();
+
+    let explicit_identity = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/sources",
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({
+                "book_id": "book-explicit",
+                "display_name": "Explicit source",
+                "article_url": "https://mp.weixin.qq.com/s/short-without-biz"
+            })),
+        ))
+        .await
+        .expect("explicit source identity request should complete");
+    assert_eq!(explicit_identity.status(), StatusCode::CREATED);
+    let explicit_identity_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(explicit_identity.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(explicit_identity_body["book_id"], "book-explicit");
+    assert_eq!(explicit_identity_body["display_name"], "Explicit source");
+    assert_eq!(
+        explicit_identity_body["article_url"],
+        "https://mp.weixin.qq.com/s/short-without-biz"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_source_update_rejects_conflicting_book_id_without_mutating_source(pool: PgPool) {
+    let app = admin_app(&pool);
+    let (cookie, csrf_token) = admin_session(&app).await;
+    let csrf = csrf_token.as_str();
+    let created = create_admin_source(
+        &app,
+        &cookie,
+        csrf,
+        serde_json::json!({
+            "book_id": "book-updated",
+            "display_name": "Admin source",
+            "article_url": "https://mp.weixin.qq.com/s/admin"
+        }),
+    )
+    .await;
+    let source_id = created["id"].as_str().unwrap().to_owned();
+
+    let conflicting_update = app
+        .clone()
+        .oneshot(admin_request_with_method(
+            &format!("/api/admin/sources/{source_id}"),
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({"book_id": "book-explicit"})),
+            "PUT",
+        ))
+        .await
+        .expect("conflicting source update request should complete");
+    assert_eq!(conflicting_update.status(), StatusCode::CONFLICT);
+
+    let after_conflict = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/api/admin/sources/{source_id}"),
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("source lookup after conflicting update should complete");
+    let after_conflict_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(after_conflict.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(after_conflict_body["book_id"], "book-updated");
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_source_creation_allows_book_only_sources(pool: PgPool) {
+    let app = admin_app(&pool);
+    let (cookie, csrf_token) = admin_session(&app).await;
+    let csrf = csrf_token.as_str();
+
+    let book_only = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/sources",
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({"book_id": "book-only"})),
+        ))
+        .await
+        .expect("book-only source request should complete");
+    assert_eq!(book_only.status(), StatusCode::CREATED);
+    let book_only_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(book_only.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(book_only_body["book_id"], "book-only");
+    assert_eq!(book_only_body["display_name"], "book-only");
+    assert!(book_only_body["article_url"].is_null());
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_source_creation_requires_book_id_or_article_url(pool: PgPool) {
+    let app = admin_app(&pool);
+    let (cookie, csrf_token) = admin_session(&app).await;
+    let csrf = csrf_token.as_str();
+
+    let missing_identity = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/sources",
+            &cookie,
+            Some(csrf),
+            Some(serde_json::json!({})),
+        ))
+        .await
+        .expect("missing source identity request should complete");
+    assert_eq!(missing_identity.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_source_scheduling_and_feed_token_endpoints(pool: PgPool) {
+    let app = admin_app(&pool);
+    let (cookie, csrf_token) = admin_session(&app).await;
+    let csrf = csrf_token.as_str();
+    let created = create_admin_source(
+        &app,
+        &cookie,
+        csrf,
+        serde_json::json!({
+            "book_id": "book-scheduled",
+            "display_name": "Scheduled source",
+            "article_url": "https://mp.weixin.qq.com/s/scheduled"
+        }),
+    )
+    .await;
+    let source_id = created["id"].as_str().unwrap().to_owned();
 
     let disabled = app
         .clone()
@@ -606,6 +866,24 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
         .await
         .expect("missing source token request should complete");
     assert_eq!(missing_feed_token.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_source_duplicate_identity_is_rejected(pool: PgPool) {
+    let app = admin_app(&pool);
+    let (cookie, csrf_token) = admin_session(&app).await;
+    let csrf = csrf_token.as_str();
+    create_admin_source(
+        &app,
+        &cookie,
+        csrf,
+        serde_json::json!({
+            "book_id": "book-updated",
+            "display_name": "Existing source",
+            "article_url": "https://mp.weixin.qq.com/s/existing"
+        }),
+    )
+    .await;
 
     let duplicate = app
         .clone()
@@ -614,12 +892,31 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
             &cookie,
             Some(csrf),
             Some(serde_json::json!({
-                "book_id": "book-admin", "display_name": "Duplicate", "article_url": "https://mp.weixin.qq.com/s/duplicate"
+                "book_id": "book-updated", "display_name": "Duplicate", "article_url": "https://mp.weixin.qq.com/s/duplicate"
             })),
         ))
         .await
         .expect("duplicate source request should complete");
     assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_source_history_endpoint_validates_limit(pool: PgPool) {
+    let app = admin_app(&pool);
+    let (cookie, csrf_token) = admin_session(&app).await;
+    let csrf = csrf_token.as_str();
+    let created = create_admin_source(
+        &app,
+        &cookie,
+        csrf,
+        serde_json::json!({
+            "book_id": "book-history",
+            "display_name": "History source",
+            "article_url": "https://mp.weixin.qq.com/s/history"
+        }),
+    )
+    .await;
+    let source_id = created["id"].as_str().unwrap().to_owned();
 
     let invalid_history = app
         .clone()
@@ -632,6 +929,50 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
         .await
         .expect("invalid history request should complete");
     assert_eq!(invalid_history.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_source_delete_endpoint_removes_the_source(pool: PgPool) {
+    let app = admin_app(&pool);
+    let (cookie, csrf_token) = admin_session(&app).await;
+    let csrf = csrf_token.as_str();
+    let created = create_admin_source(
+        &app,
+        &cookie,
+        csrf,
+        serde_json::json!({
+            "book_id": "book-delete",
+            "display_name": "Delete source",
+            "article_url": "https://mp.weixin.qq.com/s/delete"
+        }),
+    )
+    .await;
+    let source_id = created["id"].as_str().unwrap().to_owned();
+
+    let deleted = app
+        .clone()
+        .oneshot(admin_request_with_method(
+            &format!("/api/admin/sources/{source_id}"),
+            &cookie,
+            Some(csrf),
+            None,
+            "DELETE",
+        ))
+        .await
+        .expect("source deletion request should complete");
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+    let deleted_detail = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/api/admin/sources/{source_id}"),
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("deleted source detail request should complete");
+    assert_eq!(deleted_detail.status(), StatusCode::NOT_FOUND);
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -649,6 +990,16 @@ async fn every_protected_admin_route_rejects_an_unauthenticated_request(pool: Pg
         "display_name": "test source",
         "article_url": "https://mp.weixin.qq.com/s/test"
     });
+    let source_update_payload = serde_json::json!({
+        "book_id": "test-book",
+        "display_name": "test source",
+        "article_url": null,
+        "account_id": null,
+        "sync_interval_seconds": 3600,
+        "rss_item_limit": 20,
+        "priority": 0,
+        "max_attempts": 3
+    });
     let protected_routes = vec![
         ("GET", "/admin", None, StatusCode::SEE_OTHER),
         ("GET", "/admin/", None, StatusCode::SEE_OTHER),
@@ -656,6 +1007,12 @@ async fn every_protected_admin_route_rejects_an_unauthenticated_request(pool: Pg
         (
             "GET",
             "/admin/weread/accounts/00000000-0000-0000-0000-000000000001",
+            None,
+            StatusCode::SEE_OTHER,
+        ),
+        (
+            "GET",
+            "/admin/sources/00000000-0000-0000-0000-000000000002",
             None,
             StatusCode::SEE_OTHER,
         ),
@@ -700,6 +1057,24 @@ async fn every_protected_admin_route_rejects_an_unauthenticated_request(pool: Pg
             "POST",
             "/api/admin/sources",
             Some(source_payload),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "GET",
+            "/api/admin/sources/00000000-0000-0000-0000-000000000002",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "PUT",
+            "/api/admin/sources/00000000-0000-0000-0000-000000000002",
+            Some(source_update_payload),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "DELETE",
+            "/api/admin/sources/00000000-0000-0000-0000-000000000002",
+            None,
             StatusCode::UNAUTHORIZED,
         ),
         (
@@ -1162,6 +1537,61 @@ fn admin_app(pool: &PgPool) -> axum::Router {
         [127, 0, 0, 1],
         43_210,
     )))))
+}
+
+async fn admin_session(app: &axum::Router) -> (String, String) {
+    let login = app
+        .clone()
+        .oneshot(json_request(
+            "/api/admin/login",
+            serde_json::json!({"username": "admin", "password": "correct horse"}),
+        ))
+        .await
+        .expect("valid login request should complete");
+    assert_eq!(login.status(), StatusCode::OK);
+    let cookie = login.headers()[header::SET_COOKIE]
+        .to_str()
+        .expect("session cookie should be valid")
+        .split(';')
+        .next()
+        .expect("cookie should contain a value")
+        .to_owned();
+    let login_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(login.into_body(), usize::MAX)
+            .await
+            .expect("login body should be readable"),
+    )
+    .expect("login body should be JSON");
+    let csrf = login_body["csrf_token"]
+        .as_str()
+        .expect("CSRF should be returned")
+        .to_owned();
+    (cookie, csrf)
+}
+
+async fn create_admin_source(
+    app: &axum::Router,
+    cookie: &str,
+    csrf: &str,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    let response = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/sources",
+            cookie,
+            Some(csrf),
+            Some(payload),
+        ))
+        .await
+        .expect("source creation request should complete");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("source response should be readable"),
+    )
+    .expect("source response should be JSON")
 }
 
 async fn status(app: &axum::Router, path: &str) -> StatusCode {

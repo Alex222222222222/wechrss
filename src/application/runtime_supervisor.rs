@@ -21,6 +21,7 @@ use crate::{
     acquisition::{
         article_page::WebDriverArticlePageFetcher,
         browser_pool::BrowserPool,
+        identity::BrowserArticleIdentityResolver,
         pacing::PacingController,
         webdriver::{BrowserProfile, BrowserViewport, WebDriverFactory},
         weread::{
@@ -51,7 +52,7 @@ use crate::{
         },
         unit_of_work::UnitOfWorkFactory,
     },
-    web::{admin::admin_router, api::feed_router, auth::AdminAuthenticator},
+    web::{admin::admin_router_with_identity_resolver, api::feed_router, auth::AdminAuthenticator},
 };
 
 use super::{
@@ -181,6 +182,7 @@ impl<F, S> RuntimeJobHandler<F, S> {
     }
 }
 
+#[async_trait::async_trait]
 impl<F, S> JobHandler for RuntimeJobHandler<F, S>
 where
     F: JobHandler,
@@ -473,16 +475,48 @@ impl RuntimeSupervisor {
             )
             .map_err(RuntimeSupervisorError::AdminAuth)?;
             let weread_auth = self.build_auth_service()?;
-            router = router.merge(admin_router(
-                auth,
-                SourceService::new(
-                    PostgresSourceRepository::new(self.pool.clone()),
-                    UnitOfWorkFactory::new(self.pool.clone()),
-                ),
-                FeedTokenService::new(PostgresFeedTokenRepository::new(self.pool.clone())),
-                PostgresSyncRunRepository::new(self.pool.clone()),
-                weread_auth,
-            ));
+            let sources = SourceService::new(
+                PostgresSourceRepository::new(self.pool.clone()),
+                UnitOfWorkFactory::new(self.pool.clone()),
+            );
+            let feed_tokens =
+                FeedTokenService::new(PostgresFeedTokenRepository::new(self.pool.clone()));
+            let sync_runs = PostgresSyncRunRepository::new(self.pool.clone());
+            if let Some(browser_pool) = self.browser_pool.clone() {
+                let browser_profile = BrowserProfile {
+                    user_agent: self.config.browser_user_agent.clone(),
+                    viewport: BrowserViewport::new(
+                        self.config.browser_viewport_width,
+                        self.config.browser_viewport_height,
+                    ),
+                    locale: self.config.browser_locale.clone(),
+                    expected_timezone: Some(self.config.timezone),
+                    extra_args: self.config.browser_extra_args.clone(),
+                };
+                let webdriver = WebDriverFactory::new(
+                    self.config.webdriver_url.clone(),
+                    self.config.browser_engine,
+                )
+                .with_profile(browser_profile);
+                let identity_resolver =
+                    Arc::new(BrowserArticleIdentityResolver::new(webdriver, browser_pool));
+                router = router.merge(admin_router_with_identity_resolver(
+                    auth,
+                    sources,
+                    feed_tokens,
+                    sync_runs,
+                    weread_auth,
+                    identity_resolver,
+                ));
+            } else {
+                router = router.merge(crate::web::admin::admin_router(
+                    auth,
+                    sources,
+                    feed_tokens,
+                    sync_runs,
+                    weread_auth,
+                ));
+            }
         }
         Ok(router)
     }
@@ -706,10 +740,17 @@ fn listener_address(bind: &str, port: u16) -> String {
 fn browser_pool_for_plan(
     plan: &RuntimePlan,
 ) -> Result<Option<BrowserPool>, RuntimeSupervisorError> {
-    let Some(RuntimeComponent::Worker(worker)) = plan.component(AppRole::Worker) else {
-        return Ok(None);
+    let capacity = match plan.component(AppRole::Worker) {
+        Some(RuntimeComponent::Worker(worker)) => worker.concurrency() as usize,
+        _ if plan.component(AppRole::Api).is_some_and(
+            |component| matches!(component, RuntimeComponent::Api(api) if api.admin_enabled()),
+        ) =>
+        {
+            1
+        }
+        _ => return Ok(None),
     };
-    BrowserPool::new(worker.concurrency() as usize)
+    BrowserPool::new(capacity)
         .map(Some)
         .map_err(RuntimeSupervisorError::BrowserPool)
 }

@@ -44,6 +44,7 @@ fn zero_delay_pacing() -> PacingController {
 
 struct PublicFetcher;
 
+#[async_trait::async_trait]
 impl ArticlePageFetcher for PublicFetcher {
     async fn fetch(
         &self,
@@ -67,6 +68,7 @@ struct LeaseCheckingAdapter {
     calls: Arc<AtomicUsize>,
 }
 
+#[async_trait::async_trait]
 impl<R> WeReadAdapter<R> for LeaseCheckingAdapter
 where
     R: AccountLeaseStore,

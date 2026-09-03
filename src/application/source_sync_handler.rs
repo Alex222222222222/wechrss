@@ -49,7 +49,7 @@ use crate::{
 /// `list_article_references` and pass only validated public-page results back
 /// through `fetch_article`. The latter operation is deliberately given no
 /// account or browser-pool credential capability by this interface.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait SourceSyncAcquirer: Send + Sync {
     /// Lists the current normalized WeRead article references for one source.
     async fn list_article_references(
@@ -170,6 +170,7 @@ impl<S, A, C> SourceSyncJobHandler<S, A, C> {
     }
 }
 
+#[async_trait::async_trait]
 impl<S, A, C> JobHandler for SourceSyncJobHandler<S, A, C>
 where
     S: SourceReader,
@@ -444,11 +445,15 @@ where
                 .map_err(|_| ())?;
         }
 
-        let next_fetch_at = finished_at
-            .checked_add_signed(context.source.sync_interval())
-            .ok_or(())?;
         {
             let mut sources = unit_of_work.source();
+            let current_source = sources
+                .find_for_update(context.source.id())
+                .await
+                .map_err(|_| ())?;
+            let next_fetch_at = finished_at
+                .checked_add_signed(current_source.sync_interval())
+                .ok_or(())?;
             sources
                 .update_schedule(context.source.id(), next_fetch_at, None, None)
                 .await
@@ -497,9 +502,6 @@ where
             .map_err(|_| ())?;
         let retry_at = finished_at.checked_add_signed(self.config.retry_after);
         let cooldown_until = finished_at.checked_add_signed(self.config.failure_cooldown);
-        let next_fetch_at = finished_at
-            .checked_add_signed(context.source.sync_interval())
-            .ok_or(())?;
         let mut unit_of_work = self
             .dependencies
             .unit_of_work
@@ -510,7 +512,7 @@ where
         match classified.outcome() {
             SyncOutcome::AuthenticationRequired => {
                 let mut sources = unit_of_work.source();
-                sources
+                let gated_source = sources
                     .set_scheduling_gate(
                         context.source.id(),
                         SchedulingGate::AuthenticationRequired,
@@ -520,7 +522,7 @@ where
                 sources
                     .update_schedule(
                         context.source.id(),
-                        context.source.next_fetch_at(),
+                        gated_source.next_fetch_at(),
                         None,
                         None,
                     )
@@ -529,14 +531,14 @@ where
             }
             SyncOutcome::RiskControlled => {
                 let mut sources = unit_of_work.source();
-                sources
+                let gated_source = sources
                     .set_scheduling_gate(context.source.id(), SchedulingGate::RiskControlled)
                     .await
                     .map_err(|_| ())?;
                 sources
                     .update_schedule(
                         context.source.id(),
-                        context.source.next_fetch_at(),
+                        gated_source.next_fetch_at(),
                         None,
                         None,
                     )
@@ -553,14 +555,14 @@ where
             }
             SyncOutcome::Blocked => {
                 let mut sources = unit_of_work.source();
-                sources
+                let gated_source = sources
                     .set_scheduling_gate(context.source.id(), SchedulingGate::RiskControlled)
                     .await
                     .map_err(|_| ())?;
                 sources
                     .update_schedule(
                         context.source.id(),
-                        context.source.next_fetch_at(),
+                        gated_source.next_fetch_at(),
                         None,
                         None,
                     )
@@ -569,6 +571,13 @@ where
             }
             SyncOutcome::Failed => {
                 let mut sources = unit_of_work.source();
+                let current_source = sources
+                    .find_for_update(context.source.id())
+                    .await
+                    .map_err(|_| ())?;
+                let next_fetch_at = finished_at
+                    .checked_add_signed(current_source.sync_interval())
+                    .ok_or(())?;
                 sources
                     .update_schedule(context.source.id(), next_fetch_at, None, None)
                     .await

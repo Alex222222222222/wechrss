@@ -105,9 +105,11 @@ async fn insert_source(pool: &PgPool, source_id: SourceId) {
         id: source_id,
         book_id: format!("book-{source_id}"),
         display_name: "Token integration source".to_owned(),
-        article_url: "https://mp.weixin.qq.com/s/token-test"
-            .parse::<VerifiedWechatArticleUrl>()
-            .expect("test URL should be valid"),
+        article_url: Some(
+            "https://mp.weixin.qq.com/s/token-test"
+                .parse::<VerifiedWechatArticleUrl>()
+                .expect("test URL should be valid"),
+        ),
         enabled: true,
         sync_interval: Duration::hours(1),
         rss_item_limit: 20,

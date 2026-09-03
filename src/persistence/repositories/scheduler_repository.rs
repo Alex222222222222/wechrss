@@ -132,7 +132,7 @@ pub enum SchedulerRepositoryError {
 }
 
 /// Cross-replica scheduler operation.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait SchedulerRepository: Send + Sync {
     /// Enqueues up to `limit` eligible sources and reserves each source for a
     /// short period. The optional policy is evaluated using a PostgreSQL
@@ -184,6 +184,7 @@ impl PostgresSchedulerRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl SchedulerRepository for PostgresSchedulerRepository {
     async fn enqueue_due_sources(
         &self,

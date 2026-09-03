@@ -107,7 +107,7 @@ pub struct JobLease {
 /// callers migrate to this smaller port. PostgreSQL and the in-memory test
 /// repository both implement this trait, so application orchestration can be
 /// written against the same queue contract in production and tests.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait JobQueue: Send + Sync {
     /// Inserts a job unless an active job owns its deduplication key.
     async fn enqueue(&self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError>;
@@ -147,7 +147,7 @@ pub trait JobQueue: Send + Sync {
 /// keeping claim, heartbeat, recovery, and worker outcomes on their own
 /// narrower capabilities. It intentionally exposes no commit operation; the
 /// enclosing unit of work owns that boundary.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait JobEnqueueTransaction {
     /// Enqueues one job without committing the surrounding transaction.
     async fn enqueue_job(&mut self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError>;
@@ -160,7 +160,7 @@ pub trait JobEnqueueTransaction {
 /// implementation must keep those writes in one atomic persistence operation;
 /// the current repository implementation exposes the job-only behavior while
 /// the source-coupled recovery boundary is completed.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait ExpiredJobRecovery: Send + Sync {
     /// Recovers up to `limit` expired running jobs.
     ///
@@ -251,7 +251,7 @@ pub enum JobOutcome {
 /// exactly once. This command-shaped API keeps worker outcome choices out of
 /// the independently committing queue port and avoids a second set of
 /// convenience transactions.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait JobOutcomeTransaction {
     /// Applies one fenced worker outcome without committing the transaction.
     async fn apply_outcome(&mut self, outcome: JobOutcome) -> Result<Job, JobRepositoryError>;
@@ -264,7 +264,7 @@ pub trait JobOutcomeTransaction {
 /// use `persistence::unit_of_work`, whose transaction-scoped job view will
 /// eventually delegate to these operations. Dropping an uncommitted handle must
 /// roll the transaction back.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait JobRepositoryTransaction {
     // TODO(design): remove caller-provided `now` from lease-sensitive repository
     // APIs when introducing the repository-owned production/test clock.
@@ -359,9 +359,10 @@ pub trait JobRepositoryTransaction {
 /// Keeping this adapter generic ensures the PostgreSQL and memory
 /// implementations cannot drift: every transition continues to use the same
 /// fenced implementation that backs the compatibility methods.
+#[async_trait::async_trait]
 impl<T> JobOutcomeTransaction for T
 where
-    T: JobRepositoryTransaction,
+    T: JobRepositoryTransaction + Send,
 {
     async fn apply_outcome(&mut self, outcome: JobOutcome) -> Result<Job, JobRepositoryError> {
         match outcome {
@@ -407,9 +408,10 @@ where
 
 /// Adapts the interim transaction contract to the transaction-scoped enqueue
 /// port until the old all-in-one transaction is removed.
+#[async_trait::async_trait]
 impl<T> JobEnqueueTransaction for T
 where
-    T: JobRepositoryTransaction,
+    T: JobRepositoryTransaction + Send,
 {
     async fn enqueue_job(&mut self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError> {
         JobRepositoryTransaction::enqueue(self, spec).await
@@ -437,15 +439,15 @@ pub enum JobRepositoryError {
 ///
 /// [`PostgresJobRepository`] uses one transaction per convenience mutation and
 /// converts zero-row fenced updates into a domain-level lease error rather than
-/// silently reporting success. The trait uses native async methods and is
+/// silently reporting success. The trait uses `async_trait` methods and is
 /// intended to be used through a generic repository parameter; an application
 /// that needs dynamic dispatch can add an object-safe adapter.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait JobRepository: JobQueue + ExpiredJobRecovery + Send + Sync {
     // Compatibility surface. New application code should depend on
     // `JobQueue`, `JobOutcomeTransaction`, and `ExpiredJobRecovery` separately.
     /// Interim job-only transaction type; multi-repository work uses UnitOfWork.
-    type Transaction<'a>: JobRepositoryTransaction + 'a
+    type Transaction<'a>: JobRepositoryTransaction + Send + 'a
     where
         Self: 'a;
 
@@ -791,6 +793,7 @@ enum FencedOperation<'a> {
     },
 }
 
+#[async_trait::async_trait]
 impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
     async fn enqueue(&mut self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError> {
         self.enqueue_internal(spec, false).await
@@ -1220,6 +1223,7 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
     }
 }
 
+#[async_trait::async_trait]
 impl JobRepository for PostgresJobRepository {
     type Transaction<'a> = PostgresJobTransaction<'a>;
 
@@ -1230,6 +1234,7 @@ impl JobRepository for PostgresJobRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl JobQueue for PostgresJobRepository {
     async fn enqueue(&self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError> {
         let mut transaction = self.begin().await?;
@@ -1277,6 +1282,7 @@ impl JobQueue for PostgresJobRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl ExpiredJobRecovery for PostgresJobRepository {
     async fn recover_expired(
         &self,
@@ -1638,6 +1644,7 @@ impl Drop for MemoryJobTransaction<'_> {
     }
 }
 
+#[async_trait::async_trait]
 impl JobRepository for MemoryJobRepository {
     type Transaction<'a> = MemoryJobTransaction<'a>;
 
@@ -1652,6 +1659,7 @@ impl JobRepository for MemoryJobRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl JobQueue for MemoryJobRepository {
     async fn enqueue(&self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError> {
         let mut jobs = self.jobs.lock().await;
@@ -1686,6 +1694,7 @@ impl JobQueue for MemoryJobRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl ExpiredJobRecovery for MemoryJobRepository {
     async fn recover_expired(
         &self,
@@ -1697,6 +1706,7 @@ impl ExpiredJobRecovery for MemoryJobRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl JobRepositoryTransaction for MemoryJobTransaction<'_> {
     async fn enqueue(&mut self, spec: NewJob) -> Result<EnqueueResult, JobRepositoryError> {
         enqueue_in_store(self.jobs_mut()?, spec)

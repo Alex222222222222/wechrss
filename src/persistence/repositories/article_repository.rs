@@ -92,7 +92,7 @@ pub enum ArticleRepositoryError {
 }
 
 /// Pool-backed article reads and observation-version allocation.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait ArticleRepository: Send + Sync {
     /// Finds one article by its composite source/`review_id` identity.
     async fn find(
@@ -136,6 +136,7 @@ impl PostgresArticleRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl ArticleRepository for PostgresArticleRepository {
     async fn find(
         &self,
@@ -188,7 +189,7 @@ impl ArticleRepository for PostgresArticleRepository {
 }
 
 /// Operations on article rows inside the shared application transaction.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait ArticleTransactionRepository {
     /// Inserts or updates one article and reports RSS-visible change.
     async fn upsert(
@@ -216,6 +217,7 @@ impl<'borrow, 'pool> PostgresArticleTransaction<'borrow, 'pool> {
     }
 }
 
+#[async_trait::async_trait]
 impl ArticleTransactionRepository for PostgresArticleTransaction<'_, '_> {
     async fn upsert(
         &mut self,

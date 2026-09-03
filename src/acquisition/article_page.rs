@@ -110,6 +110,7 @@ impl WebDriverArticlePageFetcher {
     }
 }
 
+#[async_trait::async_trait]
 impl ArticlePageFetcher for WebDriverArticlePageFetcher {
     async fn fetch(
         &self,
@@ -319,7 +320,7 @@ fn parse_publication_time(value: &str, timezone: Tz) -> Result<DateTime<Utc>, Ar
 }
 
 /// Port for fetching rendered article content without credentials.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait ArticlePageFetcher: Send + Sync {
     /// Fetches one verified public URL and consumes the clean browser session.
     ///
@@ -362,6 +363,7 @@ mod tests {
 
     struct FakeFetcher;
 
+    #[async_trait::async_trait]
     impl ArticlePageFetcher for FakeFetcher {
         async fn fetch(
             &self,
@@ -382,6 +384,7 @@ mod tests {
 
     struct BlockingFetcher;
 
+    #[async_trait::async_trait]
     impl ArticlePageFetcher for BlockingFetcher {
         async fn fetch(
             &self,

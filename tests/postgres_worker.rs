@@ -18,6 +18,7 @@ struct FixedHandler {
     outcome: JobExecution,
 }
 
+#[async_trait::async_trait]
 impl JobHandler for FixedHandler {
     async fn execute(&self, _lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
         self.outcome.clone()

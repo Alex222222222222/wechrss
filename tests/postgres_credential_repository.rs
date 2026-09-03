@@ -270,6 +270,96 @@ async fn credential_replacement_waits_for_the_live_lease_row_lock(pool: PgPool) 
         .expect("test lease should be released");
 }
 
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn credential_replacement_for_another_account_is_not_blocked_by_a_lease_row_lock(
+    pool: PgPool,
+) {
+    let repository = PostgresCredentialRepository::new(pool.clone());
+    let leases = PostgresAccountLeaseRepository::new(pool.clone());
+    let locked_account_id = account_id();
+    let other_account_id = account_id();
+    repository
+        .insert(
+            locked_account_id,
+            "locked",
+            b"locked-ciphertext-v1",
+            at(3_600),
+        )
+        .await
+        .expect("locked account should be inserted");
+    repository
+        .insert(other_account_id, "other", b"other-ciphertext-v1", at(3_600))
+        .await
+        .expect("other account should be inserted");
+    let locked_lease = leases
+        .acquire(
+            locked_account_id,
+            "credential-test-locked",
+            chrono::Duration::minutes(5),
+        )
+        .await
+        .expect("locked account lease acquisition should succeed")
+        .expect("test should own the locked account lease");
+    let other_lease = leases
+        .acquire(
+            other_account_id,
+            "credential-test-other",
+            chrono::Duration::minutes(5),
+        )
+        .await
+        .expect("other account lease acquisition should succeed")
+        .expect("test should own the other account lease");
+
+    let mut lock_holder = pool
+        .begin()
+        .await
+        .expect("lock-holder transaction should begin");
+    sqlx::query("SELECT account_id FROM account_leases WHERE account_id = $1 FOR UPDATE")
+        .bind(locked_account_id.as_uuid())
+        .fetch_one(&mut *lock_holder)
+        .await
+        .expect("test should hold the locked account lease row");
+
+    let replaced = timeout(
+        Duration::from_secs(5),
+        repository.replace(CredentialReplacement {
+            account_id: other_account_id,
+            display_name: "other-updated".to_owned(),
+            expected_version: 1,
+            ciphertext: b"other-ciphertext-v2".to_vec(),
+            access_expires_at: at(7_200),
+            lease_owner: "credential-test-other".to_owned(),
+            lease_token: other_lease.token(),
+        }),
+    )
+    .await
+    .expect("an unrelated account replacement should not wait for the locked row")
+    .expect("other account replacement should succeed");
+    assert_eq!(replaced.account().account_id(), other_account_id);
+    assert_eq!(replaced.account().credential_version(), 2);
+
+    lock_holder
+        .commit()
+        .await
+        .expect("lock-holder transaction should commit");
+    leases
+        .release(
+            locked_account_id,
+            "credential-test-locked",
+            locked_lease.token(),
+        )
+        .await
+        .expect("locked account lease should be released");
+    leases
+        .release(
+            other_account_id,
+            "credential-test-other",
+            other_lease.token(),
+        )
+        .await
+        .expect("other account lease should be released");
+}
+
 #[derive(Clone)]
 struct TestRefresher;
 

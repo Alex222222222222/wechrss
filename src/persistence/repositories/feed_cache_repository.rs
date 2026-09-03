@@ -67,7 +67,7 @@ pub enum FeedBuildLeaseError {
 /// database clock. The interface has no caller-supplied wall clock, so a
 /// replica with a skewed clock cannot take over a live build or renew an
 /// expired one.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait FeedBuildLeaseRepository: Send + Sync {
     /// Acquires a lease or returns `None` when another live builder owns it.
     async fn acquire_build(
@@ -117,6 +117,7 @@ impl PostgresFeedBuildLeaseRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl FeedBuildLeaseRepository for PostgresFeedBuildLeaseRepository {
     async fn acquire_build(
         &self,
@@ -354,7 +355,7 @@ impl FeedCacheRepository for PostgresFeedCacheRepository {
 }
 
 /// Operations on feed-cache rows inside the shared application transaction.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait FeedCacheTransactionRepository {
     /// Publishes only if the source revision and live build fence still match.
     ///
@@ -381,6 +382,7 @@ impl<'borrow, 'pool> PostgresFeedCacheTransaction<'borrow, 'pool> {
     }
 }
 
+#[async_trait::async_trait]
 impl FeedCacheTransactionRepository for PostgresFeedCacheTransaction<'_, '_> {
     async fn publish_if_current(
         &mut self,
@@ -728,6 +730,7 @@ impl MemoryFeedBuildLeaseRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl FeedBuildLeaseRepository for MemoryFeedBuildLeaseRepository {
     async fn acquire_build(
         &self,

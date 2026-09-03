@@ -22,6 +22,7 @@ struct ShutdownRepository {
     fail_first: bool,
 }
 
+#[async_trait::async_trait]
 impl SchedulerRepository for ShutdownRepository {
     async fn enqueue_due_sources(
         &self,

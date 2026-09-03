@@ -8,3 +8,10 @@ Keep `.dev/` private and local: do not copy its environment-specific values,
 cluster details, credentials, endpoints, or other operational information into
 tracked files, command output committed to the repository, or user-facing
 documentation. The directory is intentionally gitignored.
+
+## Testing
+
+Keep each test focused on one behavior or outcome. A test may cover multiple
+assertions when they all describe that same behavior. Keep multiple behaviors
+in one test only when their preparation steps, such as injecting test data,
+are the same and splitting the test would duplicate that setup.

@@ -129,15 +129,32 @@ reused for public article extraction.
 
 ### Add a source
 
-1. The API receives an article URL or normalized `book_id`.
-2. If the URL already carries `__biz`, identity acquisition resolves it
-   without network access; otherwise it opens the URL in a clean public browser
-   session and captures the validated final URL and page source.
+1. The API receives an article URL, a normalized `book_id`, or both.
+2. If a book ID is supplied it is authoritative. Otherwise, if the URL already
+   carries `__biz`, identity acquisition resolves it without network access;
+   short URLs use a clean public browser session to capture the validated final
+   URL and page source.
 3. It extracts `biz` from the final URL or narrow page-source fallbacks,
-   decodes the numeric `bid`, and derives
-   `MP_WXS_<bid>`.
-4. The source repository stores the source and creates its initial schedule.
+   decodes the numeric `bid`, and derives `MP_WXS_<bid>`. A supplied display
+   name overrides the resolved public-account name; book-only sources use the
+   book ID as a stable fallback name.
+4. The source repository stores the source and creates its initial schedule;
+   an article URL is nullable when only a book ID was supplied.
 5. A deduplicated `source_sync` job becomes eligible for execution.
+
+### Edit or delete a source
+
+1. The authenticated admin page loads one source by durable ID and submits a
+   complete editable configuration to `PUT /api/admin/sources/{id}`. Omitted
+   fields retain their current values; nullable article URL and account ID
+   fields can be explicitly cleared.
+2. The source transaction validates and trims the new identity, locks the
+   current row, advances the feed revision only when feed-visible fields
+   changed, and preserves scheduler timestamps and gates.
+3. `DELETE /api/admin/sources/{id}` removes source-owned jobs and deletes the
+   source; PostgreSQL cascades its articles, sync history, feed cache, and
+   feed token. All three routes require the admin session, and mutations also
+   require CSRF.
 
 ### Synchronize a source
 
@@ -446,12 +463,13 @@ cargo nextest run --locked --tests -j 16
 
 SQLx integration tests use `#[sqlx::test]`, so each test receives an isolated
 temporary database and can run concurrently without sharing application data.
-The documented `-j 16` setting is suitable for the trusted development
-PostgreSQL service used by this project, but should be tuned for other
-environments: every test may create a database and apply the complete
-migration set, so connection, CPU, and I/O capacity still limit useful
-parallelism. The ignored real-browser test remains a separately controlled
-WebDriver test and is not part of the normal nextest run.
+The repository's `.config/nextest.toml` keeps the global `-j 16` setting for
+fast unit-test execution while placing the API and PostgreSQL-backed test
+binaries in a `postgres` test group capped at sixteen concurrent isolated
+database setups. This keeps database concurrency bounded independently if the
+global setting is raised later. Lower that group limit for a smaller or shared
+PostgreSQL service. The ignored real-browser test remains a separately
+controlled WebDriver test and is not part of the normal nextest run.
 
 Mutation testing is also part of the validation workflow for behavior-heavy
 application code. Install `cargo-mutants` once, then use nextest as its test

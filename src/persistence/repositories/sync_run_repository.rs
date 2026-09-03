@@ -108,7 +108,7 @@ pub enum SyncRunRepositoryError {
 }
 
 /// Pool-backed synchronization-run reads.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait SyncRunRepository: Send + Sync {
     /// Finds one run by its durable identifier.
     async fn find(&self, run_id: Uuid) -> Result<Option<SyncRun>, SyncRunRepositoryError>;
@@ -143,6 +143,7 @@ impl PostgresSyncRunRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl SyncRunRepository for PostgresSyncRunRepository {
     async fn find(&self, run_id: Uuid) -> Result<Option<SyncRun>, SyncRunRepositoryError> {
         if run_id.is_nil() {
@@ -181,7 +182,7 @@ impl SyncRunRepository for PostgresSyncRunRepository {
 }
 
 /// Operations on synchronization-run rows inside `UnitOfWork`.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait SyncRunTransactionRepository {
     /// Inserts a new running record.
     async fn start(&mut self, spec: NewSyncRun) -> Result<SyncRun, SyncRunRepositoryError>;
@@ -212,6 +213,7 @@ impl<'borrow, 'pool> PostgresSyncRunTransaction<'borrow, 'pool> {
     }
 }
 
+#[async_trait::async_trait]
 impl SyncRunTransactionRepository for PostgresSyncRunTransaction<'_, '_> {
     async fn start(&mut self, spec: NewSyncRun) -> Result<SyncRun, SyncRunRepositoryError> {
         let run = SyncRun::start(spec)?;

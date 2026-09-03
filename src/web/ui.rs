@@ -6,7 +6,7 @@
 
 use axum::response::Html;
 
-use crate::domain::credentials::WeReadAccount;
+use crate::domain::{credentials::WeReadAccount, source::Source};
 
 use super::auth::AdminSession;
 
@@ -27,20 +27,89 @@ pub fn admin_page(session: &AdminSession) -> Html<String> {
     let csrf_json = serde_json::to_string(&csrf).expect("escaped CSRF token should serialize");
     let template = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Werrss admin</title></head>
-<body><main><h1>Werrss admin</h1><p>Signed in as <strong>__USERNAME__</strong></p><button id="logout">Sign out</button><h2>WeRead authentication</h2><p>Log in to <a href="https://weread.qq.com" target="_blank" rel="noreferrer">weread.qq.com</a> in a desktop browser. In Developer Tools, open the Network tab, select a request to <code>/web/mp/articles</code>, and copy the complete <code>Cookie</code> request-header value without the <code>Cookie:</code> prefix. It should include at least <code>wr_vid</code>, <code>wr_skey</code>, and <code>wr_rt</code>. Paste that value below. Tokens are encrypted for storage and are never shown again. Set the expiry to the access-session expiry shown by your authentication source. Use the existing account ID to replace credentials without changing source references. Display name is optional when the cookie contains <code>wr_name</code>; it will be percent-decoded automatically.</p><form id="weread-account"><label>Account ID (optional for a new account) <input name="account_id" type="text" autocomplete="off"></label><label>Display name (optional; defaults to wr_name) <input name="display_name" type="text" autocomplete="off"></label><label>WeRead Cookie header <textarea name="cookie_header" rows="4" required autocomplete="off"></textarea></label><label>Access token expiry <input name="access_expires_at" type="datetime-local" required></label><button>Save WeRead account</button></form><p id="account-result" role="status"></p><h2>WeRead accounts</h2><p><a href="/admin/weread/accounts">Manage all WeRead accounts</a></p><p id="account-list-error" role="alert"></p><ul id="weread-accounts"></ul><h2>Sources</h2><p id="error" role="alert"></p><ul id="sources"></ul><h2>Add source</h2><form id="create"><label>Book ID <input name="book_id" required></label><label>Name <input name="display_name" required></label><label>Article URL <input name="article_url" type="url" required></label><label>WeRead account ID (optional; blank chooses randomly) <input name="account_id" type="text"></label><button>Add source</button></form></main>
+<body><main><h1>Werrss admin</h1><p>Signed in as <strong>__USERNAME__</strong></p><button id="logout">Sign out</button><h2>WeRead authentication</h2><p>Log in to <a href="https://weread.qq.com" target="_blank" rel="noreferrer">weread.qq.com</a> in a desktop browser. In Developer Tools, open the Network tab, select a request to <code>/web/mp/articles</code>, and copy the complete <code>Cookie</code> request-header value without the <code>Cookie:</code> prefix. It should include at least <code>wr_vid</code>, <code>wr_skey</code>, and <code>wr_rt</code>. Paste that value below. Tokens are encrypted for storage and are never shown again. Set the expiry to the access-session expiry shown by your authentication source. Use the existing account ID to replace credentials without changing source references. Display name is optional when the cookie contains <code>wr_name</code>; it will be percent-decoded automatically.</p><form id="weread-account"><label>Account ID (optional for a new account) <input name="account_id" type="text" autocomplete="off"></label><label>Display name (optional; defaults to wr_name) <input name="display_name" type="text" autocomplete="off"></label><label>WeRead Cookie header <textarea name="cookie_header" rows="4" required autocomplete="off"></textarea></label><label>Access token expiry <input name="access_expires_at" type="datetime-local" required></label><button>Save WeRead account</button></form><p id="account-result" role="status"></p><h2>WeRead accounts</h2><p><a href="/admin/weread/accounts">Manage all WeRead accounts</a></p><p id="account-list-error" role="alert"></p><ul id="weread-accounts"></ul><h2>Sources</h2><p id="error" role="alert"></p><ul id="sources"></ul><h2>Add source</h2><form id="create"><label>Book ID (optional) <input name="book_id"></label><label>Name (optional; defaults to the WeChat account name) <input name="display_name"></label><label>Article URL (optional when Book ID is supplied) <input name="article_url" type="url"></label><label>WeRead account ID (optional; blank chooses randomly) <input name="account_id" type="text"></label><button>Add source</button></form></main>
 <script>
 const csrf=__CSRF__;const headers={'content-type':'application/json','x-csrf-token':csrf};const list=document.querySelector('#sources');const error=document.querySelector('#error');const accountResult=document.querySelector('#account-result');const accountList=document.querySelector('#weread-accounts');const accountListError=document.querySelector('#account-list-error');
 async function request(path,options={}){return fetch(path,{...options,headers:{...headers,...(options.headers||{})}})}
 async function apiErrorMessage(response,fallback){try{const value=await response.json();if(typeof value.error==='string'&&value.error.trim()){return value.error}}catch{}return fallback}
-async function load(){const response=await fetch('/api/admin/sources');if(!response.ok){error.textContent='Unable to load sources.';return}const sources=await response.json();list.replaceChildren(...sources.map(source=>{const item=document.createElement('li');item.textContent=`${source.display_name} (${source.book_id}) — ${source.scheduling_gate} — ${source.enabled?'enabled':'paused'} `;const pause=document.createElement('button');pause.textContent=source.enabled?'Pause':'Enable';pause.onclick=async()=>{await request(`/api/admin/sources/${source.id}/enabled`,{method:'POST',body:JSON.stringify({enabled:!source.enabled})});load()};item.append(pause);const gate=document.createElement('button');gate.textContent='Clear gate';gate.onclick=async()=>{await request(`/api/admin/sources/${source.id}/gate`,{method:'POST',body:JSON.stringify({gate:'ready'})});load()};item.append(gate);const token=document.createElement('button');token.textContent='Create feed link';token.onclick=async()=>{const result=await request(`/api/admin/sources/${source.id}/feed-token`,{method:'POST'});if(result.ok){const value=await result.json();const link=document.createElement('code');link.textContent=` ${value.feed_path}`;item.append(link)}};item.append(token);const history=document.createElement('button');history.textContent='Sync history';history.onclick=async()=>{const result=await fetch(`/api/admin/sources/${source.id}/sync-runs`);if(result.ok){const runs=await result.json();item.append(document.createTextNode(` history: ${runs.map(run=>run.outcome).join(', ')||'none'}`))}};item.append(history);return item}))}
+async function load(){const response=await fetch('/api/admin/sources');if(!response.ok){error.textContent='Unable to load sources.';return}const sources=await response.json();list.replaceChildren(...sources.map(source=>{const item=document.createElement('li');item.textContent=`${source.display_name} (${source.book_id}) — ${source.scheduling_gate} — ${source.enabled?'enabled':'paused'} `;const edit=document.createElement('a');edit.href=`/admin/sources/${encodeURIComponent(source.id)}`;edit.textContent='Edit';item.append(edit);const pause=document.createElement('button');pause.textContent=source.enabled?'Pause':'Enable';pause.onclick=async()=>{const result=await request(`/api/admin/sources/${source.id}/enabled`,{method:'POST',body:JSON.stringify({enabled:!source.enabled})});if(!result.ok){error.textContent=await apiErrorMessage(result,'Unable to change source status.');return}load()};item.append(pause);const gate=document.createElement('button');gate.textContent='Clear gate';gate.onclick=async()=>{const result=await request(`/api/admin/sources/${source.id}/gate`,{method:'POST',body:JSON.stringify({gate:'ready'})});if(!result.ok){error.textContent=await apiErrorMessage(result,'Unable to clear source gate.');return}load()};item.append(gate);const token=document.createElement('button');token.textContent='Create feed link';token.onclick=async()=>{const result=await request(`/api/admin/sources/${source.id}/feed-token`,{method:'POST'});if(result.ok){const value=await result.json();const link=document.createElement('code');link.textContent=` ${value.feed_path}`;item.append(link)}};item.append(token);const history=document.createElement('button');history.textContent='Sync history';history.onclick=async()=>{const result=await fetch(`/api/admin/sources/${source.id}/sync-runs`);if(result.ok){const runs=await result.json();item.append(document.createTextNode(` history: ${runs.map(run=>run.outcome).join(', ')||'none'}`))}};item.append(history);return item}))}
 async function loadAccounts(){const response=await fetch('/api/admin/weread/accounts');if(!response.ok){accountListError.textContent='Unable to load WeRead accounts.';return}const accounts=await response.json();accountList.replaceChildren(...accounts.map(account=>{const item=document.createElement('li');item.textContent=`${account.display_name} (${account.account_id}) — ${account.status} `;const edit=document.createElement('a');edit.href=`/admin/weread/accounts/${encodeURIComponent(account.account_id)}`;edit.textContent='Edit';item.append(edit);const enabled=document.createElement('button');enabled.textContent=account.status==='disabled'?'Enable':'Disable';enabled.onclick=async()=>{const result=await request(`/api/admin/weread/accounts/${account.account_id}/enabled`,{method:'POST',body:JSON.stringify({enabled:account.status==='disabled'})});if(!result.ok){accountListError.textContent=await apiErrorMessage(result,'Unable to change account status.');return}loadAccounts()};item.append(enabled);const remove=document.createElement('button');remove.textContent='Delete';remove.onclick=async()=>{if(!confirm(`Delete ${account.display_name}?`)){return}const result=await request(`/api/admin/weread/accounts/${account.account_id}`,{method:'DELETE'});if(!result.ok){accountListError.textContent=await apiErrorMessage(result,'Unable to delete account.');return}loadAccounts()};item.append(remove);return item}))}
-document.querySelector('#create').addEventListener('submit',async event=>{event.preventDefault();const form=new FormData(event.target);const account=form.get('account_id');const response=await request('/api/admin/sources',{method:'POST',body:JSON.stringify({book_id:form.get('book_id'),display_name:form.get('display_name'),article_url:form.get('article_url'),account_id:account?account:null})});if(response.ok){event.target.reset();load()}else{error.textContent='Source could not be added.'}});
+document.querySelector('#create').addEventListener('submit',async event=>{event.preventDefault();const form=new FormData(event.target);const account=form.get('account_id');const value=(name)=>{const field=form.get(name);return field&&field.trim()?field.trim():null};const response=await request('/api/admin/sources',{method:'POST',body:JSON.stringify({book_id:value('book_id'),display_name:value('display_name'),article_url:value('article_url'),account_id:account?account:null})});if(response.ok){event.target.reset();load()}else{error.textContent=await apiErrorMessage(response,'Source could not be added.')}});
 document.querySelector('#weread-account').addEventListener('submit',async event=>{event.preventDefault();accountResult.textContent='';const form=new FormData(event.target);const account=form.get('account_id');const displayName=form.get('display_name');const path=account?`/api/admin/weread/accounts/${encodeURIComponent(account)}`:'/api/admin/weread/accounts';const response=await request(path,{method:account?'PUT':'POST',body:JSON.stringify({account_id:account?account:null,display_name:displayName||null,cookie_header:form.get('cookie_header'),access_expires_at:new Date(form.get('access_expires_at')).toISOString()})});if(response.ok){const value=await response.json();event.target.reset();accountResult.textContent=`Saved account ${value.account_id}; use this ID when adding a source.`;loadAccounts()}else{accountResult.textContent=await apiErrorMessage(response,'WeRead account could not be saved; check the values and try again.')}});
 document.querySelector('#logout').addEventListener('click',async()=>{await request('/api/admin/logout',{method:'POST'});location='/admin/login'});load();loadAccounts();
 </script></body></html>"#;
     Html(
         template
             .replace("__USERNAME__", &username)
+            .replace("__CSRF__", &csrf_json),
+    )
+}
+
+/// Renders the authenticated source configuration and lifecycle page.
+pub fn source_page(session: &AdminSession, source: &Source) -> Html<String> {
+    let username = escape_html(session.username());
+    let csrf = escape_html(session.csrf_token());
+    let csrf_json = serde_json::to_string(&csrf).expect("escaped CSRF token should serialize");
+    let source_id = escape_html(&source.id().to_string());
+    let book_id = escape_html(source.book_id());
+    let display_name = escape_html(source.display_name());
+    let article_url = escape_html(
+        source
+            .article_url()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+            .as_str(),
+    );
+    let account_id = escape_html(
+        source
+            .account_id()
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+            .as_str(),
+    );
+    let status = if source.enabled() {
+        "enabled"
+    } else {
+        "paused"
+    };
+    let gate = escape_html(source.scheduling_gate().as_str());
+    let template = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Edit source — Werrss admin</title></head>
+<body><main><p><a href="/admin/">← Back to admin</a></p><h1>Edit source</h1><p>Signed in as <strong>__USERNAME__</strong></p><dl><dt>Status</dt><dd>__STATUS__</dd><dt>Scheduling gate</dt><dd>__GATE__</dd><dt>Feed revision</dt><dd>__REVISION__</dd></dl><form id="source"><label>Book ID <input name="book_id" value="__BOOK_ID__" required></label><label>Name <input name="display_name" value="__DISPLAY_NAME__" required></label><label>Article URL <input name="article_url" type="url" value="__ARTICLE_URL__"><small>Optional; clear it when the source is identified only by Book ID.</small></label><label>WeRead account ID <input name="account_id" value="__ACCOUNT_ID__"><small>Optional; clear it to let the worker choose an enabled account.</small></label><label>Sync interval (seconds) <input name="sync_interval_seconds" type="number" min="1" value="__SYNC_INTERVAL__" required></label><label>RSS item limit <input name="rss_item_limit" type="number" min="1" value="__RSS_ITEM_LIMIT__" required></label><label>Priority <input name="priority" type="number" value="__PRIORITY__" required></label><label>Maximum attempts <input name="max_attempts" type="number" min="1" value="__MAX_ATTEMPTS__" required></label><button>Save source</button></form><p id="result" role="status"></p><h2>Lifecycle</h2><button id="toggle">__TOGGLE__ source</button><h2>Danger zone</h2><button id="delete">Delete source</button></main>
+<script>
+const sourceId='__SOURCE_ID__';const csrf=__CSRF__;const headers={'content-type':'application/json','x-csrf-token':csrf};const result=document.querySelector('#result');
+const request=(path,options={})=>fetch(path,{...options,headers:{...headers,...(options.headers||{})}});
+async function apiErrorMessage(response,fallback){try{const value=await response.json();if(typeof value.error==='string'&&value.error.trim()){return value.error}}catch{}return fallback}
+document.querySelector('#source').addEventListener('submit',async event=>{event.preventDefault();result.textContent='';const form=new FormData(event.target);const value=name=>{const field=form.get(name);return field&&field.toString().trim()?field.toString().trim():null};const response=await request(`/api/admin/sources/${sourceId}`,{method:'PUT',body:JSON.stringify({book_id:value('book_id'),display_name:value('display_name'),article_url:value('article_url'),account_id:value('account_id'),sync_interval_seconds:Number(form.get('sync_interval_seconds')),rss_item_limit:Number(form.get('rss_item_limit')),priority:Number(form.get('priority')),max_attempts:Number(form.get('max_attempts'))})});if(response.ok){result.textContent='Source updated.';location.reload()}else{result.textContent=await apiErrorMessage(response,'Source could not be updated.')}});
+document.querySelector('#toggle').addEventListener('click',async()=>{const response=await request(`/api/admin/sources/${sourceId}/enabled`,{method:'POST',body:JSON.stringify({enabled:__NEXT_ENABLED__})});if(response.ok){location.reload()}else{result.textContent=await apiErrorMessage(response,'Source status could not be changed.')}});
+document.querySelector('#delete').addEventListener('click',async()=>{if(!confirm('Delete this source and its stored articles permanently?')){return}const response=await request(`/api/admin/sources/${sourceId}`,{method:'DELETE'});if(response.ok){location='/admin/'}else{result.textContent=await apiErrorMessage(response,'Source could not be deleted.')}});
+</script></body></html>"#;
+    Html(
+        template
+            .replace("__USERNAME__", &username)
+            .replace("__SOURCE_ID__", &source_id)
+            .replace("__BOOK_ID__", &book_id)
+            .replace("__DISPLAY_NAME__", &display_name)
+            .replace("__ARTICLE_URL__", &article_url)
+            .replace("__ACCOUNT_ID__", &account_id)
+            .replace("__STATUS__", status)
+            .replace("__GATE__", &gate)
+            .replace("__REVISION__", &source.feed_revision().to_string())
+            .replace(
+                "__SYNC_INTERVAL__",
+                &source.sync_interval().num_seconds().to_string(),
+            )
+            .replace("__RSS_ITEM_LIMIT__", &source.rss_item_limit().to_string())
+            .replace("__PRIORITY__", &source.priority().to_string())
+            .replace("__MAX_ATTEMPTS__", &source.max_attempts().to_string())
+            .replace(
+                "__TOGGLE__",
+                if source.enabled() { "Pause" } else { "Enable" },
+            )
+            .replace(
+                "__NEXT_ENABLED__",
+                if source.enabled() { "false" } else { "true" },
+            )
             .replace("__CSRF__", &csrf_json),
     )
 }
@@ -143,6 +212,7 @@ mod tests {
         assert!(body.contains("cookie_header"));
         assert!(body.contains("/web/mp/articles"));
         assert!(body.contains("href=\"/admin/weread/accounts\""));
+        assert!(body.contains("/admin/sources/${encodeURIComponent(source.id)}"));
     }
 
     #[test]
@@ -172,6 +242,66 @@ mod tests {
         assert!(body.contains("account.display_name"));
         assert!(body.contains("account.status"));
         assert!(body.contains("accountResult.textContent=`Saved account ${value.account_id}; use this ID when adding a source.`;loadAccounts()"));
+    }
+
+    #[test]
+    fn source_page_exposes_edit_lifecycle_controls_without_secrets() {
+        let auth = AdminAuthenticator::new(
+            "admin".to_owned(),
+            SecretString::new("password".to_owned().into_boxed_str()),
+            SecretString::new("signing-key".to_owned().into_boxed_str()),
+        )
+        .unwrap();
+        let (session, _) = auth
+            .login(
+                "admin",
+                "password",
+                "test",
+                "2026-09-01T00:00:00Z".parse().unwrap(),
+            )
+            .unwrap();
+        let source = Source::new(crate::domain::source::NewSource::test_default())
+            .expect("test source should be valid");
+
+        let body = source_page(&session, &source).0;
+        assert!(body.contains("<h1>Edit source</h1>"));
+        assert!(body.contains("name=\"book_id\" value=\"book-1\""));
+        assert!(body.contains("name=\"display_name\" value=\"Example\""));
+        assert!(body.contains("/api/admin/sources/${sourceId}"));
+        assert!(body.contains("method:'PUT'"));
+        assert!(body.contains("method:'DELETE'"));
+        assert!(body.contains("/api/admin/sources/${sourceId}/enabled"));
+        assert!(body.contains("Delete this source and its stored articles permanently?"));
+        assert!(!body.contains("cookie_header"));
+    }
+
+    #[test]
+    fn source_page_escapes_editable_values_and_supports_unbound_sources() {
+        let auth = AdminAuthenticator::new(
+            "admin".to_owned(),
+            SecretString::new("password".to_owned().into_boxed_str()),
+            SecretString::new("signing-key".to_owned().into_boxed_str()),
+        )
+        .unwrap();
+        let (session, _) = auth
+            .login(
+                "admin",
+                "password",
+                "test",
+                "2026-09-01T00:00:00Z".parse().unwrap(),
+            )
+            .unwrap();
+        let mut spec = crate::domain::source::NewSource::test_default();
+        spec.book_id = "book<&\"".to_owned();
+        spec.display_name = "Name<&\"".to_owned();
+        spec.article_url = None;
+        let source = Source::new(spec).expect("test source should be valid");
+
+        let body = source_page(&session, &source).0;
+        assert!(body.contains("name=\"book_id\" value=\"book&lt;&amp;&quot;\""));
+        assert!(body.contains("name=\"display_name\" value=\"Name&lt;&amp;&quot;\""));
+        assert!(body.contains("name=\"article_url\" type=\"url\" value=\"\""));
+        assert!(body.contains("name=\"account_id\" value=\"\""));
     }
 
     #[test]

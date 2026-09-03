@@ -399,6 +399,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl SchedulerRepository for RecordingRepository {
         async fn enqueue_due_sources(
             &self,
