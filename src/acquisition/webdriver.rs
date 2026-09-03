@@ -791,8 +791,19 @@ where
             .map_err(|error| WebDriverError::Command(error.to_string()))
     }
 
+    /// Returns the browser-observed URL after navigation and redirects.
+    pub(crate) async fn current_url(&self) -> Result<Url, WebDriverError> {
+        self.session
+            .client
+            .as_ref()
+            .ok_or(WebDriverError::NotConnected)?
+            .current_url()
+            .await
+            .map_err(|error| WebDriverError::Command(error.to_string()))
+    }
+
     /// Installs a validated WeRead cookie header into the current browser
-    /// origin. The caller must navigate to `i.weread.qq.com` first because
+    /// origin. The caller must navigate to `weread.qq.com` first because
     /// WebDriver rejects cookies added while no matching origin is loaded.
     pub(crate) async fn install_cookie_header(
         &mut self,
@@ -812,7 +823,7 @@ where
             };
             let mut cookie = Cookie::new(name.trim(), value.trim());
             cookie.set_path("/");
-            cookie.set_domain("i.weread.qq.com");
+            cookie.set_domain("weread.qq.com");
             cookie.set_secure(true);
             client
                 .add_cookie(cookie)
@@ -845,7 +856,7 @@ where
 mod tests {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
     use axum::{
@@ -929,6 +940,122 @@ mod tests {
             .connect()
             .await
             .expect("the fake WebDriver should accept session setup")
+    }
+
+    const TEST_WEREAD_SHELF_URL: &str = "https://weread.qq.com/web/shelf";
+
+    #[derive(Debug)]
+    struct WeReadBrowserState {
+        navigations: Mutex<Vec<String>>,
+        cookie_domains: Mutex<Vec<Option<String>>>,
+        current_url: Mutex<String>,
+        redirect_shelf_to_login: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    struct WeReadHttpClient {
+        state: Arc<WeReadBrowserState>,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for WeReadHttpClient {
+        async fn send(&self, request: Request<Body<'_>>) -> WebDriverResult<Response<Bytes>> {
+            let method = request.method().clone();
+            let path = request.uri().path().to_owned();
+            let body = match request.body() {
+                Body::Json(value) => Some((*value).clone()),
+                Body::Empty => None,
+            };
+
+            if method == Method::POST && path.ends_with("/session") {
+                return webdriver_json_response(json!({
+                    "sessionId": "test-session",
+                    "capabilities": {}
+                }));
+            }
+            if method == Method::POST && path.ends_with("/url") {
+                let target = body
+                    .as_ref()
+                    .and_then(|value| value.get("url"))
+                    .and_then(Value::as_str)
+                    .expect("navigation command should contain a URL");
+                self.state
+                    .navigations
+                    .lock()
+                    .unwrap()
+                    .push(target.to_owned());
+                let current_url =
+                    if self.state.redirect_shelf_to_login && target == TEST_WEREAD_SHELF_URL {
+                        "https://weread.qq.com/web/login"
+                    } else {
+                        target
+                    };
+                *self.state.current_url.lock().unwrap() = current_url.to_owned();
+                return webdriver_json_response(Value::Null);
+            }
+            if method == Method::GET && path.ends_with("/url") {
+                let current_url = self.state.current_url.lock().unwrap().clone();
+                return webdriver_json_response(json!(current_url));
+            }
+            if method == Method::POST && path.ends_with("/cookie") {
+                self.state.cookie_domains.lock().unwrap().push(
+                    body.as_ref()
+                        .and_then(|value| value.get("cookie"))
+                        .and_then(|cookie| cookie.get("domain"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+                return webdriver_json_response(Value::Null);
+            }
+            if method == Method::POST && path.ends_with("/execute/sync") {
+                return webdriver_json_response(json!(r#"{"data":[]}"#));
+            }
+            webdriver_json_response(Value::Null)
+        }
+
+        async fn new(&self) -> Arc<dyn HttpClient> {
+            Arc::new(self.clone())
+        }
+    }
+
+    fn webdriver_json_response(value: Value) -> WebDriverResult<Response<Bytes>> {
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(Bytes::from(json!({"value": value}).to_string()))
+            .map_err(|error| ThirtyfourError::RequestFailed(error.to_string()))
+    }
+
+    async fn weread_driver(state: Arc<WeReadBrowserState>) -> WebDriver {
+        WebDriver::builder("http://webdriver.test", DesiredCapabilities::firefox())
+            .client(WeReadHttpClient { state })
+            .connect()
+            .await
+            .expect("the fake WeRead WebDriver should accept session setup")
+    }
+
+    #[derive(Debug)]
+    struct TestWeReadCredentialProvider;
+
+    #[async_trait::async_trait]
+    impl crate::acquisition::weread::WeReadCredentialProvider for TestWeReadCredentialProvider {
+        async fn credentials(
+            &self,
+            _account_id: crate::domain::credentials::WeReadAccountId,
+        ) -> Result<
+            crate::domain::credentials::WeReadCredentials,
+            crate::acquisition::weread::WeReadCredentialProviderError,
+        > {
+            let credentials = crate::domain::credentials::WeReadCredentials::new(
+                "access",
+                "refresh",
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                chrono::Utc::now(),
+            )
+            .expect("test credentials should be valid");
+            Ok(credentials
+                .with_web_cookie("wr_skey=access; wr_rt=refresh")
+                .expect("test cookie should be valid"))
+        }
     }
 
     #[test]
@@ -1132,5 +1259,124 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn weread_listing_visits_the_authenticated_shelf_before_the_article_list() {
+        use crate::acquisition::weread::{BrowserWeReadAdapter, WeReadAdapter};
+
+        let state = Arc::new(WeReadBrowserState {
+            navigations: Mutex::new(Vec::new()),
+            cookie_domains: Mutex::new(Vec::new()),
+            current_url: Mutex::new(TEST_WEREAD_SHELF_URL.to_owned()),
+            redirect_shelf_to_login: false,
+        });
+        let repository = crate::persistence::repositories::account_lease_repository::
+            MemoryAccountLeaseRepository::new(chrono::Utc::now());
+        let account_id =
+            crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(1));
+        let pool = BrowserPool::new(1).unwrap();
+        let mut session = pool
+            .open_authenticated(
+                repository,
+                account_id,
+                "worker-a",
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .expect("the test worker should acquire the account")
+            .attach_client(weread_driver(Arc::clone(&state)).await);
+        let request = session
+            .prepare_request(chrono::Duration::seconds(30))
+            .await
+            .unwrap();
+        let adapter =
+            BrowserWeReadAdapter::new("https://weread.qq.com/web/mp/articles".parse().unwrap())
+                .unwrap()
+                .with_credential_provider(Arc::new(TestWeReadCredentialProvider));
+
+        let references = adapter.list_articles("book-1", request).await.unwrap();
+
+        assert!(references.is_empty());
+        let navigations = state.navigations.lock().unwrap().clone();
+        assert_eq!(
+            navigations,
+            vec![
+                TEST_WEREAD_SHELF_URL.to_owned(),
+                TEST_WEREAD_SHELF_URL.to_owned(),
+                "https://weread.qq.com/web/mp/articles?bookId=book-1&offset=0".to_owned(),
+            ]
+        );
+        let cookie_domains = state.cookie_domains.lock().unwrap().clone();
+        assert_eq!(
+            cookie_domains,
+            vec![
+                Some("weread.qq.com".to_owned()),
+                Some("weread.qq.com".to_owned()),
+            ]
+        );
+        session
+            .release()
+            .await
+            .expect("the test account lease should be released");
+    }
+
+    #[tokio::test]
+    async fn weread_listing_stops_when_the_shelf_redirects_to_login() {
+        use crate::acquisition::weread::{BrowserWeReadAdapter, WeReadAdapter, WeReadAdapterError};
+
+        let state = Arc::new(WeReadBrowserState {
+            navigations: Mutex::new(Vec::new()),
+            cookie_domains: Mutex::new(Vec::new()),
+            current_url: Mutex::new(TEST_WEREAD_SHELF_URL.to_owned()),
+            redirect_shelf_to_login: true,
+        });
+        let repository = crate::persistence::repositories::account_lease_repository::
+            MemoryAccountLeaseRepository::new(chrono::Utc::now());
+        let account_id =
+            crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(1));
+        let pool = BrowserPool::new(1).unwrap();
+        let mut session = pool
+            .open_authenticated(
+                repository,
+                account_id,
+                "worker-a",
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .expect("the test worker should acquire the account")
+            .attach_client(weread_driver(Arc::clone(&state)).await);
+        let request = session
+            .prepare_request(chrono::Duration::seconds(30))
+            .await
+            .unwrap();
+        let adapter =
+            BrowserWeReadAdapter::new("https://weread.qq.com/web/mp/articles".parse().unwrap())
+                .unwrap()
+                .with_credential_provider(Arc::new(TestWeReadCredentialProvider));
+
+        let error = adapter
+            .list_articles("book-1", request)
+            .await
+            .expect_err("a login redirect must stop article-list navigation");
+
+        assert_eq!(
+            error,
+            WeReadAdapterError::AuthenticationExpired { code: -2012 }
+        );
+        let navigations = state.navigations.lock().unwrap().clone();
+        assert_eq!(
+            navigations,
+            vec![
+                TEST_WEREAD_SHELF_URL.to_owned(),
+                TEST_WEREAD_SHELF_URL.to_owned(),
+            ]
+        );
+        session
+            .release()
+            .await
+            .expect("the test account lease should be released");
     }
 }

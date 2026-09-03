@@ -885,10 +885,12 @@ panel-enrolled account. When omitted, source-sync selects an enabled,
 unexpired account enrolled through the admin panel from PostgreSQL for each
 unbound job, choosing randomly among usable accounts. A source-specific
 account ID takes precedence. The adapter injects the encrypted cookie header enrolled through the
-admin panel into a fresh authenticated browser session. `WEREAD_ARTICLE_LIST_URL` defaults to
-`https://i.weread.qq.com/web/mp/articles` and is accepted only as that exact
-HTTPS endpoint without credentials, fragments, or a non-default port. Runtime
-source-sync listing holds the account lease through its authenticated request,
+admin panel into a fresh authenticated browser session, opens
+`https://weread.qq.com/web/shelf` in that same session, and stops with an
+authentication-expired result if WeRead redirects away from the shelf. `WEREAD_ARTICLE_LIST_URL`
+defaults to `https://weread.qq.com/web/mp/articles` and is accepted only as that exact HTTPS
+endpoint without credentials, fragments, or a non-default port. Runtime source-sync listing holds
+the account lease through its authenticated request,
 applies the shared request pacing policy, then releases it before public article
 fetching. QR exchange and interactive login are intentionally not implemented
 in this first executable slice; provisioned credentials can be refreshed by

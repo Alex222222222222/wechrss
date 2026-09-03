@@ -42,8 +42,11 @@ use super::{
     webdriver::AuthenticatedRequest,
 };
 
-const WEREAD_HOST: &str = "i.weread.qq.com";
+const WEREAD_HOST: &str = "weread.qq.com";
 const WEREAD_ARTICLE_LIST_PATH: &str = "/web/mp/articles";
+const WEREAD_SHELF_PATH: &str = "/web/shelf";
+const WEREAD_SHELF_URL: &str = "https://weread.qq.com/web/shelf";
+const WEREAD_AUTHENTICATION_EXPIRED_CODE: i64 = -2012;
 
 /// One normalized article-list entry returned by the WeRead adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +156,7 @@ pub trait WeReadCredentialProvider: Send + Sync {
 pub enum WeReadEndpointError {
     /// The endpoint is not the HTTPS WeRead article-list API.
     #[error(
-        "WeRead article-list endpoint must be HTTPS i.weread.qq.com/web/mp/articles without credentials, fragments, or a non-default port"
+        "WeRead article-list endpoint must be HTTPS weread.qq.com/web/mp/articles without credentials, fragments, or a non-default port"
     )]
     Invalid,
 }
@@ -444,14 +447,29 @@ where
             )
         })?;
         request
-            .goto("https://i.weread.qq.com/")
+            .goto(WEREAD_SHELF_URL)
             .await
             .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+        request.ensure_usable().map_err(WeReadAdapterError::from)?;
         request
             .install_cookie_header(cookie)
             .await
             .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
         request.ensure_usable().map_err(WeReadAdapterError::from)?;
+        // The initial shelf navigation establishes the origin required for
+        // WebDriver cookie injection. Navigate to it again after installing
+        // credentials so WeRead can apply the cookies and redirect an
+        // unauthenticated account to its login page before listing articles.
+        request
+            .goto(WEREAD_SHELF_URL)
+            .await
+            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+        request.ensure_usable().map_err(WeReadAdapterError::from)?;
+        let shelf_url = request
+            .current_url()
+            .await
+            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
+        ensure_authenticated_shelf_url(&shelf_url)?;
         if let Some(pacing) = &self.pacing {
             pacing.wait(crate::domain::pacing::DelayKind::Request).await;
         }
@@ -467,6 +485,23 @@ where
             .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
         request.ensure_usable().map_err(WeReadAdapterError::from)?;
         parse_article_list_body(&body)
+    }
+}
+
+fn ensure_authenticated_shelf_url(url: &Url) -> Result<(), WeReadAdapterError> {
+    let is_shelf = url.scheme() == "https"
+        && url.host_str() == Some(WEREAD_HOST)
+        && (url.path() == WEREAD_SHELF_PATH || url.path() == "/web/shelf/")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+        && url.port().is_none_or(|port| port == 443);
+    if is_shelf {
+        Ok(())
+    } else {
+        Err(WeReadAdapterError::AuthenticationExpired {
+            code: WEREAD_AUTHENTICATION_EXPIRED_CODE,
+        })
     }
 }
 
@@ -764,9 +799,46 @@ mod tests {
     }
 
     #[test]
+    fn accepts_the_authenticated_canonical_shelf_url() {
+        for value in [
+            "https://weread.qq.com/web/shelf",
+            "https://weread.qq.com/web/shelf/",
+            "https://weread.qq.com/web/shelf?tab=recent",
+        ] {
+            let url = value.parse().expect("test URL should parse");
+            assert!(
+                ensure_authenticated_shelf_url(&url).is_ok(),
+                "canonical shelf URL should be accepted: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_login_redirect_before_article_list_navigation() {
+        let url: Url = "https://weread.qq.com/web/login".parse().unwrap();
+        assert_eq!(
+            ensure_authenticated_shelf_url(&url),
+            Err(WeReadAdapterError::AuthenticationExpired {
+                code: WEREAD_AUTHENTICATION_EXPIRED_CODE,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_a_shelf_url_on_an_untrusted_host() {
+        let url: Url = "https://i.weread.qq.com/web/shelf".parse().unwrap();
+        assert_eq!(
+            ensure_authenticated_shelf_url(&url),
+            Err(WeReadAdapterError::AuthenticationExpired {
+                code: WEREAD_AUTHENTICATION_EXPIRED_CODE,
+            })
+        );
+    }
+
+    #[test]
     fn appends_book_identity_without_discarding_configured_endpoint_query() {
         let adapter = BrowserWeReadAdapter::new(
-            "https://i.weread.qq.com/web/mp/articles?count=100"
+            "https://weread.qq.com/web/mp/articles?count=100"
                 .parse()
                 .unwrap(),
         )
@@ -774,27 +846,27 @@ mod tests {
         let endpoint = article_list_endpoint(adapter.endpoint(), "book/with spaces").unwrap();
         assert_eq!(
             endpoint.as_str(),
-            "https://i.weread.qq.com/web/mp/articles?count=100&bookId=book%2Fwith+spaces&offset=0"
+            "https://weread.qq.com/web/mp/articles?count=100&bookId=book%2Fwith+spaces&offset=0"
         );
     }
 
     #[test]
     fn replaces_configured_book_identity_and_offset() {
         let endpoint: Url =
-            "https://i.weread.qq.com/web/mp/articles?bookId=wrong&offset=99&count=100"
+            "https://weread.qq.com/web/mp/articles?bookId=wrong&offset=99&count=100"
                 .parse()
                 .unwrap();
         let endpoint = article_list_endpoint(&endpoint, "right").unwrap();
 
         assert_eq!(
             endpoint.as_str(),
-            "https://i.weread.qq.com/web/mp/articles?count=100&bookId=right&offset=0"
+            "https://weread.qq.com/web/mp/articles?count=100&bookId=right&offset=0"
         );
     }
 
     #[test]
     fn rejects_an_empty_book_identity_before_touching_the_browser() {
-        let endpoint: Url = "https://i.weread.qq.com/web/mp/articles".parse().unwrap();
+        let endpoint: Url = "https://weread.qq.com/web/mp/articles".parse().unwrap();
         assert_eq!(
             article_list_endpoint(&endpoint, "  "),
             Err(WeReadAdapterError::Protocol(
@@ -806,12 +878,13 @@ mod tests {
     #[test]
     fn rejects_untrusted_article_list_endpoints_at_construction() {
         for value in [
-            "http://i.weread.qq.com/web/mp/articles",
+            "http://weread.qq.com/web/mp/articles",
             "https://example.test/web/mp/articles",
-            "https://i.weread.qq.com/web/mp/other",
-            "https://i.weread.qq.com:8443/web/mp/articles",
-            "https://user:password@i.weread.qq.com/web/mp/articles",
-            "https://i.weread.qq.com/web/mp/articles#fragment",
+            "https://weread.qq.com/web/mp/other",
+            "https://weread.qq.com:8443/web/mp/articles",
+            "https://user:password@weread.qq.com/web/mp/articles",
+            "https://weread.qq.com/web/mp/articles#fragment",
+            "https://i.weread.qq.com/web/mp/articles",
         ] {
             let endpoint = value.parse().expect("test URL should parse");
             assert!(
@@ -826,15 +899,12 @@ mod tests {
 
     #[test]
     fn normalizes_the_default_https_port_for_the_article_list_endpoint() {
-        let adapter = BrowserWeReadAdapter::new(
-            "https://i.weread.qq.com:443/web/mp/articles"
-                .parse()
-                .unwrap(),
-        )
-        .unwrap();
+        let adapter =
+            BrowserWeReadAdapter::new("https://weread.qq.com:443/web/mp/articles".parse().unwrap())
+                .unwrap();
         assert_eq!(
             adapter.endpoint().as_str(),
-            "https://i.weread.qq.com/web/mp/articles"
+            "https://weread.qq.com/web/mp/articles"
         );
     }
 

@@ -979,7 +979,7 @@ fn parse_log_level(
 }
 
 fn parse_weread_article_list_url(value: Option<String>) -> Result<Url, ConfigError> {
-    let value = value.unwrap_or_else(|| "https://i.weread.qq.com/web/mp/articles".to_owned());
+    let value = value.unwrap_or_else(|| "https://weread.qq.com/web/mp/articles".to_owned());
     let url = value
         .trim()
         .parse::<Url>()
@@ -988,7 +988,7 @@ fn parse_weread_article_list_url(value: Option<String>) -> Result<Url, ConfigErr
             reason: "expected a valid HTTPS WeRead article-list URL",
         })?;
     if url.scheme() != "https"
-        || url.host_str() != Some("i.weread.qq.com")
+        || url.host_str() != Some("weread.qq.com")
         || url.path() != "/web/mp/articles"
         || !url.username().is_empty()
         || url.password().is_some()
@@ -997,7 +997,7 @@ fn parse_weread_article_list_url(value: Option<String>) -> Result<Url, ConfigErr
     {
         return Err(ConfigError::InvalidValue {
             variable: "WEREAD_ARTICLE_LIST_URL",
-            reason: "must use HTTPS i.weread.qq.com/web/mp/articles without credentials, fragments, or a non-default port",
+            reason: "must use HTTPS weread.qq.com/web/mp/articles without credentials, fragments, or a non-default port",
         });
     }
     Ok(url)
@@ -1350,7 +1350,7 @@ mod tests {
         assert!(config.weread_account_id.is_none());
         assert_eq!(
             config.weread_article_list_url.as_str(),
-            "https://i.weread.qq.com/web/mp/articles"
+            "https://weread.qq.com/web/mp/articles"
         );
         assert!(config.roles.contains(AppRole::Api));
         assert!(!config.roles.contains(AppRole::Scheduler));
@@ -2103,7 +2103,7 @@ mod tests {
                 ),
                 (
                     "WEREAD_ARTICLE_LIST_URL".to_owned(),
-                    "https://i.weread.qq.com/web/mp/articles?offset=0".to_owned(),
+                    "https://weread.qq.com/web/mp/articles?offset=0".to_owned(),
                 ),
             ])
             .collect::<Vec<_>>();
@@ -2116,7 +2116,7 @@ mod tests {
         );
         assert_eq!(
             config.weread_article_list_url.as_str(),
-            "https://i.weread.qq.com/web/mp/articles?offset=0"
+            "https://weread.qq.com/web/mp/articles?offset=0"
         );
     }
 
@@ -2130,13 +2130,14 @@ mod tests {
         assert!(AppConfig::from_env_iter(account_only).is_ok());
 
         for endpoint in [
-            "http://i.weread.qq.com/web/mp/articles",
+            "http://weread.qq.com/web/mp/articles",
             "https://example.com/web/mp/articles",
-            "https://i.weread.qq.com.evil.example/web/mp/articles",
-            "https://i.weread.qq.com/web/mp/other",
-            "https://i.weread.qq.com:8443/web/mp/articles",
-            "https://user:password@i.weread.qq.com/web/mp/articles",
-            "https://i.weread.qq.com/web/mp/articles#fragment",
+            "https://weread.qq.com.evil.example/web/mp/articles",
+            "https://weread.qq.com/web/mp/other",
+            "https://weread.qq.com:8443/web/mp/articles",
+            "https://user:password@weread.qq.com/web/mp/articles",
+            "https://weread.qq.com/web/mp/articles#fragment",
+            "https://i.weread.qq.com/web/mp/articles",
         ] {
             let environment =
                 replace_environment(valid_environment(), "WEREAD_ARTICLE_LIST_URL", endpoint);

@@ -107,7 +107,7 @@ The endpoint is always configured for source-sync acquisition. An account ID
 is optional when using an admin-enrolled account:
 
 ```text
-WEREAD_ARTICLE_LIST_URL=https://i.weread.qq.com/web/mp/articles
+WEREAD_ARTICLE_LIST_URL=https://weread.qq.com/web/mp/articles
 ```
 
 `WEREAD_ACCOUNT_ID` remains available as the default panel-enrolled account.
@@ -119,12 +119,14 @@ interval. Enroll or replace credentials later from the protected admin panel;
 the running worker observes the account on a subsequent job without a restart.
 
 Enroll the cookie header from the admin panel; the runtime injects it into a
-fresh authenticated browser session. The runtime holds a PostgreSQL account
+fresh authenticated browser session, revisits `https://weread.qq.com/web/shelf`
+after injection, and only requests the article list when that same session
+remains on the shelf rather than being redirected to login. The runtime holds a PostgreSQL account
 lease while the authenticated request is active and releases it before
 opening a clean public session for article content. Authentication material is
 never sent to public WeChat pages. The article-list
 URL is restricted by configuration validation to the exact HTTPS
-`i.weread.qq.com/web/mp/articles` endpoint without credentials, fragments, or
+`weread.qq.com/web/mp/articles` endpoint without credentials, fragments, or
 a non-default port.
 
 The admin panel provides the non-interactive credential enrollment flow: after

@@ -108,7 +108,7 @@ keys in a secret manager or an ignored local environment file.
 | `BROWSER_VIEWPORT_HEIGHT` | `2000` | Browser viewport height in CSS pixels. Valid range: `1`–`8192`. |
 | `BROWSER_EXTRA_ARGS` | Empty | Optional whitespace-separated browser arguments. At most 32 arguments are accepted, each must begin with `-`, and controlled browser arguments such as User-Agent, window size, persistent-profile paths, and headless mode cannot be overridden. |
 | `WEREAD_ACCOUNT_ID` | Unset | Optional stable WeRead account UUID used as the default panel-enrolled account. When unset, an unbound source-sync job randomly selects an enabled, unexpired account enrolled through the admin panel from PostgreSQL. A source-specific account ID takes precedence. |
-| `WEREAD_ARTICLE_LIST_URL` | `https://i.weread.qq.com/web/mp/articles` | Exact HTTPS WeRead article-list endpoint. Credentials, fragments, and non-default ports are rejected. |
+| `WEREAD_ARTICLE_LIST_URL` | `https://weread.qq.com/web/mp/articles` | Exact HTTPS WeRead article-list endpoint. Source synchronization first opens `https://weread.qq.com/web/shelf` in the same authenticated browser session, verifies it did not redirect to login, and then requests the article list. Credentials, fragments, and non-default ports are rejected. |
 
 ### Workers, jobs, and leases
 
