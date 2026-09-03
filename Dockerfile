@@ -4,13 +4,17 @@ FROM rust:1-bookworm AS builder
 
 WORKDIR /usr/src/werrss
 
-# Keep dependency downloads independent from source changes without creating a
-# fake package binary that could accidentally be copied into the runtime image.
+# Keep dependency downloads independent from source changes. Cargo requires a
+# target even for `cargo fetch`, so use a temporary library target; unlike the
+# old cache recipe, this never creates a runtime binary.
 COPY Cargo.toml Cargo.lock ./
 
 RUN --mount=type=cache,id=werrss-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=werrss-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    cargo fetch --locked
+    mkdir src \
+    && printf 'pub fn dependency_cache_probe() {}\n' > src/lib.rs \
+    && cargo fetch --locked \
+    && rm -rf src
 
 # SQLx embeds the checked-in migrations at compile time.
 COPY migrations ./migrations
