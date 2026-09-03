@@ -40,6 +40,34 @@ fn public_parser_handles_current_and_legacy_payloads_consistently() {
 }
 
 #[test]
+fn public_parser_handles_the_cover_payload_shape() {
+    let payload = json!({
+        "reviewId": "MP_WXS_2103095721_1V0fvyRTje-N7TWQunyLJA",
+        "title": "人物文章",
+        "name": "人物",
+        "pic": "https://mmbiz.qpic.cn/cover.jpg"
+    });
+
+    let articles = parse_article_list_payload(&payload).expect("cover payload should parse");
+
+    assert_eq!(articles.len(), 1);
+    assert_eq!(
+        articles[0].review_id,
+        "MP_WXS_2103095721_1V0fvyRTje-N7TWQunyLJA"
+    );
+    assert_eq!(articles[0].title.as_deref(), Some("人物文章"));
+    assert_eq!(articles[0].author.as_deref(), Some("人物"));
+    assert_eq!(
+        articles[0].cover_url.as_deref(),
+        Some("https://mmbiz.qpic.cn/cover.jpg")
+    );
+    assert_eq!(
+        articles[0].article_url.as_ref().unwrap().as_str(),
+        "https://mp.weixin.qq.com/s/1V0fvyRTje-N7TWQunyLJA"
+    );
+}
+
+#[test]
 fn public_parser_returns_typed_risk_control_and_rejects_malformed_json() {
     assert_eq!(
         parse_article_list_payload(&json!({"errcode": -2010})),

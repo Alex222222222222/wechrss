@@ -15,11 +15,13 @@
 //! layer, while risk-control responses remain terminal.
 //!
 //! The pure [`parse_article_list_payload`] boundary is executable without a
-//! browser or network. It accepts the current `data` envelope and the legacy
-//! `reviews[].subReviews[]` envelope, normalizes nested review records, and
-//! rejects unsupported or unsafe values before they reach persistence. The
-//! concrete browser adapter below keeps the authenticated WebDriver capability
-//! private and parses only the response body needed by source synchronization.
+//! browser or network. It accepts the current `data` envelope, the legacy
+//! `reviews[].subReviews[]` envelope, and the single-article `/api/mp/cover`
+//! response, normalizes review records, and rejects unsupported or unsafe
+//! values before they reach persistence. The concrete browser adapter below
+//! keeps the authenticated WebDriver capability private and reads the
+//! endpoint response as raw text; it does not parse browser-rendered JSON
+//! viewer text.
 //! QR exchange remains outside this protocol adapter; credential refresh is
 //! handled by the application authentication lifecycle.
 
@@ -44,6 +46,7 @@ use super::{
 
 const WEREAD_HOST: &str = "weread.qq.com";
 const WEREAD_ARTICLE_LIST_PATH: &str = "/web/mp/articles";
+const WEREAD_ARTICLE_COVER_PATH: &str = "/api/mp/cover";
 const WEREAD_SHELF_PATH: &str = "/web/shelf";
 const WEREAD_SHELF_URL: &str = "https://weread.qq.com/web/shelf";
 const WEREAD_AUTHENTICATION_EXPIRED_CODE: i64 = -2012;
@@ -151,12 +154,12 @@ pub trait WeReadCredentialProvider: Send + Sync {
     ) -> Result<WeReadCredentials, WeReadCredentialProviderError>;
 }
 
-/// Validation failure for the authenticated WeRead article-list endpoint.
+/// Validation failure for the authenticated WeRead article endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum WeReadEndpointError {
-    /// The endpoint is not the HTTPS WeRead article-list API.
+    /// The endpoint is not one of the supported HTTPS WeRead article APIs.
     #[error(
-        "WeRead article-list endpoint must be HTTPS weread.qq.com/web/mp/articles without credentials, fragments, or a non-default port"
+        "WeRead article endpoint must be HTTPS weread.qq.com/web/mp/articles or weread.qq.com/api/mp/cover without credentials, fragments, or a non-default port"
     )]
     Invalid,
 }
@@ -173,9 +176,10 @@ impl From<AccountLeaseError> for WeReadAdapterError {
 /// Parses a WeRead article-list response into validated references.
 ///
 /// Current mobile responses use `{"data": [...]}`. Older deployments use
-/// `{"reviews": [{"subReviews": [{"review": {...}}]}]}`. Entries without a
-/// stable `reviewId` or title are ignored because they cannot become useful
-/// articles. Present URLs are always converted to
+/// `{"reviews": [{"subReviews": [{"review": {...}}]}]}`. The current cover
+/// endpoint returns one root object with `reviewId`, `title`, `name`, and
+/// `pic`. Entries without a stable `reviewId` or title are ignored because
+/// they cannot become useful articles. Present URLs are always converted to
 /// [`VerifiedWechatArticleUrl`]; an invalid URL fails the complete response so
 /// an unsafe value cannot be passed to a later browser operation.
 pub fn parse_article_list_payload(
@@ -186,6 +190,10 @@ pub fn parse_article_list_payload(
         .ok_or_else(|| WeReadAdapterError::Protocol("response must be a JSON object".to_owned()))?;
     if let Some(error) = response_error(object)? {
         return Err(error);
+    }
+
+    if object.contains_key("reviewId") {
+        return Ok(parse_cover_entry(object)?.into_iter().collect());
     }
 
     if let Some(data) = object.get("data") {
@@ -215,6 +223,28 @@ pub fn parse_article_list_payload(
         result.extend(parse_entries(sub_reviews, group_time)?);
     }
     Ok(result)
+}
+
+fn parse_cover_entry(
+    object: &Map<String, Value>,
+) -> Result<Option<WeReadArticleReference>, WeReadAdapterError> {
+    let Some(review_id) = first_text(&[object], &["reviewId"]) else {
+        return Ok(None);
+    };
+    let Some(title) = first_text(&[object], &["title"]) else {
+        return Ok(None);
+    };
+
+    let article_url = article_url(&[object])?.or(cover_article_url(&review_id)?);
+    Ok(Some(WeReadArticleReference {
+        review_id,
+        article_url,
+        title: Some(title),
+        summary: None,
+        author: first_text(&[object], &["name"]),
+        cover_url: first_text(&[object], &["pic"]),
+        published_at: None,
+    }))
 }
 
 fn parse_entries(
@@ -304,6 +334,21 @@ fn article_url(
     verify_article_url(&value)
 }
 
+fn cover_article_url(
+    review_id: &str,
+) -> Result<Option<VerifiedWechatArticleUrl>, WeReadAdapterError> {
+    let Some(review_id) = review_id.strip_prefix("MP_WXS_") else {
+        return Ok(None);
+    };
+    let Some((_, article_id)) = review_id.rsplit_once('_') else {
+        return Ok(None);
+    };
+    if article_id.trim().is_empty() {
+        return Ok(None);
+    }
+    verify_article_url(article_id)
+}
+
 fn verify_article_url(value: &str) -> Result<Option<VerifiedWechatArticleUrl>, WeReadAdapterError> {
     let value = value.trim();
     let candidate = if value.starts_with("http://") || value.starts_with("https://") {
@@ -368,7 +413,7 @@ fn integer_value(value: &Value) -> Option<i64> {
         .or_else(|| value.as_str()?.trim().parse().ok())
 }
 
-/// Thirtyfour-backed authenticated article-list adapter.
+/// Thirtyfour-backed authenticated WeRead article adapter.
 #[derive(Clone)]
 pub struct BrowserWeReadAdapter {
     endpoint: Url,
@@ -388,7 +433,7 @@ impl std::fmt::Debug for BrowserWeReadAdapter {
 }
 
 impl BrowserWeReadAdapter {
-    /// Creates an adapter for the validated WeRead article-list endpoint.
+    /// Creates an adapter for a validated WeRead article endpoint.
     pub fn new(mut endpoint: Url) -> Result<Self, WeReadEndpointError> {
         validate_article_list_endpoint(&endpoint)?;
         if endpoint.port() == Some(443) {
@@ -474,13 +519,8 @@ where
             pacing.wait(crate::domain::pacing::DelayKind::Request).await;
         }
         request.ensure_usable().map_err(WeReadAdapterError::from)?;
-        request
-            .goto(endpoint.as_str())
-            .await
-            .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
-        request.ensure_usable().map_err(WeReadAdapterError::from)?;
         let body = request
-            .body_text()
+            .fetch_text(endpoint.as_str())
             .await
             .map_err(|error| WeReadAdapterError::Browser(error.to_string()))?;
         request.ensure_usable().map_err(WeReadAdapterError::from)?;
@@ -508,7 +548,10 @@ fn ensure_authenticated_shelf_url(url: &Url) -> Result<(), WeReadAdapterError> {
 fn validate_article_list_endpoint(endpoint: &Url) -> Result<(), WeReadEndpointError> {
     if endpoint.scheme() != "https"
         || endpoint.host_str() != Some(WEREAD_HOST)
-        || endpoint.path() != WEREAD_ARTICLE_LIST_PATH
+        || !matches!(
+            endpoint.path(),
+            WEREAD_ARTICLE_LIST_PATH | WEREAD_ARTICLE_COVER_PATH
+        )
         || !endpoint.username().is_empty()
         || endpoint.password().is_some()
         || endpoint.fragment().is_some()
@@ -527,6 +570,7 @@ fn article_list_endpoint(endpoint: &Url, book_id: &str) -> Result<Url, WeReadAda
         ));
     }
     let mut endpoint = endpoint.clone();
+    let is_article_list = endpoint.path() == WEREAD_ARTICLE_LIST_PATH;
     let configured_query = endpoint
         .query_pairs()
         .filter(|(key, _)| key != "bookId" && key != "offset")
@@ -538,9 +582,10 @@ fn article_list_endpoint(endpoint: &Url, book_id: &str) -> Result<Url, WeReadAda
         for (key, value) in configured_query {
             query.append_pair(&key, &value);
         }
-        query
-            .append_pair("bookId", book_id)
-            .append_pair("offset", "0");
+        query.append_pair("bookId", book_id);
+        if is_article_list {
+            query.append_pair("offset", "0");
+        }
     }
     Ok(endpoint)
 }
@@ -691,6 +736,42 @@ mod tests {
                 .as_ref()
                 .map(VerifiedWechatArticleUrl::as_str),
             Some("https://mp.weixin.qq.com/s/legacy-token")
+        );
+    }
+
+    #[test]
+    fn parses_the_cover_response_and_recovers_its_public_article_url() {
+        let payload = json!({
+            "avatar": "http://wx.qlogo.cn/avatar",
+            "name": " 人物 ",
+            "title": " 影子和影子，苹果CEO的接力赛 ",
+            "pic": "https://mmbiz.qpic.cn/cover.jpg",
+            "reviewId": " MP_WXS_2103095721_1V0fvyRTje-N7TWQunyLJA "
+        });
+
+        let articles = parse_article_list_payload(&payload).expect("cover response should parse");
+
+        assert_eq!(articles.len(), 1);
+        let article = &articles[0];
+        assert_eq!(
+            article.review_id,
+            "MP_WXS_2103095721_1V0fvyRTje-N7TWQunyLJA"
+        );
+        assert_eq!(
+            article.title.as_deref(),
+            Some("影子和影子，苹果CEO的接力赛")
+        );
+        assert_eq!(article.author.as_deref(), Some("人物"));
+        assert_eq!(
+            article.cover_url.as_deref(),
+            Some("https://mmbiz.qpic.cn/cover.jpg")
+        );
+        assert_eq!(
+            article
+                .article_url
+                .as_ref()
+                .map(VerifiedWechatArticleUrl::as_str),
+            Some("https://mp.weixin.qq.com/s/1V0fvyRTje-N7TWQunyLJA")
         );
     }
 
@@ -861,6 +942,19 @@ mod tests {
         assert_eq!(
             endpoint.as_str(),
             "https://weread.qq.com/web/mp/articles?count=100&bookId=right&offset=0"
+        );
+    }
+
+    #[test]
+    fn cover_endpoint_adds_book_identity_without_a_list_offset() {
+        let endpoint: Url = "https://weread.qq.com/api/mp/cover?bookId=wrong&offset=99&count=1"
+            .parse()
+            .unwrap();
+        let endpoint = article_list_endpoint(&endpoint, "right").unwrap();
+
+        assert_eq!(
+            endpoint.as_str(),
+            "https://weread.qq.com/api/mp/cover?count=1&bookId=right"
         );
     }
 

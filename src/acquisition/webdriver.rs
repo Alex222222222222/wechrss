@@ -343,6 +343,12 @@ async fn canonical_timezone(client: &WebDriver, timezone: Tz) -> Result<String, 
         .map_err(|error| WebDriverError::Command(error.to_string()))
 }
 
+#[derive(Debug, Deserialize)]
+struct BrowserFetchTextResult {
+    body: Option<String>,
+    error: Option<String>,
+}
+
 fn capabilities_for(
     engine: BrowserEngine,
     profile: &BrowserProfile,
@@ -833,22 +839,40 @@ where
         Ok(())
     }
 
-    /// Reads visible body text without exposing the raw WebDriver client.
-    pub(crate) async fn body_text(&self) -> Result<String, WebDriverError> {
+    /// Fetches a same-origin response and returns its raw text body.
+    ///
+    /// Navigating a browser directly to a JSON endpoint is not equivalent to
+    /// reading the response bytes: Firefox may replace the document with its
+    /// JSON viewer, whose visible text is a formatted tree. The async script
+    /// keeps the authenticated page origin and asks the browser Fetch API for
+    /// the response text before any document rendering can change it.
+    pub(crate) async fn fetch_text(&self, url: &str) -> Result<String, WebDriverError> {
         let result = self
             .session
             .client
             .as_ref()
             .ok_or(WebDriverError::NotConnected)?
-            .execute(
-                "return document.body ? document.body.innerText : document.documentElement.innerText;",
-                Vec::new(),
+            .execute_async(
+                r#"const done = arguments[arguments.length - 1];
+fetch(arguments[0], { credentials: "include" })
+    .then(response => response.text())
+    .then(body => done({ body }))
+    .catch(error => done({ error: String(error) }));"#,
+                vec![serde_json::json!(url)],
             )
             .await
             .map_err(|error| WebDriverError::Command(error.to_string()))?;
-        result
+        let response: BrowserFetchTextResult = result
             .convert()
-            .map_err(|error| WebDriverError::Command(error.to_string()))
+            .map_err(|error| WebDriverError::Command(error.to_string()))?;
+        if let Some(error) = response.error {
+            return Err(WebDriverError::Command(format!(
+                "browser fetch failed: {error}"
+            )));
+        }
+        response.body.ok_or_else(|| {
+            WebDriverError::Command("browser fetch returned no response body".to_owned())
+        })
     }
 }
 
@@ -948,6 +972,8 @@ mod tests {
     struct WeReadBrowserState {
         navigations: Mutex<Vec<String>>,
         cookie_domains: Mutex<Vec<Option<String>>>,
+        raw_fetch_urls: Mutex<Vec<String>>,
+        raw_fetch_body: String,
         current_url: Mutex<String>,
         redirect_shelf_to_login: bool,
     }
@@ -1009,6 +1035,23 @@ mod tests {
             }
             if method == Method::POST && path.ends_with("/execute/sync") {
                 return webdriver_json_response(json!(r#"{"data":[]}"#));
+            }
+            if method == Method::POST && path.ends_with("/execute/async") {
+                let target = body
+                    .as_ref()
+                    .and_then(|value| value.get("args"))
+                    .and_then(Value::as_array)
+                    .and_then(|args| args.first())
+                    .and_then(Value::as_str)
+                    .expect("raw fetch should contain its target URL as an argument");
+                self.state
+                    .raw_fetch_urls
+                    .lock()
+                    .unwrap()
+                    .push(target.to_owned());
+                return webdriver_json_response(json!({
+                    "body": self.state.raw_fetch_body.clone()
+                }));
             }
             webdriver_json_response(Value::Null)
         }
@@ -1262,12 +1305,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn weread_listing_visits_the_authenticated_shelf_before_the_article_list() {
+    async fn weread_cover_fetch_reads_raw_json_without_navigating_to_the_endpoint() {
         use crate::acquisition::weread::{BrowserWeReadAdapter, WeReadAdapter};
 
         let state = Arc::new(WeReadBrowserState {
             navigations: Mutex::new(Vec::new()),
             cookie_domains: Mutex::new(Vec::new()),
+            raw_fetch_urls: Mutex::new(Vec::new()),
+            raw_fetch_body: r#"{"reviewId":"MP_WXS_book-1_article-1","title":"Cover title","name":"Account","pic":"https://mmbiz.qpic.cn/cover.jpg"}"#.to_owned(),
             current_url: Mutex::new(TEST_WEREAD_SHELF_URL.to_owned()),
             redirect_shelf_to_login: false,
         });
@@ -1292,21 +1337,25 @@ mod tests {
             .await
             .unwrap();
         let adapter =
-            BrowserWeReadAdapter::new("https://weread.qq.com/web/mp/articles".parse().unwrap())
+            BrowserWeReadAdapter::new("https://weread.qq.com/api/mp/cover".parse().unwrap())
                 .unwrap()
                 .with_credential_provider(Arc::new(TestWeReadCredentialProvider));
 
         let references = adapter.list_articles("book-1", request).await.unwrap();
 
-        assert!(references.is_empty());
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].review_id, "MP_WXS_book-1_article-1");
         let navigations = state.navigations.lock().unwrap().clone();
         assert_eq!(
             navigations,
             vec![
                 TEST_WEREAD_SHELF_URL.to_owned(),
                 TEST_WEREAD_SHELF_URL.to_owned(),
-                "https://weread.qq.com/web/mp/articles?bookId=book-1&offset=0".to_owned(),
             ]
+        );
+        assert_eq!(
+            state.raw_fetch_urls.lock().unwrap().clone(),
+            vec!["https://weread.qq.com/api/mp/cover?bookId=book-1".to_owned()]
         );
         let cookie_domains = state.cookie_domains.lock().unwrap().clone();
         assert_eq!(
@@ -1329,6 +1378,8 @@ mod tests {
         let state = Arc::new(WeReadBrowserState {
             navigations: Mutex::new(Vec::new()),
             cookie_domains: Mutex::new(Vec::new()),
+            raw_fetch_urls: Mutex::new(Vec::new()),
+            raw_fetch_body: r#"{"data":[]}"#.to_owned(),
             current_url: Mutex::new(TEST_WEREAD_SHELF_URL.to_owned()),
             redirect_shelf_to_login: true,
         });

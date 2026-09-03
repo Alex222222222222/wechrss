@@ -979,7 +979,7 @@ fn parse_log_level(
 }
 
 fn parse_weread_article_list_url(value: Option<String>) -> Result<Url, ConfigError> {
-    let value = value.unwrap_or_else(|| "https://weread.qq.com/web/mp/articles".to_owned());
+    let value = value.unwrap_or_else(|| "https://weread.qq.com/api/mp/cover".to_owned());
     let url = value
         .trim()
         .parse::<Url>()
@@ -989,7 +989,7 @@ fn parse_weread_article_list_url(value: Option<String>) -> Result<Url, ConfigErr
         })?;
     if url.scheme() != "https"
         || url.host_str() != Some("weread.qq.com")
-        || url.path() != "/web/mp/articles"
+        || !matches!(url.path(), "/web/mp/articles" | "/api/mp/cover")
         || !url.username().is_empty()
         || url.password().is_some()
         || url.fragment().is_some()
@@ -997,7 +997,7 @@ fn parse_weread_article_list_url(value: Option<String>) -> Result<Url, ConfigErr
     {
         return Err(ConfigError::InvalidValue {
             variable: "WEREAD_ARTICLE_LIST_URL",
-            reason: "must use HTTPS weread.qq.com/web/mp/articles without credentials, fragments, or a non-default port",
+            reason: "must use HTTPS weread.qq.com/web/mp/articles or /api/mp/cover without credentials, fragments, or a non-default port",
         });
     }
     Ok(url)
@@ -1350,7 +1350,7 @@ mod tests {
         assert!(config.weread_account_id.is_none());
         assert_eq!(
             config.weread_article_list_url.as_str(),
-            "https://weread.qq.com/web/mp/articles"
+            "https://weread.qq.com/api/mp/cover"
         );
         assert!(config.roles.contains(AppRole::Api));
         assert!(!config.roles.contains(AppRole::Scheduler));
@@ -2117,6 +2117,21 @@ mod tests {
         assert_eq!(
             config.weread_article_list_url.as_str(),
             "https://weread.qq.com/web/mp/articles?offset=0"
+        );
+    }
+
+    #[test]
+    fn accepts_the_current_weread_cover_endpoint() {
+        let environment = replace_environment(
+            valid_environment(),
+            "WEREAD_ARTICLE_LIST_URL",
+            "https://weread.qq.com/api/mp/cover?bookId=ignored",
+        );
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        assert_eq!(
+            config.weread_article_list_url.as_str(),
+            "https://weread.qq.com/api/mp/cover?bookId=ignored"
         );
     }
 

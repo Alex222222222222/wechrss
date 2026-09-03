@@ -116,7 +116,7 @@ The endpoint is always configured for source-sync acquisition. An account ID
 is optional when using an admin-enrolled account:
 
 ```text
-WEREAD_ARTICLE_LIST_URL=https://weread.qq.com/web/mp/articles
+WEREAD_ARTICLE_LIST_URL=https://weread.qq.com/api/mp/cover
 ```
 
 `WEREAD_ACCOUNT_ID` remains available as the default panel-enrolled account.
@@ -129,14 +129,16 @@ the running worker observes the account on a subsequent job without a restart.
 
 Enroll the cookie header from the admin panel; the runtime injects it into a
 fresh authenticated browser session, revisits `https://weread.qq.com/web/shelf`
-after injection, and only requests the article list when that same session
+after injection, and only fetches the article endpoint when that same session
 remains on the shelf rather than being redirected to login. The runtime holds a PostgreSQL account
 lease while the authenticated request is active and releases it before
 opening a clean public session for article content. Authentication material is
-never sent to public WeChat pages. The article-list
-URL is restricted by configuration validation to the exact HTTPS
-`weread.qq.com/web/mp/articles` endpoint without credentials, fragments, or
-a non-default port.
+never sent to public WeChat pages. The configured WeRead article
+URL is restricted by configuration validation to the HTTPS
+`weread.qq.com/api/mp/cover` or `weread.qq.com/web/mp/articles` endpoint without
+credentials, fragments, or a non-default port. The cover endpoint is the
+recommended default because the older article-list endpoint may return a
+deprecated response for current accounts.
 
 The admin panel provides the non-interactive credential enrollment flow: after
 signing in at `/admin/login`, copy the complete `Cookie` request-header value
@@ -150,6 +152,37 @@ the field empty to randomly use any enabled, unexpired enrolled account. To
 rotate a session, submit the new cookie using the same account ID. QR-code
 login remains deferred, and no cookie should be placed in a ConfigMap or
 container image.
+
+#### Authenticated browser diagnostic
+
+The ignored `real_weread` integration test exercises the same shelf-first
+authenticated adapter used by source synchronization. It creates a standard
+Firefox session, visits `/web/shelf`, installs the cookie in the WeRead origin,
+revisits the shelf, and fetches the configured article endpoint as raw text. It does not modify
+`navigator.webdriver`, inject stealth code, or spoof browser fingerprints. Keep
+the cookie in a secret manager or a private ignored environment source; never
+commit it, put it in a Kubernetes ConfigMap, or include it in shell history or
+test output.
+
+After forwarding a temporary Firefox WebDriver service to local port `4444`,
+run it with the cookie supplied by your secret manager:
+
+```sh
+WEBDRIVER_URL=http://127.0.0.1:4444 \
+WEREAD_COOKIE_HEADER="$(your-secret-manager read weread-cookie)" \
+WEREAD_BOOK_ID=MP_WXS_2103095721 \
+  cargo test --locked --test real_weread -- --ignored --test-threads=1 --nocapture
+```
+
+The test defaults to Firefox and the public target book above. Set
+`BROWSER_ENGINE=chromium` only to compare a normal Chromium session; the test
+does not attempt to conceal WebDriver automation. The existing
+`BROWSER_USER_AGENT`, `BROWSER_VIEWPORT_WIDTH`, `BROWSER_VIEWPORT_HEIGHT`,
+`BROWSER_LOCALE`, `APP_TIMEZONE`, and `BROWSER_EXTRA_ARGS` variables can be used
+for controlled diagnostics subject to the profile validation rules. A
+successful empty list is a valid upstream response; an authentication or
+environment-control error should be treated as an upstream session rejection,
+not bypassed.
 
 ## Kubernetes
 

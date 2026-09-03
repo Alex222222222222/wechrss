@@ -108,7 +108,7 @@ keys in a secret manager or an ignored local environment file.
 | `BROWSER_VIEWPORT_HEIGHT` | `2000` | Browser viewport height in CSS pixels. Valid range: `1`–`8192`. |
 | `BROWSER_EXTRA_ARGS` | Empty | Optional whitespace-separated browser arguments. At most 32 arguments are accepted, each must begin with `-`, and controlled browser arguments such as User-Agent, window size, persistent-profile paths, and headless mode cannot be overridden. |
 | `WEREAD_ACCOUNT_ID` | Unset | Optional stable WeRead account UUID used as the default panel-enrolled account. When unset, an unbound source-sync job randomly selects an enabled, unexpired account enrolled through the admin panel from PostgreSQL. A source-specific account ID takes precedence. |
-| `WEREAD_ARTICLE_LIST_URL` | `https://weread.qq.com/web/mp/articles` | Exact HTTPS WeRead article-list endpoint. Source synchronization first opens `https://weread.qq.com/web/shelf` in the same authenticated browser session, verifies it did not redirect to login, and then requests the article list. Credentials, fragments, and non-default ports are rejected. |
+| `WEREAD_ARTICLE_LIST_URL` | `https://weread.qq.com/api/mp/cover` | HTTPS WeRead article endpoint. The default `/api/mp/cover` response returns the latest article for the book; `/web/mp/articles` remains accepted for compatible deployments. Source synchronization first opens `https://weread.qq.com/web/shelf` in the same authenticated browser session, verifies it did not redirect to login, and then fetches the endpoint response as raw text. Credentials, fragments, and non-default ports are rejected. |
 
 ### Workers, jobs, and leases
 
@@ -293,6 +293,10 @@ When adding a source, its WeRead account ID is optional. Set the ID returned by
 the admin panel to pin that source to one account; leave it empty to randomly
 select among enabled, unexpired enrolled accounts for each synchronization
 job.
+
+For a shelf-first authenticated browser diagnostic against a temporary
+WebDriver sidecar, see the
+[deployment diagnostic flow](DEPLOYMENT.md#authenticated-browser-diagnostic).
 
 ### Single-admin panel and API
 

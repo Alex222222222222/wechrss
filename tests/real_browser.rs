@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! WEBDRIVER_URL=http://127.0.0.1:4444 \
-//!   cargo test --locked --test real_browser -- --ignored --nocapture
+//!   cargo test --locked --test real_browser -- --ignored --test-threads=1 --nocapture
 //! ```
 
 use std::{env, time::Duration};
@@ -40,13 +40,7 @@ async fn fetches_a_real_public_article_without_credentials() {
         .unwrap_or_else(|_| "http://127.0.0.1:4444".to_owned())
         .parse::<Url>()
         .expect("WEBDRIVER_URL must be a valid URL");
-    let engine = env::var("BROWSER_ENGINE")
-        .map(|value| {
-            value
-                .parse::<BrowserEngine>()
-                .expect("BROWSER_ENGINE must be chromium or firefox")
-        })
-        .unwrap_or(BrowserEngine::Chromium);
+    let engine = browser_engine_from_environment();
     let profile = browser_profile_from_environment();
     eprintln!(
         "browser diagnostic profile: engine={engine:?}, user_agent={}, viewport={}x{}, locale={}, expected_timezone={}, extra_args={:?}",
@@ -134,6 +128,16 @@ fn real_browser_pacing_policy() -> PacingPolicy {
     .expect("integration-test pacing policy should be valid")
 }
 
+fn browser_engine_from_environment() -> BrowserEngine {
+    env::var("BROWSER_ENGINE")
+        .map(|value| {
+            value
+                .parse::<BrowserEngine>()
+                .expect("BROWSER_ENGINE must be chromium or firefox")
+        })
+        .unwrap_or(BrowserEngine::Chromium)
+}
+
 fn article_fetch_timezone(profile: &BrowserProfile) -> chrono_tz::Tz {
     profile.expected_timezone.unwrap_or(Shanghai)
 }
@@ -199,7 +203,8 @@ async fn browser_canonicalizes_an_iana_timezone_alias() {
         expected_timezone: Some(expected_timezone),
         ..BrowserProfile::default()
     };
-    let factory = WebDriverFactory::new(endpoint, BrowserEngine::Chromium).with_profile(profile);
+    let factory =
+        WebDriverFactory::new(endpoint, browser_engine_from_environment()).with_profile(profile);
     let pool = BrowserPool::new(1).expect("positive browser capacity");
     let session = tokio::time::timeout(Duration::from_secs(30), factory.open_public(&pool))
         .await
