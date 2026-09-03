@@ -64,5 +64,7 @@ jobs:
           push: ${{ startsWith(github.ref, 'refs/tags/v') }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
-          cache-from: type=gha,scope=werrss-container
-          cache-to: type=gha,mode=max,scope=werrss-container
+          # The cache scope changed with the removal of the dummy package
+          # build, so an old no-op artifact cannot be reused by this workflow.
+          cache-from: type=gha,scope=werrss-container-v2
+          cache-to: type=gha,mode=max,scope=werrss-container-v2

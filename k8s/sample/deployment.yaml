@@ -32,7 +32,7 @@ spec:
             sizeLimit: 2Gi
       containers:
         - name: werrss
-          image: ghcr.io/alex222222222222/werrss:v0.1.8
+          image: ghcr.io/alex222222222222/werrss:v0.1.9
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

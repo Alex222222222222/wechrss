@@ -230,13 +230,13 @@ than a commitment:
    bottleneck.
 
 The release image is built by `.github/workflows/container.yml`. Push a
-semantic-version tag such as `v0.1.8` to build and publish
-`ghcr.io/<owner>/<repository>:v0.1.8` and `:latest`; branch and pull-request
+semantic-version tag such as `v0.1.9` to build and publish
+`ghcr.io/<owner>/<repository>:v0.1.9` and `:latest`; branch and pull-request
 builds validate the Dockerfile without publishing. The image expects the same
 environment variables described in [DEPLOYMENT.md](DEPLOYMENT.md), including
 `DATABASE_URL`; no credentials are baked into the image. The Dockerfile keeps
-dependency compilation in a cacheable manifest-only layer and uses a small
-non-root distroless runtime image. The application image does not need
+dependency downloads and build artifacts in BuildKit cache mounts and uses a
+small non-root distroless runtime image. The application image does not need
 `tzdata`; the browser sidecar still does.
 
 ## WeRead authentication
