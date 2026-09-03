@@ -5,6 +5,15 @@ edition = "2021"
 description = "Architecture skeleton for a browser-driven WeChat public-account RSS service"
 license = "MIT"
 
+[profile.release]
+# Keep release artifacts small without serializing code generation. Thin LTO
+# removes cross-crate dead code while retaining more parallel build work than
+# a single-codegen-unit release profile.
+opt-level = "z"
+lto = "thin"
+panic = "abort"
+strip = "symbols"
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"

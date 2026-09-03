@@ -68,11 +68,20 @@ For a local build, run this from the repository root:
 docker build --tag werrss:local .
 ```
 
+The Dockerfile builds the Rust dependencies in a manifest-only layer, so
+source-only changes reuse that work when the Docker/BuildKit cache is
+available. GitHub Actions exports the same intermediate layers through its
+GitHub Actions cache. The final image uses the non-root distroless C/C++
+runtime and has no shell or package manager; use the HTTP probes and container
+logs for operational diagnostics. The Rust binary embeds the IANA timezone
+database through `chrono-tz`, so `tzdata` is required by the browser sidecar
+but not by the application image.
+
 The image listens on port `8080` by default and runs as an unprivileged user.
 Provide `DATABASE_URL` and the other runtime settings through the deployment
 environment; do not put credentials in a Dockerfile, image layer, or committed
-configuration file. The image contains the application and timezone/CA data,
-but browser-backed source synchronization still requires the separately
+configuration file. The image contains the application and CA data, but
+browser-backed source synchronization still requires the separately
 configured WebDriver sidecar described below. Its authenticated session can
 come from the admin-enrolled cookie header.
 

@@ -234,7 +234,10 @@ semantic-version tag such as `v0.1.7` to build and publish
 `ghcr.io/<owner>/<repository>:v0.1.7` and `:latest`; branch and pull-request
 builds validate the Dockerfile without publishing. The image expects the same
 environment variables described in [DEPLOYMENT.md](DEPLOYMENT.md), including
-`DATABASE_URL`; no credentials are baked into the image.
+`DATABASE_URL`; no credentials are baked into the image. The Dockerfile keeps
+dependency compilation in a cacheable manifest-only layer and uses a small
+non-root distroless runtime image. The application image does not need
+`tzdata`; the browser sidecar still does.
 
 ## WeRead authentication
 
