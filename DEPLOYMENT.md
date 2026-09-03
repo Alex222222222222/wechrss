@@ -55,11 +55,11 @@ Kubernetes Secret.
 ## Werrss application image
 
 The release image is published to GHCR by `.github/workflows/container.yml`
-when a semantic-version tag such as `v0.1.5` is pushed. Pull the versioned
+when a semantic-version tag such as `v0.1.6` is pushed. Pull the versioned
 image with:
 
 ```sh
-docker pull ghcr.io/<owner>/<repository>:v0.1.5
+docker pull ghcr.io/<owner>/<repository>:v0.1.6
 ```
 
 For a local build, run this from the repository root:
