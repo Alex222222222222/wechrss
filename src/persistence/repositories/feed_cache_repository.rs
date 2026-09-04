@@ -3,13 +3,13 @@
 //! Stores one rendered XML document per source, its ETag/content hash,
 //! generated time, expiry time, and monotonic source feed revision. Reads and
 //! fenced compare-and-swap replacement are implemented below. The durable
-//! `feed_build_leases` single-flight boundary coordinates cache misses before
+//! `feed_build_leases` single-flight boundary coordinates cache misses during
 //! rendering and final publication.
 //!
-//! Freshness is intended to default to 30 minutes. Stale rows should remain
-//! serveable for stale-while-revalidate behavior, while cache misses are
-//! eventually populated by a feed rebuild use case. This repository never
-//! contacts WeChat or the browser. The build-lease operations use PostgreSQL
+//! Freshness is intended to default to 30 minutes. Stale rows remain available
+//! as a fallback if an on-demand rebuild cannot complete, while cache misses
+//! are populated by a feed rebuild use case. This repository never contacts
+//! WeChat or the browser. The build-lease operations use PostgreSQL
 //! server time in short committed statements, not a connection-scoped
 //! advisory lock; rendering therefore happens after the lease statement
 //! releases its connection.

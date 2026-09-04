@@ -23,6 +23,10 @@ fn config() -> AppConfig {
             "APP_INSTANCE_ID".to_owned(),
             "runtime-integration".to_owned(),
         ),
+        (
+            "SERVER_ROOT_URL".to_owned(),
+            "https://feeds.example.test/werrss.xml".to_owned(),
+        ),
     ])
     .expect("test configuration should be valid")
 }

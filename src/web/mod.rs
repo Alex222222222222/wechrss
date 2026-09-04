@@ -6,11 +6,12 @@
 //! selectors, or synchronization algorithms. The media route is only needed
 //! when optional binary asset archiving is enabled.
 //!
-//! The public feed route reads persisted XML cache bytes and returns them
-//! immediately.
-//! Stale-cache requests may enqueue a deduplicated rebuild but never wait for
-//! browser work. Feed freshness and rebuild orchestration belong to
-//! `application::feed_service`, not Axum handlers.
+//! The public feed route reads fresh persisted XML cache bytes immediately.
+//! Missing or expired cache rows invoke the database-only rebuild capability
+//! and return the newly published bytes; if another builder is active, the
+//! application service waits only for its bounded request timeout. Feed
+//! freshness and rebuild orchestration belong to `application::feed_service`,
+//! not Axum handlers.
 //!
 //! API readiness remains available for cached RSS when browser workers are
 //! degraded. Administrative routes are registered only when complete

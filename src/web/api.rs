@@ -9,13 +9,12 @@
 //! application services. Access and refresh tokens must never appear in
 //! response DTOs, tracing fields, or error messages.
 //!
-//! The feed handler delegates to `FeedService`, emits its ETag/Last-Modified and
-//! freshness metadata, and supports conditional requests without invoking
-//! acquisition code. It must not reset a stale row to a fresh 30-minute HTTP
-//! lifetime.
-//! A true cache miss owned by another live feed-build lease may poll only for a
-//! short configured bound; if no document appears, the handler maps the typed
-//! result to `503 Service Unavailable` with `Retry-After`.
+//! The feed handler delegates to `FeedService`, emits its ETag/Last-Modified
+//! and freshness metadata, and supports conditional requests. A missing or
+//! expired cache is rebuilt synchronously from normalized database records
+//! before the response is returned; if another live feed-build lease owns the
+//! work, the service waits only for its configured bound and maps an
+//! unavailable miss to `503 Service Unavailable` with `Retry-After`.
 //!
 //! Liveness is process-only. API readiness requires PostgreSQL but remains ready
 //! to serve persisted feeds when the browser component is degraded; browser
@@ -38,6 +37,7 @@ use sqlx::PgPool;
 
 use crate::{
     application::{
+        feed_rebuild_service::FeedRebuilder,
         feed_service::{
             FeedCacheStatus, FeedDelivery, FeedRebuildQueue, FeedService, FeedServiceError,
         },
@@ -54,10 +54,11 @@ use crate::{
 /// Token resolution and cache delivery remain separate application calls. A
 /// syntactically invalid, unknown, or revoked token always receives the same
 /// `404` response, while storage failures receive `503` without exposing
-/// repository details. The route never renders XML or starts browser work.
-pub fn feed_router<R, C, Q>(
+/// repository details. The route never starts browser work; a cache rebuild,
+/// when needed, uses only normalized database records.
+pub fn feed_router<R, C, Q, B>(
     token_service: FeedTokenService<R>,
-    feed_service: FeedService<C, Q>,
+    feed_service: FeedService<C, Q, B>,
     pool: PgPool,
     timezone: Tz,
 ) -> Router
@@ -65,6 +66,7 @@ where
     R: FeedTokenRepository + 'static,
     C: FeedCacheRepository + 'static,
     Q: FeedRebuildQueue + 'static,
+    B: FeedRebuilder + 'static,
 {
     let state = Arc::new(FeedApiState {
         token_service,
@@ -74,16 +76,16 @@ where
     });
     Router::new()
         .route("/api/health", get(liveness))
-        .route("/api/ready", get(readiness::<R, C, Q>))
+        .route("/api/ready", get(readiness::<R, C, Q, B>))
         // Axum does not allow a literal suffix in the same segment as a path
         // parameter, so the handler validates the exact `.xml` shape below.
-        .route("/feeds/{*feed_path}", get(feed::<R, C, Q>))
+        .route("/feeds/{*feed_path}", get(feed::<R, C, Q, B>))
         .with_state(state)
 }
 
-struct FeedApiState<R, C, Q> {
+struct FeedApiState<R, C, Q, B> {
     token_service: FeedTokenService<R>,
-    feed_service: FeedService<C, Q>,
+    feed_service: FeedService<C, Q, B>,
     pool: PgPool,
     timezone: Tz,
 }
@@ -101,11 +103,12 @@ async fn liveness() -> impl IntoResponse {
 /// configured timezone. Database errors are not returned to callers because
 /// they may contain connection details.
 #[tracing::instrument(skip_all, level = "debug")]
-async fn readiness<R, C, Q>(State(state): State<Arc<FeedApiState<R, C, Q>>>) -> Response
+async fn readiness<R, C, Q, B>(State(state): State<Arc<FeedApiState<R, C, Q, B>>>) -> Response
 where
     R: FeedTokenRepository + 'static,
     C: FeedCacheRepository + 'static,
     Q: FeedRebuildQueue + 'static,
+    B: FeedRebuilder + 'static,
 {
     let database_check = sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.pool)
@@ -132,8 +135,8 @@ where
         .into_response()
 }
 
-async fn feed<R, C, Q>(
-    State(state): State<Arc<FeedApiState<R, C, Q>>>,
+async fn feed<R, C, Q, B>(
+    State(state): State<Arc<FeedApiState<R, C, Q, B>>>,
     Path(feed_path): Path<String>,
     headers: HeaderMap,
 ) -> Response
@@ -141,6 +144,7 @@ where
     R: FeedTokenRepository + 'static,
     C: FeedCacheRepository + 'static,
     Q: FeedRebuildQueue + 'static,
+    B: FeedRebuilder + 'static,
 {
     tracing::trace!("handling feed request");
     let Some(feed_token) = feed_path

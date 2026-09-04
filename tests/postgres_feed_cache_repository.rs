@@ -2,6 +2,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 use werrss::{
+    application::feed_rebuild_service::{
+        FeedRebuildConfig, FeedRebuildDependencies, FeedRebuildService,
+    },
     application::feed_service::{
         FeedDelivery, FeedRebuildJobConfig, FeedRebuildStatus, FeedRequest, FeedService,
         FeedServiceConfig, PostgresFeedRebuildQueue,
@@ -11,12 +14,14 @@ use werrss::{
         source::{FeedRevision, SourceId},
     },
     persistence::{
+        repositories::article_repository::PostgresArticleRepository,
         repositories::feed_cache_repository::{
             FeedBuildLeaseRepository, FeedCachePublishResult, FeedCacheRepository,
             FeedCacheTransactionRepository, PostgresFeedBuildLeaseRepository,
             PostgresFeedCacheRepository,
         },
         repositories::job_repository::PostgresJobRepository,
+        repositories::source_repository::PostgresSourceRepository,
         unit_of_work::UnitOfWorkFactory,
     },
     rss::renderer::{RenderArticle, RenderFeedInput, RssRenderer},
@@ -157,7 +162,7 @@ async fn rendered_feed_candidate_publishes_through_fenced_cache_path(pool: PgPoo
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
-async fn feed_service_serves_stale_cache_and_deduplicates_rebuild_jobs(pool: PgPool) {
+async fn feed_service_rebuilds_an_expired_cache_before_delivery(pool: PgPool) {
     let source_id = insert_source(&pool, 1).await;
     let lease_repository = PostgresFeedBuildLeaseRepository::new(pool.clone());
     publish(
@@ -171,58 +176,65 @@ async fn feed_service_serves_stale_cache_and_deduplicates_rebuild_jobs(pool: PgP
         PostgresJobRepository::new(pool.clone()),
         FeedRebuildJobConfig::default(),
     );
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let rebuild_service = FeedRebuildService::new(
+        FeedRebuildDependencies::new(
+            PostgresSourceRepository::new(pool.clone()),
+            PostgresArticleRepository::new(pool.clone()),
+            PostgresFeedBuildLeaseRepository::new(pool.clone()),
+            factory,
+        ),
+        FeedRebuildConfig::new(
+            chrono::Duration::minutes(5),
+            chrono::Duration::minutes(30),
+            "https://feeds.example.test/werrss.xml",
+            "Integration test feed",
+        )
+        .expect("feed rebuild configuration should be valid"),
+        "api-feed-builder",
+    )
+    .expect("feed rebuild service should be constructible");
     let service = FeedService::new(
         PostgresFeedCacheRepository::new(pool.clone()),
         queue,
+        rebuild_service,
         FeedServiceConfig::default(),
     );
 
     let first = service
         .get_feed(FeedRequest::new(source_id, None))
         .await
-        .expect("stale cache should be returned");
+        .expect("stale cache should be rebuilt");
     assert!(matches!(
         first,
         FeedDelivery::Cached {
-            status: werrss::application::feed_service::FeedCacheStatus::Stale,
-            rebuild: FeedRebuildStatus::Enqueued,
+            status: werrss::application::feed_service::FeedCacheStatus::Fresh,
+            rebuild: FeedRebuildStatus::Rebuilt,
             cache,
-        } if cache.xml_bytes() == b"stale-feed"
+        } if String::from_utf8_lossy(cache.xml_bytes()).contains("Test source")
     ));
 
     let second = service
         .get_feed(FeedRequest::new(source_id, None))
         .await
-        .expect("duplicate stale request should still be served");
+        .expect("fresh rebuilt cache should be served");
     assert!(matches!(
         second,
         FeedDelivery::Cached {
-            rebuild: FeedRebuildStatus::AlreadyActive,
+            status: werrss::application::feed_service::FeedCacheStatus::Fresh,
+            rebuild: FeedRebuildStatus::NotNeeded,
             ..
         }
     ));
 
-    let job_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE dedupe_key = $1 AND status = 'queued'")
-            .bind(format!("feed_rebuild:{source_id}"))
-            .fetch_one(&pool)
-            .await
-            .expect("rebuild job should be queryable");
-    assert_eq!(job_count, 1);
-
-    let (run_after, created_at, updated_at): (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) =
-        sqlx::query_as("SELECT run_after, created_at, updated_at FROM jobs WHERE dedupe_key = $1")
-            .bind(format!("feed_rebuild:{source_id}"))
-            .fetch_one(&pool)
-            .await
-            .expect("rebuild timestamps should be queryable");
-    let database_now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
-        .fetch_one(&pool)
-        .await
-        .expect("database time should be queryable");
-    assert!(run_after <= database_now);
-    assert!(created_at <= database_now);
-    assert_eq!(created_at, updated_at);
+    let job_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE source_id = $1 AND job_type = 'feed_rebuild'",
+    )
+    .bind(source_id.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .expect("rebuild jobs should be queryable");
+    assert_eq!(job_count, 0);
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]

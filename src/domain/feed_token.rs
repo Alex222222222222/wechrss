@@ -23,8 +23,8 @@
 //! the persistence boundary, so replicas can resolve the same token from the
 //! shared database without a process-local secret map. Hash equality is
 //! deterministic and safe to index. RSS-cache behavior is intentionally
-//! separate: token lookup selects a source, then the cache-first feed service
-//! reads that source's already-rendered bytes.
+//! separate: token lookup selects a source, then the feed service reads or
+//! rebuilds that source's cache.
 
 use std::fmt;
 

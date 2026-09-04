@@ -2,9 +2,9 @@
 //!
 //! This service turns the current normalized source/article snapshot into a
 //! revision-aware feed-cache candidate. It is intentionally separate from
-//! [`super::feed_service::FeedService`]: the feed request path only reads
-//! cached bytes, while this path is allowed to load articles, render XML, and
-//! publish through the fenced cache transaction.
+//! [`super::feed_service::FeedService`]: this path is allowed to load articles,
+//! render XML, and publish through the fenced cache transaction, while feed
+//! delivery decides when a request should invoke it.
 //!
 //! Responsibilities:
 //!
@@ -55,7 +55,7 @@
 //! failures, renderer validation failures, lease loss, and transaction errors
 //! do not report a successful rebuild. Cleanup errors are logged while the
 //! primary error is preserved; an unclean lease remains bounded by its durable
-//! expiry. The service never falls back to rendering on the RSS request path.
+//! expiry.
 
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
@@ -262,6 +262,13 @@ pub enum FeedRebuildError {
     /// Settings became impossible to apply at the current clock instant.
     #[error(transparent)]
     Config(#[from] FeedRebuildConfigError),
+}
+
+/// Capability used by feed delivery to rebuild one source synchronously.
+#[async_trait::async_trait]
+pub trait FeedRebuilder: Send + Sync {
+    /// Rebuilds and publishes the current feed-cache snapshot for `source_id`.
+    async fn rebuild(&self, source_id: SourceId) -> Result<FeedRebuildOutcome, FeedRebuildError>;
 }
 
 /// Transaction-scoped feed-cache publication capability.
@@ -558,6 +565,19 @@ where
                 "unable to release failed feed rebuild lease"
             );
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl<S, A, L, U> FeedRebuilder for FeedRebuildService<S, A, L, U>
+where
+    S: SourceReader,
+    A: ArticleRepository,
+    L: FeedBuildLeaseRepository,
+    U: FeedRebuildUnitOfWorkFactory,
+{
+    async fn rebuild(&self, source_id: SourceId) -> Result<FeedRebuildOutcome, FeedRebuildError> {
+        FeedRebuildService::rebuild(self, source_id).await
     }
 }
 

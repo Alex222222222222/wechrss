@@ -406,8 +406,8 @@ pub struct AppConfig {
     /// Bounded wait associated with a cache miss before returning retry advice.
     pub rss_cache_miss_wait: Duration,
     /// Optional canonical public URL written to generated RSS channel links.
-    /// A feed worker requires this value because no placeholder URL is safe to
-    /// publish.
+    /// The API and worker roles require this value because no placeholder URL
+    /// is safe to publish when a feed is rebuilt on demand.
     pub server_root_url: Option<Url>,
     /// Duration for which one feed rebuild may hold its distributed lease.
     pub feed_build_lease: Duration,

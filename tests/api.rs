@@ -18,6 +18,7 @@ use werrss::{
             AuthService, AuthServiceConfig, AuthServiceDependencies, ManualCredentialRefresher,
             RingCredentialCipher,
         },
+        feed_rebuild_service::{FeedRebuildConfig, FeedRebuildDependencies, FeedRebuildService},
         feed_service::{
             FeedRebuildJobConfig, FeedService, FeedServiceConfig, PostgresFeedRebuildQueue,
         },
@@ -28,10 +29,12 @@ use werrss::{
     persistence::{
         repositories::{
             account_lease_repository::PostgresAccountLeaseRepository,
+            article_repository::PostgresArticleRepository,
             credential_repository::PostgresCredentialRepository,
             feed_cache_repository::{
-                FeedBuildLeaseRepository, FeedCachePublishResult, FeedCacheTransactionRepository,
-                PostgresFeedBuildLeaseRepository, PostgresFeedCacheRepository,
+                FeedBuildLeaseRepository, FeedCachePublishResult, FeedCacheRepository,
+                FeedCacheTransactionRepository, PostgresFeedBuildLeaseRepository,
+                PostgresFeedCacheRepository,
             },
             feed_token_repository::PostgresFeedTokenRepository,
             job_repository::PostgresJobRepository,
@@ -716,6 +719,18 @@ async fn admin_source_update_rejects_conflicting_book_id_without_mutating_source
     )
     .await;
     let source_id = created["id"].as_str().unwrap().to_owned();
+
+    create_admin_source(
+        &app,
+        &cookie,
+        csrf,
+        serde_json::json!({
+            "book_id": "book-explicit",
+            "display_name": "Existing source",
+            "article_url": "https://mp.weixin.qq.com/s/existing"
+        }),
+    )
+    .await;
 
     let conflicting_update = app
         .clone()
@@ -1431,7 +1446,7 @@ async fn feed_route_rejects_non_xml_and_nested_paths(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
-async fn feed_route_returns_retry_after_for_a_cache_miss(pool: PgPool) {
+async fn feed_route_builds_and_returns_a_feed_on_a_cache_miss(pool: PgPool) {
     let source_id = insert_source(&pool).await;
     let token = FeedTokenService::new(PostgresFeedTokenRepository::new(pool.clone()))
         .issue(source_id)
@@ -1444,21 +1459,25 @@ async fn feed_route_returns_retry_after_for_a_cache_miss(pool: PgPool) {
         .oneshot(get_request(&path, None))
         .await
         .expect("cache-miss request should complete");
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response
-            .headers()
-            .get(header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok()),
-        Some("5")
+        response.headers()[header::CONTENT_TYPE],
+        "application/rss+xml; charset=utf-8"
     );
-    assert_eq!(
-        to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("cache-miss body should be readable")
-            .len(),
-        0
-    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("cache-miss body should be readable");
+    let body = String::from_utf8(body.to_vec()).expect("feed body should be UTF-8");
+    assert!(body.contains("<rss"));
+    assert!(body.contains("API integration source"));
+
+    let cached = PostgresFeedCacheRepository::new(pool.clone())
+        .get(source_id)
+        .await
+        .expect("rebuilt cache should be queryable")
+        .expect("cache miss should publish a cache row");
+    assert!(cached.is_fresh());
+    assert_eq!(cached.cache().xml_bytes(), body.as_bytes());
 
     let queued: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM jobs WHERE source_id = $1 AND job_type = 'feed_rebuild'",
@@ -1467,7 +1486,7 @@ async fn feed_route_returns_retry_after_for_a_cache_miss(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("rebuild job should be queryable");
-    assert_eq!(queued, 1);
+    assert_eq!(queued, 0);
 }
 
 fn router(pool: &PgPool) -> axum::Router {
@@ -1476,9 +1495,27 @@ fn router(pool: &PgPool) -> axum::Router {
         PostgresJobRepository::new(pool.clone()),
         FeedRebuildJobConfig::default(),
     );
+    let rebuild_service = FeedRebuildService::new(
+        FeedRebuildDependencies::new(
+            PostgresSourceRepository::new(pool.clone()),
+            PostgresArticleRepository::new(pool.clone()),
+            PostgresFeedBuildLeaseRepository::new(pool.clone()),
+            UnitOfWorkFactory::new(pool.clone()),
+        ),
+        FeedRebuildConfig::new(
+            Duration::minutes(5),
+            Duration::minutes(30),
+            "https://feeds.example.test/werrss.xml",
+            "API integration feed",
+        )
+        .expect("feed rebuild configuration should be valid"),
+        "api-feed-builder",
+    )
+    .expect("feed rebuild service should be constructible");
     let feed_service = FeedService::new(
         PostgresFeedCacheRepository::new(pool.clone()),
         queue,
+        rebuild_service,
         FeedServiceConfig::default(),
     );
     feed_router(token_service, feed_service, pool.clone(), UTC)

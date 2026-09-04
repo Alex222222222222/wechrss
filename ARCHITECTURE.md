@@ -196,13 +196,14 @@ enabled, asset writes must be deduplicated as well.
 
 1. The feed route reads one cached XML document from `feed_cache`.
 2. A fresh cache is returned immediately with its ETag.
-3. A stale cache is returned immediately while a deduplicated rebuild job is
-   enqueued. A stale response is not advertised as fresh to downstream caches.
-4. In the current cache-first implementation, a cache miss enqueues a
-   deduplicated rebuild and returns a typed temporary-unavailable result with
-   `Retry-After`; it does not render in the request. A future database-only
-   single-flight/CAS path may populate and return the first document. Concurrent
-   misses must not all render and overwrite the same source feed.
+3. An expired or missing cache invokes the database-only rebuild service. The
+   rebuild lease and fenced publication ensure that concurrent requests do not
+   overwrite one another, and the request reads the fresh published bytes back
+   before returning them.
+4. If another builder already owns the lease, the request polls for a bounded
+   period. If rebuilding fails or that period expires, an expired cache remains
+   available as a stale fallback; a true miss returns `503` with `Retry-After`
+   and a deduplicated background rebuild is retained when possible.
 
 RSS requests never start browser work or wait for a synchronization job.
 
@@ -304,8 +305,10 @@ Version one keeps the custom PostgreSQL `jobs` table as the authoritative
 application queue. It owns the durable job lifecycle, active-job
 deduplication, retry and failure counters, quiet-hours deferral, leases,
 fencing tokens, and the transaction-scoped completion contract. The
-cache-first `FeedService` currently enqueues `feed_rebuild` rows through this
-table using the canonical `feed_rebuild:{source_id}` key.
+cache-first `FeedService` invokes the database-only rebuild capability for
+missing or expired caches and enqueues `feed_rebuild` rows through this table
+using the canonical `feed_rebuild:{source_id}` key only when request-time
+rebuilding cannot complete.
 
 PGMQ is a possible future transport optimization, not a version-one
 replacement for the `jobs` table. If it is evaluated later, the safe hybrid
@@ -619,11 +622,12 @@ source_id, lease_owner, lease_token, lease_until, heartbeat_at, created_at,
 updated_at
 ```
 
-When a stale cache exists, non-owners return it immediately. On a true cache
-miss, a non-owner does not render concurrently: it performs a short bounded poll
-for the lease owner's result and otherwise returns a typed temporary-unavailable
-response with `Retry-After`. Expired build leases are safely takeable by another
-replica.
+When an expired cache exists, non-owners wait for the lease owner's fresh
+result for the configured bound and then return the expired bytes only if the
+fresh result is unavailable. On a true cache miss, a non-owner does not render
+concurrently: it performs the same bounded poll and otherwise returns a typed
+temporary-unavailable response with `Retry-After`. Expired build leases are
+safely takeable by another replica.
 
 The feed endpoint returns `ETag`, `Last-Modified`, and `Cache-Control`. The
 initial route uses `max-age=0, must-revalidate` for fresh responses because the
@@ -658,7 +662,8 @@ enqueues work and applies quiet-hours eligibility. `SyncService` executes
 claimed work and re-checks quiet hours between upstream operations.
 `ArchiveService` owns the content pipeline. `JobService` owns leases and
 transitions. `FeedService` owns conditional reads, fresh/stale/missing
-decisions, and deduplicated rebuild enqueueing over the persisted cache.
+decisions, on-demand database-only rebuilding, and deduplicated retry
+enqueueing over the persisted cache.
 Single-flight cache population is coordinated by the durable feed-build lease,
 and database-only rebuild orchestration is implemented by
 `FeedRebuildService`. Application services receive a `UnitOfWorkFactory` for
@@ -851,7 +856,9 @@ CREDENTIAL_ENCRYPTION_KEY
 ```
 
 `APP_TIMEZONE` is an IANA timezone name and defaults to `UTC`. `APP_ROLES`
-defaults to `api`; worker startup additionally requires `SERVER_ROOT_URL`.
+defaults to `api`; API and worker startup additionally require
+`SERVER_ROOT_URL` because either role may build a missing or expired feed
+cache on demand.
 `APP_INSTANCE_ID` may be omitted for local use; the loader then generates a
 random per-process UUID so application replicas do not share job-lease
 ownership. `WORKER_CONCURRENCY` defaults to `1`, and account/feed-build
@@ -1057,8 +1064,9 @@ than add more empty module shells. Work proceeds in this order:
    lease repositories are also executable. No source or feed application
    service may bypass these boundaries with convenience transactions.
 3. Make `FeedService` executable over the persisted cache (cache-first
-   delivery and deduplicated rebuild enqueueing are implemented). The worker
-   supports committing its fenced outcome through `UnitOfWork`, and
+   delivery, on-demand database-only rebuilding, and deduplicated retry
+   enqueueing are implemented). The worker supports committing its fenced
+   outcome through `UnitOfWork`, and
    `FeedRebuildService::rebuild_for_job` now couples successful feed-cache
    finalization to that outcome. Add the remaining source/archive queries; the
    `FeedRebuildJobHandler` already maps pre-publication rebuild failures to
@@ -1133,10 +1141,11 @@ persistence, binary asset persistence, URL rewriting, and other repository
 views remain future work. The pure RSS renderer in
 `src/rss/renderer.rs` is executable and produces revision-tagged cache
 candidates. The cache-first `FeedService` in
-`src/application/feed_service.rs` is also executable: it serves fresh or stale
-rows, honors conditional ETags, and enqueues deduplicated rebuild jobs through
-the custom `jobs` table adapter. It is wired to the public tokenized feed route
-in `src/web/api.rs`; feed-token resolution itself is implemented by
+`src/application/feed_service.rs` is also executable: it serves fresh rows,
+rebuilds missing or expired rows on demand, honors conditional ETags, and
+enqueues deduplicated retry jobs through the custom `jobs` table adapter when a
+request-time rebuild cannot complete. It is wired to the public tokenized feed
+route in `src/web/api.rs`; feed-token resolution itself is implemented by
 `FeedTokenService`. `FeedRebuildService` reads normalized source
 and article rows, renders outside a transaction, and publishes through the
 revision/fence-aware feed-cache transaction. Its `rebuild_for_job` path also
@@ -1144,7 +1153,7 @@ completes a claimed `feed_rebuild` job in that same final unit of work on
 successful finalization; `FeedRebuildJobHandler` maps active builders and
 pre-publication failures to safe worker outcomes without double-completing a
 successful job. `FeedService` is HTTP-wired by the public tokenized feed route;
-the rebuild service remains an internal worker dependency.
+the rebuild service is shared by the worker and the request-time feed path.
 
 The one-pass scheduler wrapper in `src/application/scheduler.rs` now forwards
 the configured quiet-hours policy to the atomic source-scheduling operation.

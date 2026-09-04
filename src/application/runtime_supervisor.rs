@@ -95,6 +95,13 @@ type FeedRebuildHandler = FeedRebuildJobHandler<
     UnitOfWorkFactory,
 >;
 
+type RuntimeFeedRebuildService = FeedRebuildService<
+    PostgresSourceRepository,
+    PostgresArticleRepository,
+    PostgresFeedBuildLeaseRepository,
+    UnitOfWorkFactory,
+>;
+
 type SourceSyncHandler = SourceSyncJobHandler<
     PostgresSourceRepository,
     PostgresArticleRepository,
@@ -303,7 +310,11 @@ impl RuntimeSupervisor {
 
     fn validated_plan(config: &AppConfig) -> Result<RuntimePlan, RuntimeSupervisorError> {
         let plan = RuntimePlan::from_config(config).map_err(RuntimeSupervisorError::Plan)?;
-        if plan.component(AppRole::Worker).is_some() && config.server_root_url.is_none() {
+        // The API can rebuild a missing/expired feed cache on demand, so it
+        // needs the same canonical channel URL as a feed worker.
+        let feed_builder_required =
+            plan.component(AppRole::Api).is_some() || plan.component(AppRole::Worker).is_some();
+        if feed_builder_required && config.server_root_url.is_none() {
             return Err(RuntimeSupervisorError::ServerRootUrlNotConfigured);
         }
         Ok(plan)
@@ -480,9 +491,12 @@ impl RuntimeSupervisor {
             PostgresJobRepository::new(self.pool.clone()),
             queue_config,
         );
+        let rebuild_service =
+            self.build_feed_rebuild_service(format!("{}-feed-api", self.config.instance_id))?;
         let feed_service = FeedService::new(
             PostgresFeedCacheRepository::new(self.pool.clone()),
             queue,
+            rebuild_service,
             feed_config,
         );
         let mut router = feed_router(
@@ -566,17 +580,7 @@ impl RuntimeSupervisor {
         let retry_after = chrono_duration(self.config.job_poll_interval, "JOB_POLL_SECONDS")?;
         let rebuild_config = self.feed_rebuild_config(lease_for, cache_ttl)?;
         let owner = format!("{}-feed-worker-{worker_index}", self.config.instance_id);
-        let rebuild_service = FeedRebuildService::new(
-            FeedRebuildDependencies::new(
-                PostgresSourceRepository::new(self.pool.clone()),
-                PostgresArticleRepository::new(self.pool.clone()),
-                PostgresFeedBuildLeaseRepository::new(self.pool.clone()),
-                UnitOfWorkFactory::new(self.pool.clone()),
-            ),
-            rebuild_config,
-            owner,
-        )
-        .map_err(RuntimeSupervisorError::FeedRebuild)?;
+        let rebuild_service = self.build_feed_rebuild_service_with_config(rebuild_config, owner)?;
         let handler_config = FeedRebuildJobHandlerConfig::new(retry_after)
             .map_err(RuntimeSupervisorError::FeedRebuildHandlerConfig)?;
         let feed_handler = FeedRebuildJobHandler::new(rebuild_service, handler_config);
@@ -752,6 +756,34 @@ impl RuntimeSupervisor {
         )
         .map_err(RuntimeSupervisorError::FeedRebuildConfig)
     }
+
+    fn build_feed_rebuild_service(
+        &self,
+        owner: impl Into<String>,
+    ) -> Result<RuntimeFeedRebuildService, RuntimeSupervisorError> {
+        let lease_for = chrono_duration(self.config.feed_build_lease, "FEED_BUILD_LEASE_SECONDS")?;
+        let cache_ttl = chrono_duration(self.config.rss_cache_ttl, "RSS_CACHE_TTL_SECONDS")?;
+        let rebuild_config = self.feed_rebuild_config(lease_for, cache_ttl)?;
+        self.build_feed_rebuild_service_with_config(rebuild_config, owner)
+    }
+
+    fn build_feed_rebuild_service_with_config(
+        &self,
+        rebuild_config: FeedRebuildConfig,
+        owner: impl Into<String>,
+    ) -> Result<RuntimeFeedRebuildService, RuntimeSupervisorError> {
+        FeedRebuildService::new(
+            FeedRebuildDependencies::new(
+                PostgresSourceRepository::new(self.pool.clone()),
+                PostgresArticleRepository::new(self.pool.clone()),
+                PostgresFeedBuildLeaseRepository::new(self.pool.clone()),
+                UnitOfWorkFactory::new(self.pool.clone()),
+            ),
+            rebuild_config,
+            owner,
+        )
+        .map_err(RuntimeSupervisorError::FeedRebuild)
+    }
 }
 
 async fn bind_listener(
@@ -841,8 +873,8 @@ pub enum RuntimeSupervisorError {
     /// The source-sync handler could not be configured.
     #[error("source-sync handler could not be configured")]
     SourceSyncNotConfigured,
-    /// Feed workers must not publish a placeholder channel URL.
-    #[error("SERVER_ROOT_URL is required when the worker role is enabled")]
+    /// API and feed workers must not publish a placeholder channel URL.
+    #[error("SERVER_ROOT_URL is required when the API or worker role is enabled")]
     ServerRootUrlNotConfigured,
     /// PostgreSQL could not be reached.
     #[error("database connection failed")]
@@ -1158,6 +1190,17 @@ mod tests {
             rebuild_config.feed_url(),
             "https://feeds.example.test/werrss.xml"
         );
+    }
+
+    #[tokio::test]
+    async fn api_requires_a_configured_feed_url_for_on_demand_rebuilds() {
+        let mut config = config("api");
+        config.server_root_url = None;
+
+        assert!(matches!(
+            RuntimeSupervisor::new(config, lazy_pool()),
+            Err(RuntimeSupervisorError::ServerRootUrlNotConfigured)
+        ));
     }
 
     #[tokio::test]

@@ -1,11 +1,10 @@
-//! Cache-first feed delivery and rebuild enqueueing.
+//! Cache-first feed delivery and on-demand feed rebuilding.
 //!
 //! This module is the executable part of the feed request boundary. It reads
-//! the persisted cache, honors conditional requests, serves stale bytes without
-//! waiting for upstream synchronization, and enqueues one deduplicated
-//! `feed_rebuild` job when the cache is stale or missing. Rendering and fenced
-//! publication remain separate use cases because neither belongs on the RSS
-//! request's latency-sensitive path.
+//! the persisted cache, honors conditional requests, and rebuilds an expired
+//! or missing cache before returning the response. Rendering and fenced
+//! publication remain separate use cases from cache reads, while the durable
+//! `feed_rebuild` job remains available as a failure fallback.
 //!
 //! Responsibilities:
 //!
@@ -13,8 +12,8 @@
 //! - return a typed cached, not-modified, or temporarily-unavailable result;
 //! - recognize normal HTTP `If-None-Match` forms, including lists, weak
 //!   validators, quoted validators, and `*`;
-//! - enqueue a rebuild through an application port while allowing a stale
-//!   response to succeed if that enqueue fails; and
+//! - rebuild a missing or expired cache synchronously before delivery, with a
+//!   bounded wait when another builder already owns the build lease; and
 //! - provide the v1 adapter from that port to the existing PostgreSQL `jobs`
 //!   table.
 //!
@@ -25,22 +24,23 @@
 //! waits for a synchronization job.
 //!
 //! Expected interfaces: the web layer supplies a source id and an optional
-//! `If-None-Match` value; a [`FeedCacheRepository`] performs one fast read; and
-//! a [`FeedRebuildQueue`] maps a source to the canonical active-job dedupe key.
-//! `FeedTokenService` can be placed in front of this service without changing
-//! its cache or queue contracts.
+//! `If-None-Match` value; a [`FeedCacheRepository`] performs cache reads;
+//! [`FeedRebuilder`] performs the database-only render/publication operation;
+//! and [`FeedRebuildQueue`] maps a failed request to the canonical active-job
+//! dedupe key. `FeedTokenService` can be placed in front of this service
+//! without changing its cache or rebuild contracts.
 //!
 //! Data flow: a fresh cache is returned immediately, optionally as 304 when
-//! its ETag matches. A stale cache is returned immediately and asks the queue
-//! for `feed_rebuild:{source_id}`. A miss asks the same queue and returns a
-//! bounded retry result; it does not render synchronously. The queue's active
-//! uniqueness constraint provides cross-replica single-flight for rebuild
-//! requests.
+//! its ETag matches. A stale cache or miss invokes the rebuild capability and
+//! reads the fresh cache back before constructing the response. The rebuild
+//! service's distributed build lease provides cross-replica single-flight. If
+//! rebuilding fails or the bounded wait expires, stale content remains
+//! available and a cache miss returns `Retry-After` information.
 //!
 //! Failure behavior: cache storage errors are returned because no response
-//! metadata can be trusted. Queue errors are represented as
+//! metadata can be trusted. Rebuild and queue errors are represented as
 //! [`FeedRebuildStatus::Unavailable`]; stale content remains available, while
-//! a miss returns `Retry-After` information. Queue failures should be logged or
+//! a miss returns `Retry-After` information. Failures should be logged or
 //! metered by the application boundary without exposing database URLs or
 //! credentials.
 //!
@@ -53,18 +53,20 @@
 //! future transport optimization while the `jobs` row remains authoritative.
 //!
 //! The database-only rebuild orchestration lives in
-//! [`super::feed_rebuild_service::FeedRebuildService`], keeping rendering and
-//! publication off this latency-sensitive request path.
+//! [`super::feed_rebuild_service::FeedRebuildService`]. It is intentionally
+//! invoked only for cache misses/expiry, so fresh requests remain a fast read.
 
-use std::fmt;
+use std::{fmt, time::Duration as StdDuration};
 
 use chrono::{Duration, Utc};
 use serde_json::json;
 use thiserror::Error;
+use tokio::time::{sleep, Instant};
 
 use crate::{
+    application::feed_rebuild_service::{FeedRebuildOutcome, FeedRebuilder},
     domain::{
-        feed::FeedCache,
+        feed::{FeedCache, FeedCacheRead},
         job::{JobType, NewJob},
         source::SourceId,
     },
@@ -108,6 +110,8 @@ pub enum FeedCacheStatus {
 pub enum FeedRebuildStatus {
     /// No rebuild was needed because the cache was fresh.
     NotNeeded,
+    /// The request rebuilt and published the cache itself.
+    Rebuilt,
     /// This request inserted the active rebuild job.
     Enqueued,
     /// A rebuild job already exists for this source.
@@ -126,7 +130,7 @@ pub enum FeedDelivery {
         cache: FeedCache,
         /// Whether the cached row is current and unexpired.
         status: FeedCacheStatus,
-        /// Rebuild enqueue result, if the row was stale.
+        /// On-demand rebuild or fallback-queue result, if the row was stale.
         rebuild: FeedRebuildStatus,
     },
     /// Cached XML bytes should be returned with a 200 response.
@@ -135,14 +139,14 @@ pub enum FeedDelivery {
         cache: FeedCache,
         /// Whether the cached row is current and unexpired.
         status: FeedCacheStatus,
-        /// Rebuild enqueue result, if the row was stale.
+        /// On-demand rebuild or fallback-queue result, if the row was stale.
         rebuild: FeedRebuildStatus,
     },
     /// No cache row was available and the caller should retry later.
     Unavailable {
         /// Suggested delay before trying the feed again.
         retry_after: Duration,
-        /// Rebuild enqueue result for the cache miss.
+        /// On-demand rebuild or fallback-queue result for the cache miss.
         rebuild: FeedRebuildStatus,
     },
 }
@@ -347,82 +351,159 @@ pub enum FeedServiceError {
 }
 
 /// Cache-first feed delivery service.
-pub struct FeedService<C, Q> {
+pub struct FeedService<C, Q, B> {
     cache: C,
     rebuild_queue: Q,
+    rebuilder: B,
     config: FeedServiceConfig,
 }
 
-impl<C, Q> FeedService<C, Q>
+impl<C, Q, B> FeedService<C, Q, B>
 where
     C: FeedCacheRepository,
     Q: FeedRebuildQueue,
+    B: FeedRebuilder,
 {
-    /// Creates a service over one cache reader and one durable rebuild queue.
-    pub fn new(cache: C, rebuild_queue: Q, config: FeedServiceConfig) -> Self {
+    /// Creates a service over a cache reader, durable fallback queue, and
+    /// synchronous rebuild capability.
+    pub fn new(cache: C, rebuild_queue: Q, rebuilder: B, config: FeedServiceConfig) -> Self {
         Self {
             cache,
             rebuild_queue,
+            rebuilder,
             config,
         }
     }
 
-    /// Returns cached feed bytes or a bounded temporary-unavailable result.
+    /// Returns fresh feed bytes, rebuilding a missing or expired cache first.
     #[tracing::instrument(skip_all, level = "debug", fields(source_id = %request.source_id))]
     pub async fn get_feed(&self, request: FeedRequest) -> Result<FeedDelivery, FeedServiceError> {
         validate_source_id(request.source_id)?;
-        tracing::trace!("looking up feed cache");
-        let read = match self.cache.get(request.source_id).await {
-            Ok(read) => read,
-            Err(error) => {
-                tracing::warn!(error = %error, "feed cache lookup failed");
-                return Err(error.into());
+        let read = self.read_cache(request.source_id).await?;
+        match read {
+            Some(read) if read.is_fresh() => Ok(cached_delivery(
+                &request,
+                read.cache().clone(),
+                FeedCacheStatus::Fresh,
+                FeedRebuildStatus::NotNeeded,
+            )),
+            Some(read) => {
+                tracing::debug!("feed cache is expired; rebuilding before delivery");
+                self.rebuild_and_deliver(request, Some(read.cache().clone()))
+                    .await
             }
-        };
-        let Some(read) = read else {
-            tracing::debug!("feed cache miss; requesting a rebuild");
-            let rebuild = self.enqueue_rebuild(request.source_id).await;
-            return Ok(FeedDelivery::Unavailable {
-                retry_after: self.config.cache_miss_retry_after(),
-                rebuild,
-            });
-        };
-
-        let status = if read.is_fresh() {
-            FeedCacheStatus::Fresh
-        } else {
-            FeedCacheStatus::Stale
-        };
-        let rebuild = match status {
-            FeedCacheStatus::Fresh => FeedRebuildStatus::NotNeeded,
-            FeedCacheStatus::Stale => self.enqueue_rebuild(read.cache().source_id()).await,
-        };
-        let cache = read.cache().clone();
-        tracing::debug!(
-            status = ?status,
-            feed_revision = ?cache.feed_revision(),
-            rebuild = ?rebuild,
-            "feed cache lookup completed"
-        );
-
-        if if_none_match_matches(request.if_none_match.as_deref(), cache.etag()) {
-            Ok(FeedDelivery::NotModified {
-                cache,
-                status,
-                rebuild,
-            })
-        } else {
-            Ok(FeedDelivery::Cached {
-                cache,
-                status,
-                rebuild,
-            })
+            None => {
+                tracing::debug!("feed cache is missing; rebuilding before delivery");
+                self.rebuild_and_deliver(request, None).await
+            }
         }
     }
 
     /// Returns the configured stale-while-revalidate window for HTTP mapping.
     pub const fn stale_while_revalidate(&self) -> Duration {
         self.config.stale_while_revalidate()
+    }
+
+    async fn read_cache(
+        &self,
+        source_id: SourceId,
+    ) -> Result<Option<FeedCacheRead>, FeedServiceError> {
+        tracing::trace!(%source_id, "looking up feed cache");
+        self.cache.get(source_id).await.map_err(|error| {
+            tracing::warn!(%source_id, error = %error, "feed cache lookup failed");
+            FeedServiceError::Cache(error)
+        })
+    }
+
+    async fn rebuild_and_deliver(
+        &self,
+        request: FeedRequest,
+        stale_cache: Option<FeedCache>,
+    ) -> Result<FeedDelivery, FeedServiceError> {
+        let source_id = request.source_id;
+        let rebuild = match self.rebuilder.rebuild(source_id).await {
+            Ok(FeedRebuildOutcome::AlreadyActive) => {
+                tracing::debug!(
+                    %source_id,
+                    "feed rebuild is already active; waiting for its cache"
+                );
+                FeedRebuildStatus::AlreadyActive
+            }
+            Ok(outcome) => {
+                tracing::debug!(%source_id, outcome = ?outcome, "on-demand feed rebuild completed");
+                FeedRebuildStatus::Rebuilt
+            }
+            Err(error) => {
+                tracing::warn!(%source_id, error = %error, "on-demand feed rebuild failed");
+                self.enqueue_rebuild(source_id).await
+            }
+        };
+
+        let fresh = if matches!(
+            rebuild,
+            FeedRebuildStatus::Rebuilt | FeedRebuildStatus::AlreadyActive
+        ) {
+            self.wait_for_fresh_cache(source_id).await?
+        } else {
+            None
+        };
+        if let Some(read) = fresh {
+            return Ok(cached_delivery(
+                &request,
+                read.cache().clone(),
+                FeedCacheStatus::Fresh,
+                rebuild,
+            ));
+        }
+
+        if let Some(cache) = stale_cache {
+            tracing::warn!(
+                %source_id,
+                rebuild = ?rebuild,
+                "fresh feed cache unavailable; serving expired cache"
+            );
+            return Ok(cached_delivery(
+                &request,
+                cache,
+                FeedCacheStatus::Stale,
+                rebuild,
+            ));
+        }
+
+        tracing::warn!(
+            %source_id,
+            rebuild = ?rebuild,
+            "feed rebuild did not produce a cache"
+        );
+        Ok(FeedDelivery::Unavailable {
+            retry_after: self.config.cache_miss_retry_after(),
+            rebuild,
+        })
+    }
+
+    async fn wait_for_fresh_cache(
+        &self,
+        source_id: SourceId,
+    ) -> Result<Option<FeedCacheRead>, FeedServiceError> {
+        let wait_for = self
+            .config
+            .cache_miss_retry_after()
+            .to_std()
+            .unwrap_or_else(|_| StdDuration::from_secs(1));
+        let deadline = Instant::now() + wait_for;
+        loop {
+            let read = self.read_cache(source_id).await?;
+            if read.as_ref().is_some_and(|read| read.is_fresh()) {
+                return Ok(read);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let remaining = deadline - now;
+            sleep(remaining.min(StdDuration::from_millis(25))).await;
+        }
     }
 
     async fn enqueue_rebuild(&self, source_id: SourceId) -> FeedRebuildStatus {
@@ -437,6 +518,34 @@ where
                 tracing::warn!(%source_id, error = %error, "unable to enqueue feed rebuild");
                 FeedRebuildStatus::Unavailable
             }
+        }
+    }
+}
+
+fn cached_delivery(
+    request: &FeedRequest,
+    cache: FeedCache,
+    status: FeedCacheStatus,
+    rebuild: FeedRebuildStatus,
+) -> FeedDelivery {
+    tracing::debug!(
+        source_id = %cache.source_id(),
+        status = ?status,
+        feed_revision = ?cache.feed_revision(),
+        rebuild = ?rebuild,
+        "feed cache delivery prepared"
+    );
+    if if_none_match_matches(request.if_none_match.as_deref(), cache.etag()) {
+        FeedDelivery::NotModified {
+            cache,
+            status,
+            rebuild,
+        }
+    } else {
+        FeedDelivery::Cached {
+            cache,
+            status,
+            rebuild,
         }
     }
 }
@@ -472,9 +581,12 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::domain::{
-        feed::{FeedCacheCandidate, FeedCacheRead},
-        source::FeedRevision,
+    use crate::{
+        application::feed_rebuild_service::FeedRebuildError,
+        domain::{
+            feed::{FeedCacheCandidate, FeedCacheRead},
+            source::FeedRevision,
+        },
     };
 
     #[derive(Clone)]
@@ -502,6 +614,75 @@ mod tests {
             Self {
                 read: Arc::new(Mutex::new(None)),
                 fail: true,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    enum TestRebuilderMode {
+        Publish(FeedCacheRead),
+        AlreadyActive,
+        Failing,
+    }
+
+    #[derive(Clone)]
+    struct TestRebuilder {
+        mode: TestRebuilderMode,
+        cache: Option<Arc<Mutex<Option<FeedCacheRead>>>>,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl TestRebuilder {
+        fn publishing(cache: &TestCache, read: FeedCacheRead) -> Self {
+            Self {
+                mode: TestRebuilderMode::Publish(read),
+                cache: Some(Arc::clone(&cache.read)),
+                calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn active() -> Self {
+            Self {
+                mode: TestRebuilderMode::AlreadyActive,
+                cache: None,
+                calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                mode: TestRebuilderMode::Failing,
+                cache: None,
+                calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        async fn call_count(&self) -> usize {
+            *self.calls.lock().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FeedRebuilder for TestRebuilder {
+        async fn rebuild(
+            &self,
+            source_id: SourceId,
+        ) -> Result<FeedRebuildOutcome, FeedRebuildError> {
+            *self.calls.lock().await += 1;
+            match &self.mode {
+                TestRebuilderMode::Publish(read) => {
+                    *self
+                        .cache
+                        .as_ref()
+                        .expect("publishing cache is configured")
+                        .lock()
+                        .await = Some(read.clone());
+                    Ok(FeedRebuildOutcome::Published {
+                        feed_revision: read.cache().feed_revision(),
+                    })
+                }
+                TestRebuilderMode::AlreadyActive => Ok(FeedRebuildOutcome::AlreadyActive),
+                TestRebuilderMode::Failing => Err(FeedRebuildError::SourceNotFound { source_id }),
             }
         }
     }
@@ -569,12 +750,16 @@ mod tests {
     }
 
     fn cache_read(fresh: bool) -> FeedCacheRead {
+        cache_read_with_xml(fresh, b"<rss/>")
+    }
+
+    fn cache_read_with_xml(fresh: bool, xml_bytes: &[u8]) -> FeedCacheRead {
         let source_id = source_id();
         let generated_at = at(10);
         let cache = FeedCache::from_candidate(
             FeedCacheCandidate::from_parts(
                 source_id,
-                b"<rss/>".to_vec(),
+                xml_bytes.to_vec(),
                 "sha256:test".to_owned(),
                 generated_at,
                 at(40),
@@ -589,9 +774,11 @@ mod tests {
     #[tokio::test]
     async fn fresh_matching_etag_returns_not_modified_without_enqueueing() {
         let queue = TestQueue::successful(FeedRebuildEnqueueResult::Enqueued);
+        let rebuilder = TestRebuilder::active();
         let service = FeedService::new(
             TestCache::hit(cache_read(true)),
             queue.clone(),
+            rebuilder.clone(),
             FeedServiceConfig::default(),
         );
 
@@ -612,39 +799,74 @@ mod tests {
             }
         ));
         assert_eq!(queue.request_count().await, 0);
+        assert_eq!(rebuilder.call_count().await, 0);
     }
 
     #[tokio::test]
-    async fn stale_cache_is_served_and_rebuild_is_enqueued() {
+    async fn stale_cache_is_rebuilt_and_the_fresh_result_is_returned() {
         let queue = TestQueue::successful(FeedRebuildEnqueueResult::Enqueued);
+        let cache = TestCache::hit(cache_read(false));
+        let rebuilder = TestRebuilder::publishing(&cache, cache_read_with_xml(true, b"fresh"));
         let service = FeedService::new(
-            TestCache::hit(cache_read(false)),
+            cache,
             queue.clone(),
+            rebuilder.clone(),
             FeedServiceConfig::default(),
         );
 
         let delivery = service
             .get_feed(FeedRequest::new(source_id(), None))
             .await
-            .expect("stale cache should remain serveable");
+            .expect("stale cache should be rebuilt");
 
         match delivery {
             FeedDelivery::Cached {
                 cache,
-                status: FeedCacheStatus::Stale,
-                rebuild: FeedRebuildStatus::Enqueued,
-            } => assert_eq!(cache.xml_bytes(), b"<rss/>"),
-            other => panic!("expected stale cached delivery, got {other:?}"),
+                status: FeedCacheStatus::Fresh,
+                rebuild: FeedRebuildStatus::Rebuilt,
+            } => assert_eq!(cache.xml_bytes(), b"fresh"),
+            other => panic!("expected rebuilt cached delivery, got {other:?}"),
         }
-        assert_eq!(queue.request_count().await, 1);
+        assert_eq!(queue.request_count().await, 0);
+        assert_eq!(rebuilder.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_cache_is_rebuilt_and_published_before_delivery() {
+        let queue = TestQueue::successful(FeedRebuildEnqueueResult::Enqueued);
+        let cache = TestCache::miss();
+        let rebuilder = TestRebuilder::publishing(&cache, cache_read_with_xml(true, b"built"));
+        let service = FeedService::new(
+            cache,
+            queue.clone(),
+            rebuilder.clone(),
+            FeedServiceConfig::default(),
+        );
+
+        let delivery = service
+            .get_feed(FeedRequest::new(source_id(), None))
+            .await
+            .expect("a cache miss should be rebuilt");
+
+        assert!(matches!(
+            delivery,
+            FeedDelivery::Cached {
+                cache,
+                status: FeedCacheStatus::Fresh,
+                rebuild: FeedRebuildStatus::Rebuilt,
+            } if cache.xml_bytes() == b"built"
+        ));
+        assert_eq!(queue.request_count().await, 0);
+        assert_eq!(rebuilder.call_count().await, 1);
     }
 
     #[tokio::test]
     async fn cache_miss_returns_retry_after_even_when_queue_is_temporarily_unavailable() {
         let queue = TestQueue::failing();
+        let rebuilder = TestRebuilder::failing();
         let config = FeedServiceConfig::new(Duration::minutes(1), Duration::seconds(7))
             .expect("test timing should be valid");
-        let service = FeedService::new(TestCache::miss(), queue.clone(), config);
+        let service = FeedService::new(TestCache::miss(), queue.clone(), rebuilder, config);
 
         let delivery = service
             .get_feed(FeedRequest::new(source_id(), None))
@@ -662,11 +884,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_rebuild_serves_the_expired_cache_and_queues_a_retry() {
+        let queue = TestQueue::successful(FeedRebuildEnqueueResult::Enqueued);
+        let rebuilder = TestRebuilder::failing();
+        let service = FeedService::new(
+            TestCache::hit(cache_read_with_xml(false, b"expired")),
+            queue.clone(),
+            rebuilder,
+            FeedServiceConfig::default(),
+        );
+
+        let delivery = service
+            .get_feed(FeedRequest::new(source_id(), None))
+            .await
+            .expect("an expired cache should remain available when rebuilding fails");
+
+        assert!(matches!(
+            delivery,
+            FeedDelivery::Cached {
+                cache,
+                status: FeedCacheStatus::Stale,
+                rebuild: FeedRebuildStatus::Enqueued,
+            } if cache.xml_bytes() == b"expired"
+        ));
+        assert_eq!(queue.request_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn active_rebuild_without_a_cache_returns_retryable_unavailability() {
+        let queue = TestQueue::successful(FeedRebuildEnqueueResult::Enqueued);
+        let rebuilder = TestRebuilder::active();
+        let config = FeedServiceConfig::new(Duration::zero(), Duration::milliseconds(1))
+            .expect("short test wait should be valid");
+        let service = FeedService::new(TestCache::miss(), queue.clone(), rebuilder, config);
+
+        let delivery = service
+            .get_feed(FeedRequest::new(source_id(), None))
+            .await
+            .expect("an active rebuild should produce a retryable result");
+
+        assert!(matches!(
+            delivery,
+            FeedDelivery::Unavailable {
+                rebuild: FeedRebuildStatus::AlreadyActive,
+                ..
+            }
+        ));
+        assert_eq!(queue.request_count().await, 0);
+    }
+
+    #[tokio::test]
     async fn invalid_source_and_cache_errors_are_not_converted_to_rebuilds() {
         let queue = TestQueue::successful(FeedRebuildEnqueueResult::Enqueued);
+        let rebuilder = TestRebuilder::active();
         let service = FeedService::new(
             TestCache::failing(),
             queue.clone(),
+            rebuilder,
             FeedServiceConfig::default(),
         );
 

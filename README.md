@@ -134,9 +134,9 @@ sync.
 | Variable | Default | Explanation |
 | --- | --- | --- |
 | `RSS_CACHE_TTL_SECONDS` | `1800` | Freshness period for a persisted RSS document. It must be positive. |
-| `RSS_STALE_WHILE_REVALIDATE_SECONDS` | `60` | Additional period during which stale RSS may be served while a rebuild is requested. It may be zero and is capped at 24 hours. |
-| `RSS_CACHE_MISS_WAIT_MS` | `5000` | Bounded wait associated with a cache miss before retry advice is returned. Valid range: `1`–`60000` milliseconds. |
-| `SERVER_ROOT_URL` | Unset | Public HTTP(S) root URL used to build generated RSS channel links and absolute feed links shown by the admin panel. It is required when the worker role is enabled. |
+| `RSS_STALE_WHILE_REVALIDATE_SECONDS` | `60` | Stale-cache fallback window advertised when an on-demand rebuild cannot provide fresh bytes. It may be zero and is capped at 24 hours. |
+| `RSS_CACHE_MISS_WAIT_MS` | `5000` | Maximum time a feed request waits for an on-demand rebuild or another active builder before retry advice is returned. Valid range: `1`–`60000` milliseconds. |
+| `SERVER_ROOT_URL` | Unset | Public HTTP(S) root URL used to build generated RSS channel links and absolute feed links shown by the admin panel. It is required when the API or worker role is enabled. |
 | `FEED_BUILD_LEASE_SECONDS` | `600` | Duration of a distributed feed-build lease. It must exceed its heartbeat interval. |
 | `FEED_BUILD_HEARTBEAT_SECONDS` | `60` | Maximum interval between feed-build lease heartbeats. It must be less than `FEED_BUILD_LEASE_SECONDS`. |
 
