@@ -14,6 +14,7 @@
 //! - define the small handler and outcome contracts used by worker dispatch;
 //! - keep a claimed lease alive while a handler is pending;
 //! - stop polling the handler when a heartbeat loses ownership;
+//! - recover expired leases before claiming new work;
 //! - bind success, deferral, retry, and permanent failure to the current
 //!   fencing token; and
 //! - make idle passes and transaction failures observable to the polling loop;
@@ -381,11 +382,19 @@ where
 {
     /// Claims and executes at most one job.
     ///
+    /// A bounded expired-lease recovery pass runs before claiming so work left
+    /// by a crashed worker can become claimable again.
+    ///
     /// `now` is the compatibility/test clock accepted by the queue port. The
     /// PostgreSQL adapter makes lease decisions with its own statement-local
     /// clock; the in-memory adapter uses this value deterministically.
     #[tracing::instrument(skip_all, level = "debug", fields(now = %now))]
     pub async fn run_once(&self, now: DateTime<Utc>) -> Result<WorkerRun, WorkerError> {
+        self.jobs
+            .recover_expired(now)
+            .await
+            .map_err(WorkerError::Job)?;
+
         let Some(lease) = self
             .jobs
             .claim_next(now, self.config.allowed_job_types())

@@ -58,6 +58,52 @@ async fn worker_commits_success_through_the_shared_unit_of_work(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn worker_recovers_expired_lease_before_claiming_postgres_work(pool: PgPool) {
+    let queue = PostgresJobRepository::new(pool.clone());
+    let job_id = enqueue_job(&queue, "recover-expired-lease").await;
+    let abandoned = queue
+        .claim_next(
+            "crashed-worker",
+            timestamp(1),
+            Duration::seconds(30),
+            &[JobType::SourceSync],
+        )
+        .await
+        .expect("initial claim should succeed")
+        .expect("the integration job should be claimable");
+    assert_eq!(abandoned.job.id(), job_id);
+    assert_eq!(abandoned.job.status(), JobStatus::Running);
+
+    sqlx::query(
+        "UPDATE jobs SET lease_until = clock_timestamp() - interval '1 second', heartbeat_at = clock_timestamp() - interval '1 second' WHERE id = $1",
+    )
+    .bind(job_id)
+    .execute(&pool)
+    .await
+    .expect("test should be able to expire the abandoned lease");
+
+    let worker = worker(
+        queue.clone(),
+        UnitOfWorkFactory::new(pool),
+        JobExecution::Succeeded,
+    );
+    let result = worker
+        .run_once(timestamp(1))
+        .await
+        .expect("worker should recover and complete the expired job");
+    let WorkerRun::Completed { job, outcome } = result else {
+        panic!("the recovered job should be completed")
+    };
+
+    assert_eq!(job.id(), job_id);
+    assert_eq!(outcome, JobExecution::Succeeded);
+    assert_eq!(job.status(), JobStatus::Succeeded);
+    assert_eq!(job.claim_count(), 2);
+    assert_eq!(job.failure_count(), 1);
+    assert_eq!(job.last_error(), None);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn worker_defers_through_the_shared_unit_of_work_without_spending_failure_budget(
     pool: PgPool,
 ) {

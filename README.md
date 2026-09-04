@@ -115,7 +115,7 @@ keys in a secret manager or an ignored local environment file.
 | Variable | Default | Explanation |
 | --- | --- | --- |
 | `WORKER_CONCURRENCY` | `1` | Maximum number of worker loops in this process. Valid range: `1`–`1024`; this controls upstream work independently from API replicas. |
-| `JOB_POLL_SECONDS` | `30` | Scheduler/worker polling interval for due work and recovery. It must be positive. |
+| `JOB_POLL_SECONDS` | `30` | Scheduler/worker polling interval for due work and expired-job recovery. It must be positive. |
 | `JOB_LEASE_SECONDS` | `600` | Duration of a claimed job lease. It must exceed `JOB_HEARTBEAT_SECONDS` plus the maximum page-operation duration. |
 | `JOB_HEARTBEAT_SECONDS` | `60` | Maximum interval between job-lease heartbeats. It must be less than `JOB_LEASE_SECONDS`. |
 | `JOB_MAX_ATTEMPTS` | `3` | Failure-attempt budget for retryable jobs. It must be positive. |
@@ -128,6 +128,23 @@ process environment variable. It is the source's `sync_interval_seconds`
 setting in the admin API and defaults to one hour for a newly created source.
 The next fetch is scheduled relative to the completion time of the previous
 sync.
+
+#### Job recovery
+
+Jobs use a durable PostgreSQL lease rather than a hard execution timeout.
+`JOB_LEASE_SECONDS` (default `600`) is renewed by the worker every
+`JOB_HEARTBEAT_SECONDS` (default `60`). If a worker crashes, its `running` job
+becomes eligible for recovery after the lease expires. Recovery is designed to
+increment the failure count and requeue the job, or mark it failed after
+`JOB_MAX_ATTEMPTS` is exhausted; the lease token also prevents a stale worker
+from completing a job after another worker takes it over.
+
+The production worker performs a bounded `JobService::recover_expired` pass
+before each claim. Because `claim_next` only selects queued, retry-waiting, or
+deferred jobs, this pass is what makes an expired `running` row claimable again.
+PostgreSQL uses row locks and `SKIP LOCKED`, so concurrent worker replicas can
+recover the same queue without applying the transition twice. Heartbeat-active
+jobs have no maximum execution duration and may run indefinitely by design.
 
 ### RSS and feed-cache behavior
 
