@@ -13,6 +13,7 @@
 //! feed capability lifecycle; web handlers will compose it with `FeedService`.
 
 pub mod archive_service;
+pub mod article_backfill_handler;
 pub mod auth_service;
 pub mod browser_health;
 pub mod feed_rebuild_handler;

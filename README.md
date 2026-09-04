@@ -47,11 +47,12 @@ needed to run the release image. The checked-in Dockerfile and GitHub Actions
 workflow build every branch and publish a release image to GHCR for `v*.*.*`
 tags.
 
-The following item is intentionally deferred until after the first release:
-
-- a queue and handler for articles missed during synchronization. This is a
-  useful repair/backfill improvement, but the first release relies on the
-  normal source synchronization path.
+Source synchronization also queues an `article_backfill` job when an individual
+article cannot be acquired or normalized. The durable repair job carries only
+the source/article identity and non-secret metadata, retries transient failures
+with the source's bounded attempt budget, and deduplicates active work by source
+and review ID. A successful repair invalidates the source feed revision and
+queues the normal feed rebuild job.
 
 ## HTTP listener configuration
 
@@ -250,20 +251,16 @@ These possible features are ordered approximately by user value and operational
 impact, not by implementation difficulty. The list is a planning guide rather
 than a commitment:
 
-Structured application logging, sensitive-value redaction, and browser health
-and worker-readiness diagnostics are included in the current runtime; the
-responsive administrator UI polish and the English, French, and Simplified
-Chinese panel translations are also included in the current panel. The
-remaining roadmap items are future work:
+Structured application logging, sensitive-value redaction, browser health and
+worker-readiness diagnostics, and missed-article repair/backfill jobs are
+included in the current runtime. The responsive administrator UI polish and the
+English, French, and Simplified Chinese panel translations are also included in
+the current panel. The remaining roadmap items are future work:
 
-1. **Add missed-article repair/backfill jobs.** Queue and process articles
-   missed during synchronization with bounded retries and deduplication. This
-   improves recovery after partial upstream failures but is not required for
-   the first release.
-2. **Persist archived assets and rewrite feed URLs.** Store approved media in
+1. **Persist archived assets and rewrite feed URLs.** Store approved media in
    local or object storage so archived articles can remain useful when
    upstream assets change or disappear.
-3. **Evaluate PGMQ as a queue transport optimization.** The current custom
+2. **Evaluate PGMQ as a queue transport optimization.** The current custom
    `jobs` table remains the version-one transport; PGMQ can be evaluated later
    if queue throughput or operational overhead becomes a demonstrated
    bottleneck.

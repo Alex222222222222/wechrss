@@ -37,7 +37,11 @@ use super::{
 /// concrete refresh transport into [`super::runtime_supervisor::RuntimeSupervisor`].
 /// Keeping this default list explicit prevents runtime composition from
 /// silently turning an uncomposed handler into claimed work.
-pub const EXECUTABLE_WORKER_JOB_TYPES: &[JobType] = &[JobType::FeedRebuild, JobType::SourceSync];
+pub const EXECUTABLE_WORKER_JOB_TYPES: &[JobType] = &[
+    JobType::FeedRebuild,
+    JobType::SourceSync,
+    JobType::ArticleBackfill,
+];
 
 /// A validated HTTP component plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,7 +223,7 @@ impl RuntimePlan {
                     WorkerConfigError::HeartbeatNotShorterThanLease,
                 ));
             }
-            let allowed_job_types = vec![JobType::FeedRebuild, JobType::SourceSync];
+            let allowed_job_types = EXECUTABLE_WORKER_JOB_TYPES.to_vec();
             let source_sync_enabled = true;
             let dispatch = WorkerConfig::new(allowed_job_types, heartbeat)
                 .map_err(RuntimePlanError::WorkerConfig)?;
@@ -355,7 +359,11 @@ mod tests {
         assert_eq!(worker.concurrency(), 4);
         assert_eq!(
             worker.worker_config().allowed_job_types(),
-            &[JobType::FeedRebuild, JobType::SourceSync]
+            &[
+                JobType::FeedRebuild,
+                JobType::SourceSync,
+                JobType::ArticleBackfill,
+            ]
         );
         assert!(worker.source_sync_enabled());
         assert_eq!(worker.job_service_config().owner(), "runtime-test");
@@ -389,7 +397,11 @@ mod tests {
         assert!(worker.source_sync_enabled());
         assert_eq!(
             worker.worker_config().allowed_job_types(),
-            &[JobType::FeedRebuild, JobType::SourceSync]
+            &[
+                JobType::FeedRebuild,
+                JobType::SourceSync,
+                JobType::ArticleBackfill,
+            ]
         );
     }
 

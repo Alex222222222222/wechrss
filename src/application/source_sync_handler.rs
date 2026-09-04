@@ -20,6 +20,7 @@ use serde_json::json;
 use crate::{
     acquisition::{article_page::ExtractedArticlePage, weread::WeReadArticleReference},
     application::{
+        article_backfill_handler::article_backfill_job,
         source_service::SourceReader,
         sync_service::{
             classify_acquisition_error, ClassifiedSyncFailure, SyncAcquisitionError, SyncService,
@@ -336,6 +337,7 @@ where
             source,
             run_id,
             stats: SyncStats::default(),
+            backfill_references: Vec::new(),
         };
         let references = match self
             .dependencies
@@ -416,6 +418,12 @@ where
                         "article acquisition failed"
                     );
                     let failure = classify_acquisition_error(&error);
+                    if should_queue_article_backfill(&error) {
+                        context.stats.articles_failed =
+                            context.stats.articles_failed.saturating_add(1);
+                        context.backfill_references.push(reference);
+                        continue;
+                    }
                     if failure.outcome() == SyncOutcome::Failed {
                         context.stats.articles_failed =
                             context.stats.articles_failed.saturating_add(1);
@@ -459,6 +467,7 @@ where
                         "article normalization failed"
                     );
                     context.stats.articles_failed = context.stats.articles_failed.saturating_add(1);
+                    context.backfill_references.push(reference);
                 }
             }
         }
@@ -467,6 +476,7 @@ where
             source: context.source.clone(),
             run_id: context.run_id,
             stats: context.stats,
+            backfill_references: context.backfill_references.clone(),
         };
         self.persist_success(lease, context, prepared, finished_at)
             .await
@@ -517,6 +527,13 @@ where
             .begin()
             .await
             .map_err(|_| ())?;
+        // Source-owned writes use the source row as their first lock. Source
+        // deletion takes the same lock before its cascading article delete,
+        // so a worker cannot hold an article row while waiting for the source.
+        let current_source = {
+            let mut sources = unit_of_work.source();
+            sources.find_for_update(source_id).await.map_err(|_| ())?
+        };
         let mut changed = false;
         let mut stats = context.stats;
         {
@@ -539,7 +556,7 @@ where
             let mut sources = unit_of_work.source();
             Some(
                 sources
-                    .bump_feed_revision(context.source.id(), context.source.feed_revision())
+                    .bump_feed_revision(source_id, current_source.feed_revision())
                     .await
                     .map_err(|_| ())?,
             )
@@ -550,22 +567,29 @@ where
         if changed {
             let mut queue = unit_of_work.job_enqueue();
             queue
-                .enqueue_job(feed_rebuild_job(&context.source, finished_at))
+                .enqueue_job(feed_rebuild_job(&current_source, finished_at))
                 .await
                 .map_err(|_| ())?;
         }
 
+        let queued_backfills = enqueue_backfill_references(
+            &mut unit_of_work,
+            &context.source,
+            &context.backfill_references,
+            finished_at,
+        )
+        .await?;
+        if queued_backfills > 0 {
+            tracing::info!(source_id = %source_id, queued_backfills, "queued missed article backfill jobs");
+        }
+
+        let next_fetch_at = finished_at
+            .checked_add_signed(current_source.sync_interval())
+            .ok_or(())?;
         {
             let mut sources = unit_of_work.source();
-            let current_source = sources
-                .find_for_update(context.source.id())
-                .await
-                .map_err(|_| ())?;
-            let next_fetch_at = finished_at
-                .checked_add_signed(current_source.sync_interval())
-                .ok_or(())?;
             sources
-                .update_schedule(context.source.id(), next_fetch_at, None, None)
+                .update_schedule(source_id, next_fetch_at, None, None)
                 .await
                 .map_err(|_| ())?;
         }
@@ -647,6 +671,21 @@ where
             .begin()
             .await
             .map_err(|_| ())?;
+
+        let queued_backfills = enqueue_backfill_references(
+            &mut unit_of_work,
+            &context.source,
+            &context.backfill_references,
+            finished_at,
+        )
+        .await?;
+        if queued_backfills > 0 {
+            tracing::info!(
+                source_id = %context.source.id(),
+                queued_backfills,
+                "queued missed article backfill jobs while finalizing source failure"
+            );
+        }
 
         match classified.outcome() {
             SyncOutcome::AuthenticationRequired => {
@@ -791,6 +830,43 @@ struct SourceSyncRunContext {
     source: Source,
     run_id: uuid::Uuid,
     stats: SyncStats,
+    backfill_references: Vec<WeReadArticleReference>,
+}
+
+async fn enqueue_backfill_references(
+    unit_of_work: &mut crate::persistence::unit_of_work::UnitOfWork<'_>,
+    source: &Source,
+    references: &[WeReadArticleReference],
+    enqueued_at: DateTime<Utc>,
+) -> Result<usize, ()> {
+    if references.is_empty() {
+        return Ok(0);
+    }
+
+    let mut queue = unit_of_work.job_enqueue();
+    let mut queued = 0;
+    for reference in references {
+        if let Some(job) = article_backfill_job(source, reference, enqueued_at) {
+            queue.enqueue_job(job).await.map_err(|_| ())?;
+            queued += 1;
+        }
+    }
+    Ok(queued)
+}
+
+fn should_queue_article_backfill(error: &SyncAcquisitionError) -> bool {
+    matches!(
+        error,
+        SyncAcquisitionError::ArticlePage(
+            crate::acquisition::article_page::ArticlePageError::Browser(_)
+                | crate::acquisition::article_page::ArticlePageError::OperationTimedOut
+        ) | SyncAcquisitionError::WeRead(
+            crate::acquisition::weread::WeReadAdapterError::LeaseLost { .. }
+                | crate::acquisition::weread::WeReadAdapterError::LeaseBackend(_)
+                | crate::acquisition::weread::WeReadAdapterError::Protocol(_)
+                | crate::acquisition::weread::WeReadAdapterError::Browser(_)
+        )
+    )
 }
 
 fn validate_lease(lease: &JobLease) -> Result<SourceId, JobExecution> {
@@ -942,6 +1018,42 @@ mod tests {
 
         assert_eq!(failure.outcome(), SyncOutcome::Failed);
         assert!(!is_terminal_source_sync_failure(&failure));
+    }
+
+    #[test]
+    fn recoverable_article_failures_are_backfill_candidates() {
+        assert!(should_queue_article_backfill(
+            &SyncAcquisitionError::ArticlePage(
+                crate::acquisition::article_page::ArticlePageError::OperationTimedOut,
+            )
+        ));
+        assert!(should_queue_article_backfill(
+            &SyncAcquisitionError::WeRead(WeReadAdapterError::Protocol(
+                "temporary response".to_owned()
+            ),)
+        ));
+    }
+
+    #[test]
+    fn source_wide_and_blocked_failures_are_not_backfill_candidates() {
+        assert!(!should_queue_article_backfill(
+            &SyncAcquisitionError::NoAccountEnrolled
+        ));
+        assert!(!should_queue_article_backfill(
+            &SyncAcquisitionError::WeRead(WeReadAdapterError::AuthenticationExpired { code: 401 })
+        ));
+        assert!(!should_queue_article_backfill(
+            &SyncAcquisitionError::ArticlePage(
+                crate::acquisition::article_page::ArticlePageError::VerificationRequired
+            )
+        ));
+        assert!(!should_queue_article_backfill(
+            &SyncAcquisitionError::ArticlePage(
+                crate::acquisition::article_page::ArticlePageError::InvalidExtraction(
+                    "invalid article".to_owned()
+                )
+            )
+        ));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::sync::{
 };
 
 use chrono::Duration;
+use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 use werrss::{
@@ -15,9 +16,12 @@ use werrss::{
         worker::{JobExecution, JobHandler},
     },
     config::AppConfig,
-    domain::source::SourceId,
+    domain::{
+        job::{JobType, NewJob},
+        source::SourceId,
+    },
     persistence::repositories::{
-        job_repository::{JobLease, JobQueue, PostgresJobRepository},
+        job_repository::{EnqueueResult, JobLease, JobQueue, PostgresJobRepository},
         scheduler_repository::{PostgresSchedulerRepository, SchedulerPass, SchedulerRepository},
     },
 };
@@ -99,6 +103,52 @@ async fn scheduler_output_is_claimable_by_the_configured_runtime_dispatch(pool: 
         JobExecution::Succeeded
     );
     assert_eq!(source_calls.load(Ordering::Relaxed), 1);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn runtime_dispatches_claimed_article_backfill_to_the_repair_handler(pool: PgPool) {
+    let queue = PostgresJobRepository::new(pool.clone());
+    let job_id = match queue
+        .enqueue(NewJob {
+            job_type: JobType::ArticleBackfill,
+            source_id: None,
+            priority: 1,
+            run_after: chrono::Utc::now() - Duration::seconds(1),
+            max_attempts: 3,
+            payload: json!({"test": "runtime-article-backfill"}),
+            dedupe_key: format!("runtime:article-backfill:{}", Uuid::new_v4()),
+            now: chrono::Utc::now(),
+        })
+        .await
+        .expect("article-backfill job should enqueue")
+    {
+        EnqueueResult::Inserted(job) => job.id(),
+        EnqueueResult::AlreadyActive { .. } => panic!("unique runtime key should insert"),
+    };
+    let lease = queue
+        .claim_next(
+            "runtime-worker",
+            chrono::Utc::now(),
+            Duration::minutes(10),
+            &[JobType::ArticleBackfill],
+        )
+        .await
+        .expect("article-backfill job should be claimable")
+        .expect("article-backfill job should be due");
+    assert_eq!(lease.job.id(), job_id);
+
+    let backfill_calls = Arc::new(AtomicUsize::new(0));
+    let handler = RuntimeJobHandler::new(
+        RecordingHandler::new(Arc::new(AtomicUsize::new(0))),
+        Some(RecordingHandler::new(Arc::new(AtomicUsize::new(0)))),
+    )
+    .with_article_backfill(RecordingHandler::new(backfill_calls.clone()));
+
+    assert_eq!(
+        handler.execute(&lease, chrono::Utc::now()).await,
+        JobExecution::Succeeded
+    );
+    assert_eq!(backfill_calls.load(Ordering::Relaxed), 1);
 }
 
 #[derive(Clone)]

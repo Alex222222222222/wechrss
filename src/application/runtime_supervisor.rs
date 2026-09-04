@@ -64,6 +64,10 @@ use crate::{
 };
 
 use super::{
+    article_backfill_handler::{
+        ArticleBackfillJobHandler, ArticleBackfillJobHandlerConfig,
+        ArticleBackfillJobHandlerConfigError, ArticleBackfillJobHandlerDependencies,
+    },
     browser_health::{BrowserHealth, BrowserHealthMonitor},
     feed_rebuild_handler::{
         FeedRebuildJobHandler, FeedRebuildJobHandlerConfig, FeedRebuildJobHandlerConfigError,
@@ -107,12 +111,20 @@ type RuntimeFeedRebuildService = FeedRebuildService<
 type SourceSyncHandler = SourceSyncJobHandler<
     PostgresSourceRepository,
     PostgresArticleRepository,
-    BrowserSourceSyncAcquirer<
-        PostgresAccountLeaseRepository,
-        BrowserWeReadAdapter,
-        WebDriverArticlePageFetcher,
-        CredentialRepositoryAccountSelector<PostgresCredentialRepository>,
-    >,
+    RuntimeSourceSyncAcquirer,
+>;
+
+type RuntimeSourceSyncAcquirer = BrowserSourceSyncAcquirer<
+    PostgresAccountLeaseRepository,
+    BrowserWeReadAdapter,
+    WebDriverArticlePageFetcher,
+    CredentialRepositoryAccountSelector<PostgresCredentialRepository>,
+>;
+
+type ArticleBackfillHandler = ArticleBackfillJobHandler<
+    PostgresSourceRepository,
+    PostgresArticleRepository,
+    RuntimeSourceSyncAcquirer,
 >;
 
 type RuntimeAuthService = AuthService<
@@ -175,6 +187,7 @@ pub trait OptionalJobHandler: Send + Sync {
 pub struct RuntimeJobHandler<F, S> {
     feed_rebuild: F,
     source_sync: Option<S>,
+    article_backfill: Option<Box<dyn JobHandler>>,
     credential_refresh: Option<Box<dyn OptionalJobHandler>>,
 }
 
@@ -184,8 +197,18 @@ impl<F, S> RuntimeJobHandler<F, S> {
         Self {
             feed_rebuild,
             source_sync,
+            article_backfill: None,
             credential_refresh: None,
         }
+    }
+
+    /// Adds the browser-backed article repair handler to this dispatcher.
+    pub fn with_article_backfill<H>(mut self, handler: H) -> Self
+    where
+        H: JobHandler + 'static,
+    {
+        self.article_backfill = Some(Box::new(handler));
+        self
     }
 
     /// Adds the transport-backed credential refresh handler to this worker.
@@ -217,14 +240,17 @@ where
                     error: "source-sync handler is not configured".to_owned(),
                 },
             },
+            JobType::ArticleBackfill => match &self.article_backfill {
+                Some(handler) => handler.execute(lease, now).await,
+                None => crate::application::worker::JobExecution::Failed {
+                    error: "article-backfill handler is not configured".to_owned(),
+                },
+            },
             JobType::CredentialRefresh => match &self.credential_refresh {
                 Some(handler) => handler.execute(lease, now).await,
                 None => crate::application::worker::JobExecution::Failed {
                     error: "credential-refresh handler is not configured".to_owned(),
                 },
-            },
-            _ => crate::application::worker::JobExecution::Failed {
-                error: "runtime worker received an unsupported job type".to_owned(),
             },
         }
     }
@@ -611,7 +637,15 @@ impl RuntimeSupervisor {
             .source_sync_enabled()
             .then(|| self.build_source_sync_handler(worker_index))
             .transpose()?;
+        let article_backfill = plan
+            .source_sync_enabled()
+            .then(|| self.build_article_backfill_handler(worker_index))
+            .transpose()?;
         let handler = RuntimeJobHandler::new(feed_handler, source_sync);
+        let handler = match article_backfill {
+            Some(article_backfill) => handler.with_article_backfill(article_backfill),
+            None => handler,
+        };
         let handler = match self.credential_refresher.clone() {
             Some(refresher) => handler.with_credential_refresh(
                 self.build_credential_refresh_handler(refresher, worker_index)?,
@@ -672,6 +706,55 @@ impl RuntimeSupervisor {
         &self,
         worker_index: u32,
     ) -> Result<SourceSyncHandler, RuntimeSupervisorError> {
+        let acquirer = self.build_source_sync_acquirer(worker_index)?;
+        let handler_config = SourceSyncJobHandlerConfig::new(
+            chrono_duration(self.config.job_poll_interval, "JOB_POLL_SECONDS")?,
+            chrono_duration(
+                self.config.source_failure_cooldown,
+                "SOURCE_FAILURE_COOLDOWN_SECONDS",
+            )?,
+        )
+        .map_err(RuntimeSupervisorError::SourceSyncHandlerConfig)?
+        .with_quiet_hours(self.config.quiet_hours);
+        Ok(SourceSyncJobHandler::new(
+            SourceSyncJobHandlerDependencies {
+                sources: PostgresSourceRepository::new(self.pool.clone()),
+                articles: PostgresArticleRepository::new(self.pool.clone()),
+                unit_of_work: UnitOfWorkFactory::new(self.pool.clone()),
+                acquirer,
+                sync_service: SyncService::new(),
+            },
+            handler_config,
+        ))
+    }
+
+    fn build_article_backfill_handler(
+        &self,
+        worker_index: u32,
+    ) -> Result<ArticleBackfillHandler, RuntimeSupervisorError> {
+        let acquirer = self.build_source_sync_acquirer(worker_index)?;
+        let handler_config = ArticleBackfillJobHandlerConfig::new(chrono_duration(
+            self.config.job_poll_interval,
+            "JOB_POLL_SECONDS",
+        )?)
+        .map_err(RuntimeSupervisorError::ArticleBackfillHandlerConfig)?
+        .with_quiet_hours(self.config.quiet_hours);
+        Ok(ArticleBackfillJobHandler::new(
+            ArticleBackfillJobHandlerDependencies {
+                sources: PostgresSourceRepository::new(self.pool.clone()),
+                articles: PostgresArticleRepository::new(self.pool.clone()),
+                unit_of_work: UnitOfWorkFactory::new(self.pool.clone()),
+                acquirer,
+                sync_service: SyncService::new(),
+            },
+            handler_config,
+        ))
+    }
+
+    fn build_source_sync_acquirer(
+        &self,
+        worker_index: u32,
+    ) -> Result<RuntimeSourceSyncAcquirer, RuntimeSupervisorError> {
         let webdriver = browser_factory(&self.config);
         let acquisition_config = BrowserSourceSyncAcquirerConfig::new(
             self.config.weread_account_id,
@@ -706,25 +789,7 @@ impl RuntimeSupervisor {
             acquisition_config,
             worker_index,
         );
-        let handler_config = SourceSyncJobHandlerConfig::new(
-            chrono_duration(self.config.job_poll_interval, "JOB_POLL_SECONDS")?,
-            chrono_duration(
-                self.config.source_failure_cooldown,
-                "SOURCE_FAILURE_COOLDOWN_SECONDS",
-            )?,
-        )
-        .map_err(RuntimeSupervisorError::SourceSyncHandlerConfig)?
-        .with_quiet_hours(self.config.quiet_hours);
-        Ok(SourceSyncJobHandler::new(
-            SourceSyncJobHandlerDependencies {
-                sources: PostgresSourceRepository::new(self.pool.clone()),
-                articles: PostgresArticleRepository::new(self.pool.clone()),
-                unit_of_work: UnitOfWorkFactory::new(self.pool.clone()),
-                acquirer,
-                sync_service: SyncService::new(),
-            },
-            handler_config,
-        ))
+        Ok(acquirer)
     }
 
     fn build_auth_service(&self) -> Result<RuntimeAuthService, RuntimeSupervisorError> {
@@ -935,6 +1000,9 @@ pub enum RuntimeSupervisorError {
     /// Source-sync handler policy was invalid after configuration.
     #[error(transparent)]
     SourceSyncHandlerConfig(#[from] SourceSyncJobHandlerConfigError),
+    /// Article-backfill handler policy was invalid after configuration.
+    #[error(transparent)]
+    ArticleBackfillHandlerConfig(#[from] ArticleBackfillJobHandlerConfigError),
     /// Scheduler credential-refresh settings were invalid after conversion.
     #[error(transparent)]
     SchedulerConfig(#[from] SchedulerConfigError),

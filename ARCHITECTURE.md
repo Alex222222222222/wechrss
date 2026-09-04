@@ -19,10 +19,10 @@ small web UI over those application/API boundaries. The panel supports English,
 French, and Simplified Chinese through a browser preference cookie and
 `Accept-Language` negotiation, with English as the fallback.
 
-The first usable version includes interactive QR-code login and deliberately
-defers the queue/handler used to repair articles missed during synchronization.
-The latter is a post-release backfill improvement, not a prerequisite for the
-initial source-sync path.
+The first usable version includes interactive QR-code login and a durable
+article-backfill queue. Source synchronization records fetchable per-article
+failures as deduplicated repair jobs; a worker retries each job independently,
+and a successful repair publishes a new feed revision and follow-up rebuild.
 
 ## Goals
 
@@ -62,7 +62,7 @@ The current and target contracts must not be confused:
 | Area | Executable now | Target contract and implementation gate |
 | --- | --- | --- |
 | Runtime | `RuntimeSupervisor` consumes the validated `RuntimePlan`, opens the shared PostgreSQL pool, applies SQLx migrations, binds the selected API, and supervises scheduler, feed-rebuild, and account-selection-at-job-time source-sync loops with graceful shutdown; an injected refresh transport also enables account-expiry scheduling; a shared browser-health monitor gates browser-backed claims | QR/login exchange uses the admin router's bounded process-local manager; API liveness/readiness, browser-worker readiness, and single-admin routes are executable |
-| Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, type-aware feed-rebuild/source-sync dispatch, lease-fenced credential-refresh dispatch when a transport is injected, and shutdown-aware heartbeat/outcome execution | Article-backfill dispatch, plus removal of compatibility `now` parameters, remain future work |
+| Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, type-aware feed-rebuild/source-sync/article-backfill dispatch, lease-fenced credential-refresh dispatch when a transport is injected, and shutdown-aware heartbeat/outcome execution | Removal of compatibility `now` parameters remains future work |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, public RSS URL, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint; the supervisor consumes the parsed role and policy values | QR-attempt policy is currently bounded in the application manager; durable multi-replica attempt storage remains future work |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, feed-build leases, and encrypted WeRead account credential records with optimistic versions | QR attempts are intentionally process-local; durable encrypted attempt storage and remaining transaction-scoped views are future work |
 | Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, authenticated WeRead article-list transport through an admin-enrolled cookie and account lease, source-sync finalization through an injected acquisition port, feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, public tokenized feed route, API liveness/readiness and browser-worker readiness routes, single-admin source/panel routes, and the WeRead QR login transport | Login/QR exchange is executable; durable multi-replica QR attempt storage remains future work |

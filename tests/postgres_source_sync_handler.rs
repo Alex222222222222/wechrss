@@ -40,6 +40,7 @@ struct FakeAcquirer {
     pages: HashMap<String, ExtractedArticlePage>,
     timeout_articles: Vec<String>,
     blocked_articles: Vec<String>,
+    authentication_error_articles: Vec<String>,
     authentication_error: bool,
     list_started: Option<Arc<Notify>>,
     list_release: Option<Arc<Notify>>,
@@ -56,6 +57,7 @@ impl FakeAcquirer {
             pages,
             timeout_articles: Vec::new(),
             blocked_articles: Vec::new(),
+            authentication_error_articles: Vec::new(),
             authentication_error: false,
             list_started: None,
             list_release: None,
@@ -114,6 +116,15 @@ impl SourceSyncAcquirer for FakeAcquirer {
         {
             return Err(SyncAcquisitionError::ArticlePage(
                 ArticlePageError::OperationTimedOut,
+            ));
+        }
+        if self
+            .authentication_error_articles
+            .iter()
+            .any(|id| id == &reference.review_id)
+        {
+            return Err(SyncAcquisitionError::WeRead(
+                WeReadAdapterError::AuthenticationExpired { code: 401 },
             ));
         }
         self.pages
@@ -244,7 +255,7 @@ async fn source_sync_defers_before_upstream_work_during_quiet_hours(pool: PgPool
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
-async fn source_sync_retry_commits_cooldown_and_retryable_run_atomically(pool: PgPool) {
+async fn source_sync_queues_a_missed_article_backfill_and_completes_the_run(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     let factory = UnitOfWorkFactory::new(pool.clone());
     create_source(&factory, source_id).await;
@@ -272,8 +283,8 @@ async fn source_sync_retry_commits_cooldown_and_retryable_run_atomically(pool: P
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(job.get::<String, _>("status"), "retry_wait");
-    assert_eq!(job.get::<i64, _>("failure_count"), 1);
+    assert_eq!(job.get::<String, _>("status"), "succeeded");
+    assert_eq!(job.get::<i64, _>("failure_count"), 0);
     let source = sqlx::query(
         "SELECT scheduling_gate, failure_cooldown_until, schedule_reserved_until FROM sources WHERE id = $1",
     )
@@ -284,7 +295,7 @@ async fn source_sync_retry_commits_cooldown_and_retryable_run_atomically(pool: P
     assert_eq!(source.get::<String, _>("scheduling_gate"), "ready");
     assert!(source
         .get::<Option<chrono::DateTime<Utc>>, _>("failure_cooldown_until")
-        .is_some());
+        .is_none());
     assert!(source
         .get::<Option<chrono::DateTime<Utc>>, _>("schedule_reserved_until")
         .is_none());
@@ -293,7 +304,37 @@ async fn source_sync_retry_commits_cooldown_and_retryable_run_atomically(pool: P
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(outcome, SyncOutcome::RetryableFailure.as_str());
+    assert_eq!(outcome, SyncOutcome::Succeeded.as_str());
+    let run = sqlx::query(
+        "SELECT articles_seen, articles_created, articles_updated, articles_failed FROM sync_runs WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(run.get::<i64, _>("articles_seen"), 1);
+    assert_eq!(run.get::<i64, _>("articles_created"), 0);
+    assert_eq!(run.get::<i64, _>("articles_updated"), 0);
+    assert_eq!(run.get::<i64, _>("articles_failed"), 1);
+    let backfill = sqlx::query(
+        "SELECT status, payload_json, dedupe_key FROM jobs WHERE source_id = $1 AND job_type = 'article_backfill'",
+    )
+    .bind(source_id.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(backfill.get::<String, _>("status"), "queued");
+    assert_eq!(
+        backfill.get::<String, _>("dedupe_key"),
+        format!("article_backfill:{source_id}:review-timeout")
+    );
+    assert_eq!(
+        backfill
+            .get::<serde_json::Value, _>("payload_json")
+            .get("review_id")
+            .and_then(serde_json::Value::as_str),
+        Some("review-timeout")
+    );
     let article_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM articles WHERE source_id = $1")
             .bind(source_id.as_uuid())
@@ -301,6 +342,205 @@ async fn source_sync_retry_commits_cooldown_and_retryable_run_atomically(pool: P
             .await
             .unwrap();
     assert_eq!(article_count, 0);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn source_sync_persistence_retry_preserves_backfill_candidates(pool: PgPool) {
+    sqlx::query("CREATE SEQUENCE test_source_sync_finish_failure_once")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"
+        CREATE FUNCTION test_fail_first_source_sync_finish() RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF nextval('test_source_sync_finish_failure_once') = 1 THEN
+                RAISE EXCEPTION 'intentional transient sync-run persistence failure';
+            END IF;
+            RETURN NEW;
+        END;
+        $$
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER test_fail_first_source_sync_finish_trigger BEFORE UPDATE OF outcome ON sync_runs FOR EACH ROW EXECUTE FUNCTION test_fail_first_source_sync_finish()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_id).await;
+    let job_id = enqueue_source_sync(&pool, source_id).await;
+    let lease = claim(&pool, Utc.timestamp_opt(1_700_000_000, 0).single().unwrap()).await;
+    let reference = reference(
+        "review-persistence-retry",
+        "https://mp.weixin.qq.com/s/retry",
+    );
+    let mut acquirer = FakeAcquirer::successful(
+        reference,
+        page("https://mp.weixin.qq.com/s/retry", "Retry candidate"),
+    );
+    acquirer
+        .timeout_articles
+        .push("review-persistence-retry".to_owned());
+    let handler = handler(
+        pool.clone(),
+        acquirer,
+        SourceSyncJobHandlerConfig::default(),
+    );
+
+    assert_eq!(
+        handler.execute(&lease, Utc::now()).await,
+        JobExecution::Committed
+    );
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "retry_wait"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT outcome FROM sync_runs WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        SyncOutcome::RetryableFailure.as_str()
+    );
+    let backfill_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE source_id = $1 AND job_type = 'article_backfill' AND status = 'queued'",
+    )
+    .bind(source_id.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(backfill_count, 1);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn source_sync_preserves_backfill_candidates_when_a_later_article_gates_the_source(
+    pool: PgPool,
+) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_id).await;
+    let job_id = enqueue_source_sync(&pool, source_id).await;
+    let lease = claim(&pool, Utc.timestamp_opt(1_700_000_000, 0).single().unwrap()).await;
+
+    let first = reference(
+        "review-before-auth-error",
+        "https://mp.weixin.qq.com/s/before-auth",
+    );
+    let second = reference("review-auth-error", "https://mp.weixin.qq.com/s/auth-error");
+    let mut pages = HashMap::new();
+    pages.insert(
+        first.review_id.clone(),
+        page(first.article_url.as_ref().unwrap().as_str(), "Before auth"),
+    );
+    pages.insert(
+        second.review_id.clone(),
+        page(second.article_url.as_ref().unwrap().as_str(), "Auth error"),
+    );
+    let handler = handler(
+        pool.clone(),
+        FakeAcquirer {
+            references: vec![first, second],
+            pages,
+            timeout_articles: vec!["review-before-auth-error".to_owned()],
+            blocked_articles: Vec::new(),
+            authentication_error_articles: vec!["review-auth-error".to_owned()],
+            authentication_error: false,
+            list_started: None,
+            list_release: None,
+            fetch_started: None,
+            fetch_release: None,
+        },
+        SourceSyncJobHandlerConfig::default(),
+    );
+
+    assert_eq!(
+        handler.execute(&lease, Utc::now()).await,
+        JobExecution::Committed
+    );
+
+    let backfill = sqlx::query(
+        "SELECT payload_json FROM jobs WHERE source_id = $1 AND job_type = 'article_backfill' AND status = 'queued'",
+    )
+    .bind(source_id.as_uuid())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(backfill.len(), 1);
+    assert_eq!(
+        backfill[0]
+            .get::<serde_json::Value, _>("payload_json")
+            .get("review_id")
+            .and_then(serde_json::Value::as_str),
+        Some("review-before-auth-error")
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "failed"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn source_sync_queues_backfill_after_article_normalization_fails(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_id).await;
+    let job_id = enqueue_source_sync(&pool, source_id).await;
+    let lease = claim(&pool, Utc.timestamp_opt(1_700_000_000, 0).single().unwrap()).await;
+    let mut reference = reference(
+        "review-missing-published-at",
+        "https://mp.weixin.qq.com/s/missing-published-at",
+    );
+    reference.published_at = None;
+    let mut page = page(
+        "https://mp.weixin.qq.com/s/missing-published-at",
+        "Missing publication time",
+    );
+    page.published_at = None;
+    let handler = handler(
+        pool.clone(),
+        FakeAcquirer::successful(reference, page),
+        SourceSyncJobHandlerConfig::default(),
+    );
+
+    assert_eq!(
+        handler.execute(&lease, Utc::now()).await,
+        JobExecution::Committed
+    );
+
+    let backfill_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE source_id = $1 AND job_type = 'article_backfill' AND status = 'queued'",
+    )
+    .bind(source_id.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(backfill_count, 1);
+    let failed_articles: i64 =
+        sqlx::query_scalar("SELECT articles_failed FROM sync_runs WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(failed_articles, 1);
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -317,6 +557,7 @@ async fn authentication_failure_gates_the_source_and_does_not_retry_the_job(pool
             pages: HashMap::new(),
             timeout_articles: Vec::new(),
             blocked_articles: Vec::new(),
+            authentication_error_articles: Vec::new(),
             authentication_error: true,
             list_started: None,
             list_release: None,

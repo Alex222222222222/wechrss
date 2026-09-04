@@ -316,9 +316,12 @@ attempt, display its SVG, poll its status, and cancel it. All three QR routes
 require the admin session and CSRF token because a successful poll finalizes
 account persistence. Attempts are process-local, so a multi-replica deployment
 must use sticky routing for one attempt until durable encrypted attempt storage
-is introduced. A durable queue and handler for articles missed during
-synchronization is deferred; it is a post-release repair/backfill improvement
-rather than a first-release requirement.
+is introduced. Article-level acquisition and normalization failures from source
+sync are persisted as deduplicated `article_backfill` jobs. Workers retry
+transient failures within the source's bounded attempt budget; successful
+repairs advance the source feed revision and enqueue a normal `feed_rebuild`
+job. Backfill payloads contain article identity and non-secret metadata only, so
+credentials remain in the panel-enrolled account store.
 
 ## Timezone verification
 
