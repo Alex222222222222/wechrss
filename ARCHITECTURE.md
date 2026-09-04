@@ -15,7 +15,9 @@ browser path, and database-only feed rebuild orchestration are executable.
 The public feed-token lifecycle and its tokenized feed route are executable;
 administrative routes compose the source, feed-token, and synchronization-run
 application/repository boundaries. The first usable version also includes a
-small web UI over those application/API boundaries.
+small web UI over those application/API boundaries. The panel supports English,
+French, and Simplified Chinese through a browser preference cookie and
+`Accept-Language` negotiation, with English as the fallback.
 
 The first usable version deliberately defers interactive QR-code login and the
 queue/handler used to repair articles missed during synchronization. The latter

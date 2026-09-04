@@ -47,7 +47,7 @@ use crate::{
     persistence::unit_of_work::UnitOfWorkFactory,
     web::{
         auth::{AdminAuthenticator, AdminSession, AuthError},
-        ui,
+        i18n, ui,
     },
 };
 
@@ -635,7 +635,8 @@ async fn weread_account_page(
         Err(response) => return *response,
     };
     match state.weread_auth.account(account_id).await {
-        Ok(account) => ui::weread_account_page(&session, &account).into_response(),
+        Ok(account) => ui::weread_account_page(&session, &account, i18n::from_headers(&headers))
+            .into_response(),
         Err(AuthServiceError::AccountNotFound { .. }) => not_found("WeRead account"),
         Err(error) => auth_service_error_response(error),
     }
@@ -652,7 +653,7 @@ async fn weread_accounts_page(
             return (StatusCode::SEE_OTHER, [(header::LOCATION, "/admin/login")]).into_response()
         }
     };
-    ui::weread_accounts_page(&session).into_response()
+    ui::weread_accounts_page(&session, i18n::from_headers(&headers)).into_response()
 }
 
 fn parse_account_id(value: &str) -> Result<WeReadAccountId, Box<Response>> {
@@ -1091,14 +1092,14 @@ async fn list_sync_runs(
 }
 
 #[tracing::instrument(skip_all, level = "trace")]
-async fn login_page() -> impl IntoResponse {
-    ui::login_page()
+async fn login_page(headers: HeaderMap) -> impl IntoResponse {
+    ui::login_page(i18n::from_headers(&headers))
 }
 
 #[tracing::instrument(skip_all, level = "debug")]
 async fn admin_page(State(state): State<Arc<AdminApiState>>, headers: HeaderMap) -> Response {
     match authenticate(&state.auth, &headers) {
-        Ok(session) => ui::admin_page(&session).into_response(),
+        Ok(session) => ui::admin_page(&session, i18n::from_headers(&headers)).into_response(),
         Err(_) => (StatusCode::SEE_OTHER, [(header::LOCATION, "/admin/login")]).into_response(),
     }
 }
@@ -1120,7 +1121,9 @@ async fn source_page(
         Err(response) => return *response,
     };
     match state.sources.find(source_id).await {
-        Ok(Some(source)) => ui::source_page(&session, &source).into_response(),
+        Ok(Some(source)) => {
+            ui::source_page(&session, &source, i18n::from_headers(&headers)).into_response()
+        }
         Ok(None) => not_found("source"),
         Err(error) => application_error_response(error),
     }

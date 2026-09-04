@@ -10,7 +10,7 @@ use axum::response::Html;
 
 use crate::domain::{credentials::WeReadAccount, source::Source};
 
-use super::auth::AdminSession;
+use super::{auth::AdminSession, i18n::Locale};
 
 const STYLES: &str = r##"<style>
 :root {
@@ -111,6 +111,11 @@ button:disabled, .button[aria-disabled="true"] { cursor: not-allowed; opacity: .
 .header-actions { display: flex; align-items: center; gap: 14px; }
 .identity { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 13px; }
 .identity::before { width: 7px; height: 7px; border-radius: 50%; background: #12b76a; content: ""; }
+.locale-picker { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 650; }
+.locale-picker select { min-height: 34px; border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 5px 25px 5px 8px; color: var(--ink); background: var(--surface); font: inherit; cursor: pointer; }
+.locale-picker select:hover { border-color: #c5cad4; }
+.auth-toolbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 
 .page-shell { padding: 42px 0 72px; }
 .page-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 28px; margin-bottom: 30px; }
@@ -267,30 +272,51 @@ code { border-radius: 5px; padding: 2px 5px; color: #344054; background: #f2f4f7
 }
 </style>"##;
 
+const LOCALE_PICKER: &str = r##"<label class="locale-picker"><span class="sr-only" data-i18n="language.label">Language</span><select id="locale" data-i18n-aria-label="language.label" aria-label="Language"><option value="en" data-i18n="language.english">English</option><option value="fr" data-i18n="language.french">Français</option><option value="zh" data-i18n="language.chinese">中文</option></select></label>"##;
+
+fn i18n_bootstrap(locale: Locale) -> String {
+    let translations = super::i18n::translations_json(locale)
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026");
+    format!(
+        "const translations={translations};const t=key=>Object.prototype.hasOwnProperty.call(translations,key)?translations[key]:key;const statusLabel=status=>Object.prototype.hasOwnProperty.call(translations,`status.${{status}}`)?t(`status.${{status}}`):status;document.documentElement.lang='{locale}';const translateStatic=()=>{{document.querySelectorAll('[data-i18n]').forEach(element=>{{element.textContent=t(element.dataset.i18n)}});document.querySelectorAll('[data-i18n-placeholder]').forEach(element=>{{element.placeholder=t(element.dataset.i18nPlaceholder)}});document.querySelectorAll('[data-i18n-aria-label]').forEach(element=>{{element.setAttribute('aria-label',t(element.dataset.i18nAriaLabel))}})}};const addLocalePicker=()=>{{let localeSelect=document.querySelector('#locale');if(!localeSelect){{const host=document.querySelector('.header-actions')||document.querySelector('.auth-toolbar');if(!host)return;const label=document.createElement('label');label.className='locale-picker';const hidden=document.createElement('span');hidden.className='sr-only';hidden.dataset.i18n='language.label';hidden.textContent='Language';localeSelect=document.createElement('select');localeSelect.id='locale';localeSelect.dataset.i18nAriaLabel='language.label';localeSelect.setAttribute('aria-label','Language');[['en','language.english','English'],['fr','language.french','Français'],['zh','language.chinese','中文']].forEach(([value,key,labelText])=>{{const option=document.createElement('option');option.value=value;option.dataset.i18n=key;option.textContent=labelText;localeSelect.append(option)}});label.append(hidden,localeSelect);host.append(label)}}localeSelect.value='{locale}';localeSelect.addEventListener('change',()=>{{document.cookie=`werrss_locale=${{encodeURIComponent(localeSelect.value)}}; Path=/; Max-Age=31536000; SameSite=Lax`;location.reload()}})}};translateStatic();addLocalePicker();translateStatic();",
+        translations = translations,
+        locale = locale.code(),
+    )
+}
+
 /// Renders the public login page. Credentials are submitted to the JSON API.
-pub fn login_page() -> Html<String> {
+pub fn login_page(locale: Locale) -> Html<String> {
     let template = r##"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in — Werrss admin</title>__STYLES__</head>
-<body class="auth-page"><main class="auth-layout"><section class="auth-card" aria-labelledby="login-title"><a class="brand" href="/admin/login"><span class="brand-mark" aria-hidden="true">W</span><span class="brand-copy">Werrss<small>Admin console</small></span></a><div class="auth-intro"><p class="kicker">Private reader</p><h1 id="login-title">Welcome back</h1><p>Sign in to manage your sources, credentials, and feed links.</p></div><form id="login"><label><span>Username</span><input name="username" autocomplete="username" required autofocus></label><label><span>Password</span><input name="password" type="password" autocomplete="current-password" required></label><div class="form-actions"><button class="button-primary" type="submit"><span>Sign in</span></button></div><p id="error" class="feedback error" role="alert" hidden></p></form></section><aside class="auth-note" aria-label="About the admin console"><strong>A quiet place to manage your feeds.</strong><p>Everything here is designed for one trusted administrator.</p><ul><li>Protected source and account controls</li><li>Copyable RSS feed links</li><li>No secrets displayed after saving</li></ul></aside></main>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title data-i18n="login.title">Sign in — Werrss admin</title>__STYLES__</head>
+<body class="auth-page"><main class="auth-layout"><section class="auth-card" aria-labelledby="login-title"><div class="auth-toolbar">__LOCALE_PICKER__</div><a class="brand" href="/admin/login"><span class="brand-mark" aria-hidden="true">W</span><span class="brand-copy">Werrss<small data-i18n="app.admin_console">Admin console</small></span></a><div class="auth-intro"><p class="kicker" data-i18n="login.kicker">Private reader</p><h1 id="login-title" data-i18n="login.heading">Welcome back</h1><p data-i18n="login.description">Sign in to manage your sources, credentials, and feed links.</p></div><form id="login"><label><span data-i18n="login.username">Username</span><input name="username" autocomplete="username" required autofocus></label><label><span data-i18n="login.password">Password</span><input name="password" type="password" autocomplete="current-password" required></label><div class="form-actions"><button class="button-primary" type="submit"><span data-i18n="login.sign_in">Sign in</span></button></div><p id="error" class="feedback error" role="alert" hidden></p></form></section><aside class="auth-note" data-i18n-aria-label="login.about_aria" aria-label="About the admin console"><strong data-i18n="login.note_heading">A quiet place to manage your feeds.</strong><p data-i18n="login.note_description">Everything here is designed for one trusted administrator.</p><ul><li data-i18n="login.feature_controls">Protected source and account controls</li><li data-i18n="login.feature_links">Copyable RSS feed links</li><li data-i18n="login.feature_no_secrets">No secrets displayed after saving</li></ul></aside></main>
 <script>
+__I18N__
 const loginForm=document.querySelector('#login');const loginError=document.querySelector('#error');const loginButton=loginForm.querySelector('button');
-loginForm.addEventListener('submit',async event=>{event.preventDefault();loginError.hidden=true;loginButton.disabled=true;loginButton.setAttribute('aria-busy','true');const form=new FormData(event.target);try{const response=await fetch('/api/admin/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:form.get('username'),password:form.get('password')})});if(response.ok){location='/admin/';return}loginError.textContent='Sign-in failed; check the credentials or try again later.';loginError.hidden=false}catch{loginError.textContent='The admin service could not be reached. Check the connection and try again.';loginError.hidden=false}finally{loginButton.disabled=false;loginButton.removeAttribute('aria-busy')}});
+loginForm.addEventListener('submit',async event=>{event.preventDefault();loginError.hidden=true;loginButton.disabled=true;loginButton.setAttribute('aria-busy','true');const form=new FormData(event.target);try{const response=await fetch('/api/admin/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:form.get('username'),password:form.get('password')})});if(response.ok){location='/admin/';return}loginError.textContent=t('login.error.invalid');loginError.hidden=false}catch{loginError.textContent=t('login.error.unreachable');loginError.hidden=false}finally{loginButton.disabled=false;loginButton.removeAttribute('aria-busy')}});
 </script></body></html>"##;
-    Html(template.replace("__STYLES__", STYLES))
+    Html(
+        template
+            .replace("__STYLES__", STYLES)
+            .replace("__LOCALE_PICKER__", LOCALE_PICKER)
+            .replace("__I18N__", &i18n_bootstrap(locale)),
+    )
 }
 
 /// Renders the authenticated source-management panel.
-pub fn admin_page(session: &AdminSession) -> Html<String> {
+pub fn admin_page(session: &AdminSession, locale: Locale) -> Html<String> {
     let username = escape_html(session.username());
     let csrf = escape_html(session.csrf_token());
     let csrf_json = serde_json::to_string(&csrf).expect("escaped CSRF token should serialize");
     let template = r##"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dashboard — Werrss admin</title>__STYLES__</head>
-<body><header class="site-header"><div class="header-inner"><a class="brand" href="/admin/"><span class="brand-mark" aria-hidden="true">W</span><span class="brand-copy">Werrss<small>Admin console</small></span></a><div class="header-actions"><span class="identity">Signed in as <strong>__USERNAME__</strong></span><button id="logout" class="button button-quiet" type="button">Sign out</button></div></div></header><main class="page-shell"><section class="page-header"><div><p class="kicker">Workspace overview</p><h1>Good to see you.</h1><p>Keep your feeds healthy, credentials current, and delivery links close at hand.</p></div><div class="page-header-actions"><a class="button button-secondary" href="#create">Add source</a><a class="button button-quiet" href="/admin/weread/accounts">Manage accounts</a></div></section><section class="stats" aria-label="Workspace summary"><div class="stat"><span class="stat-icon">S</span><span><strong id="source-count" class="stat-value">—</strong><span class="stat-label">Sources</span></span></div><div class="stat"><span class="stat-icon green">A</span><span><strong id="active-source-count" class="stat-value">—</strong><span class="stat-label">Active sources</span></span></div><div class="stat"><span class="stat-icon orange">W</span><span><strong id="account-count" class="stat-value">—</strong><span class="stat-label">WeRead accounts</span></span></div></section><div class="layout-grid"><section class="card" id="weread-account-card"><div class="card-header"><div><h2>Connect WeRead</h2><p>Enroll a browser session for authenticated source sync.</p></div><span class="card-icon green" aria-hidden="true">W</span></div><div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><span>Cookies are encrypted before storage and are never shown again. You can replace them later from the account page.</span></div><form id="weread-account"><label><span class="label-row"><span>Account ID</span><span class="label-hint">Optional for a new account</span></span><input name="account_id" type="text" autocomplete="off" placeholder="Leave blank to create an ID"></label><label><span class="label-row"><span>Display name</span><span class="label-hint">Optional when wr_name is present</span></span><input name="display_name" type="text" autocomplete="off" placeholder="e.g. Personal account"></label><label><span>WeRead Cookie header</span><textarea name="cookie_header" rows="4" required autocomplete="off" placeholder="wr_vid=…; wr_skey=…; wr_rt=…"></textarea></label><label><span>Access token expiry</span><input name="access_expires_at" type="datetime-local" required></label><div class="form-actions"><button class="button-primary" type="submit">Save account</button></div></form><p id="account-result" class="feedback" role="status" hidden></p></section><section class="card" id="create"><div class="card-header"><div><h2>Add a source</h2><p>Start with a Book ID or resolve one from an article URL.</p></div><span class="card-icon" aria-hidden="true">+</span></div><div class="notice"><span class="notice-icon" aria-hidden="true">↗</span><span>Leave the account ID blank to let each sync choose a random enabled account.</span></div><form id="source-create"><label><span class="label-row"><span>Book ID</span><span class="label-hint">Optional with an article URL</span></span><input name="book_id" type="text" autocomplete="off" placeholder="e.g. MP_WXS_2103095721"></label><label><span>Name</span><input name="display_name" type="text" autocomplete="off" placeholder="Defaults to the resolved account name"></label><label><span>Article URL</span><input name="article_url" type="url" autocomplete="url" placeholder="https://mp.weixin.qq.com/s/…"></label><label><span class="label-row"><span>WeRead account ID</span><span class="label-hint">Optional</span></span><input name="account_id" type="text" autocomplete="off" placeholder="Pin this source to one account"></label><div class="form-actions"><button class="button-primary" type="submit">Add source</button></div></form><p id="error" class="feedback" role="alert" hidden></p></section><section class="card full-width" id="source-list"><div class="card-header"><div><h2>Sources</h2><p>Monitor scheduling gates and create public feed links.</p></div><a class="button button-quiet" href="#create">New source</a></div><div id="sources" class="resource-grid" aria-live="polite" aria-busy="true"><div class="loading-state">Loading sources…</div></div></section><section class="card full-width" id="account-list"><div class="card-header"><div><h2>WeRead accounts</h2><p>Enabled accounts are available to unbound source-sync jobs.</p></div><a class="button button-quiet" href="/admin/weread/accounts">View all</a></div><div id="weread-accounts" class="resource-grid" aria-live="polite" aria-busy="true"><div class="loading-state">Loading accounts…</div></div><p id="account-list-error" class="feedback" role="alert" hidden></p></section></div></main>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title data-i18n="dashboard.title">Dashboard — Werrss admin</title>__STYLES__</head>
+<body><header class="site-header"><div class="header-inner"><a class="brand" href="/admin/"><span class="brand-mark" aria-hidden="true">W</span><span class="brand-copy">Werrss<small data-i18n="app.admin_console">Admin console</small></span></a><div class="header-actions"><span class="identity"><span data-i18n="nav.signed_in_as">Signed in as</span> <strong>__USERNAME__</strong></span><button id="logout" class="button button-quiet" type="button" data-i18n="nav.sign_out">Sign out</button>__LOCALE_PICKER__</div></div></header><main class="page-shell"><section class="page-header"><div><p class="kicker" data-i18n="dashboard.kicker">Workspace overview</p><h1 data-i18n="dashboard.heading">Good to see you.</h1><p data-i18n="dashboard.description">Keep your feeds healthy, credentials current, and delivery links close at hand.</p></div><div class="page-header-actions"><a class="button button-secondary" href="#create" data-i18n="dashboard.add_source">Add source</a><a class="button button-quiet" href="/admin/weread/accounts" data-i18n="dashboard.manage_accounts">Manage accounts</a></div></section><section class="stats" data-i18n-aria-label="dashboard.summary_aria" aria-label="Workspace summary"><div class="stat"><span class="stat-icon">S</span><span><strong id="source-count" class="stat-value">—</strong><span class="stat-label" data-i18n="stats.sources">Sources</span></span></div><div class="stat"><span class="stat-icon green">A</span><span><strong id="active-source-count" class="stat-value">—</strong><span class="stat-label" data-i18n="stats.active_sources">Active sources</span></span></div><div class="stat"><span class="stat-icon orange">W</span><span><strong id="account-count" class="stat-value">—</strong><span class="stat-label" data-i18n="stats.weread_accounts">WeRead accounts</span></span></div></section><div class="layout-grid"><section class="card" id="weread-account-card"><div class="card-header"><div><h2 data-i18n="account.connect_heading">Connect WeRead</h2><p data-i18n="account.connect_description">Enroll a browser session for authenticated source sync.</p></div><span class="card-icon green" aria-hidden="true">W</span></div><div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><span data-i18n="account.cookies_notice">Cookies are encrypted before storage and are never shown again. You can replace them later from the account page.</span></div><form id="weread-account"><label><span class="label-row"><span data-i18n="account.id">Account ID</span><span class="label-hint" data-i18n="account.id_hint_new">Optional for a new account</span></span><input name="account_id" type="text" autocomplete="off" data-i18n-placeholder="account.id_placeholder" placeholder="Leave blank to create an ID"></label><label><span class="label-row"><span data-i18n="account.display_name">Display name</span><span class="label-hint" data-i18n="account.display_name_hint">Optional when wr_name is present</span></span><input name="display_name" type="text" autocomplete="off" data-i18n-placeholder="account.display_name_placeholder" placeholder="e.g. Personal account"></label><label><span data-i18n="account.cookie_header">WeRead Cookie header</span><textarea name="cookie_header" rows="4" required autocomplete="off" data-i18n-placeholder="account.cookie_placeholder" placeholder="wr_vid=…; wr_skey=…; wr_rt=…"></textarea></label><label><span data-i18n="account.access_expiry">Access token expiry</span><input name="access_expires_at" type="datetime-local" required></label><div class="form-actions"><button class="button-primary" type="submit" data-i18n="account.save">Save account</button></div></form><p id="account-result" class="feedback" role="status" hidden></p></section><section class="card" id="create"><div class="card-header"><div><h2 data-i18n="source.add_heading">Add a source</h2><p data-i18n="source.add_description">Start with a Book ID or resolve one from an article URL.</p></div><span class="card-icon" aria-hidden="true">+</span></div><div class="notice"><span class="notice-icon" aria-hidden="true">↗</span><span data-i18n="source.unbound_notice">Leave the account ID blank to let each sync choose a random enabled account.</span></div><form id="source-create"><label><span class="label-row"><span data-i18n="source.book_id">Book ID</span><span class="label-hint" data-i18n="source.book_id_hint">Optional with an article URL</span></span><input name="book_id" type="text" autocomplete="off" data-i18n-placeholder="source.book_id_placeholder" placeholder="e.g. MP_WXS_2103095721"></label><label><span data-i18n="source.name">Name</span><input name="display_name" type="text" autocomplete="off" data-i18n-placeholder="source.name_placeholder" placeholder="Defaults to the resolved account name"></label><label><span data-i18n="source.article_url">Article URL</span><input name="article_url" type="url" autocomplete="url" data-i18n-placeholder="source.article_url_placeholder" placeholder="https://mp.weixin.qq.com/s/…"></label><label><span class="label-row"><span data-i18n="source.account_id">WeRead account ID</span><span class="label-hint" data-i18n="source.account_id_hint">Optional</span></span><input name="account_id" type="text" autocomplete="off" data-i18n-placeholder="source.account_id_placeholder" placeholder="Pin this source to one account"></label><div class="form-actions"><button class="button-primary" type="submit" data-i18n="source.add">Add source</button></div></form><p id="error" class="feedback" role="alert" hidden></p></section><section class="card full-width" id="source-list"><div class="card-header"><div><h2 data-i18n="source.list_heading">Sources</h2><p data-i18n="source.list_description">Monitor scheduling gates and create public feed links.</p></div><a class="button button-quiet" href="#create" data-i18n="source.new">New source</a></div><div id="sources" class="resource-grid" aria-live="polite" aria-busy="true"><div class="loading-state" data-i18n="state.loading_sources">Loading sources…</div></div></section><section class="card full-width" id="account-list"><div class="card-header"><div><h2 data-i18n="account.list_heading">WeRead accounts</h2><p data-i18n="account.list_description">Enabled accounts are available to unbound source-sync jobs.</p></div><a class="button button-quiet" href="/admin/weread/accounts" data-i18n="account.view_all">View all</a></div><div id="weread-accounts" class="resource-grid" aria-live="polite" aria-busy="true"><div class="loading-state" data-i18n="state.loading_accounts">Loading accounts…</div></div><p id="account-list-error" class="feedback" role="alert" hidden></p></section></div></main>
 <script>
+__I18N__
 const csrf=__CSRF__;const headers={'content-type':'application/json','x-csrf-token':csrf};const list=document.querySelector('#sources');const error=document.querySelector('#error');const accountResult=document.querySelector('#account-result');const accountList=document.querySelector('#weread-accounts');const accountListError=document.querySelector('#account-list-error');const sourceCount=document.querySelector('#source-count');const activeSourceCount=document.querySelector('#active-source-count');const accountCount=document.querySelector('#account-count');
 async function request(path,options={}){return fetch(path,{...options,headers:{...headers,...(options.headers||{})}})}
-async function apiErrorMessage(response,fallback){try{const value=await response.json();if(typeof value.error==='string'&&value.error.trim()){return value.error}}catch{}return fallback}
+async function apiErrorMessage(response,fallback){try{const value=await response.json();if(typeof value.error==='string'&&value.error.trim()){return value.error}}catch{}return t(fallback)}
 function feedback(target,message,kind='error'){target.textContent=message;target.className=`feedback ${kind}`;target.hidden=!message}
 function stateMessage(message,kind='loading'){const item=document.createElement('div');item.className=`${kind}-state`;item.textContent=message;return item}
 function button(label,kind,handler){const item=document.createElement('button');item.type='button';item.className=`button ${kind}`;item.textContent=label;item.addEventListener('click',handler);return item}
@@ -300,21 +326,21 @@ function renderSource(source){
   const item=document.createElement('article');item.className='resource-card';
   const header=document.createElement('div');header.className='resource-card-header';
   const title=document.createElement('h3');title.textContent=source.display_name;
-  header.append(title,chip(source.enabled?'Enabled':'Paused',source.enabled?'enabled':'paused'));item.append(header);
-  const details=document.createElement('div');details.className='resource-meta';details.append(meta('Book ID',source.book_id),meta('Scheduling',source.scheduling_gate));item.append(details);
+  header.append(title,chip(t(source.enabled?'status.enabled':'status.paused'),source.enabled?'enabled':'paused'));item.append(header);
+  const details=document.createElement('div');details.className='resource-meta';details.append(meta(t('source.book_id'),source.book_id),meta(t('source.scheduling'),statusLabel(source.scheduling_gate)));item.append(details);
   const actions=document.createElement('div');actions.className='resource-actions';
-  const edit=document.createElement('a');edit.className='button button-quiet';edit.href=`/admin/sources/${encodeURIComponent(source.id)}`;edit.textContent='Edit';actions.append(edit);
-  const mutate=async(action,fallback)=>{try{const response=await action();if(!response.ok){feedback(error,await apiErrorMessage(response,fallback));return null}return response}catch{feedback(error,'The admin service could not be reached. Try again.');return null}};
-  const toggle=button(source.enabled?'Pause':'Enable','button-quiet',async()=>{toggle.disabled=true;const response=await mutate(()=>request(`/api/admin/sources/${source.id}/enabled`,{method:'POST',body:JSON.stringify({enabled:!source.enabled})}),'Unable to change source status.');if(response){await load()}toggle.disabled=false});actions.append(toggle);
-  const gate=button(source.scheduling_gate==='ready'?'Gate ready':'Clear gate','button-quiet',async()=>{gate.disabled=true;const response=await mutate(()=>request(`/api/admin/sources/${source.id}/gate`,{method:'POST',body:JSON.stringify({gate:'ready'})}),'Unable to clear source gate.');if(response){await load()}gate.disabled=false});gate.disabled=source.scheduling_gate==='ready';actions.append(gate);
+  const edit=document.createElement('a');edit.className='button button-quiet';edit.href=`/admin/sources/${encodeURIComponent(source.id)}`;edit.textContent=t('source.edit');actions.append(edit);
+  const mutate=async(action,fallback)=>{try{const response=await action();if(!response.ok){feedback(error,await apiErrorMessage(response,fallback));return null}return response}catch{feedback(error,t('common.unreachable'));return null}};
+  const toggle=button(t(source.enabled?'action.pause':'action.enable'),'button-quiet',async()=>{toggle.disabled=true;const response=await mutate(()=>request(`/api/admin/sources/${source.id}/enabled`,{method:'POST',body:JSON.stringify({enabled:!source.enabled})}),'common.source_status_failed');if(response){await load()}toggle.disabled=false});actions.append(toggle);
+  const gate=button(t(source.scheduling_gate==='ready'?'source.gate_ready':'source.clear_gate'),'button-quiet',async()=>{gate.disabled=true;const response=await mutate(()=>request(`/api/admin/sources/${source.id}/gate`,{method:'POST',body:JSON.stringify({gate:'ready'})}),'common.source_gate_failed');if(response){await load()}gate.disabled=false});gate.disabled=source.scheduling_gate==='ready';actions.append(gate);
   const spacer=document.createElement('span');spacer.className='spacer';actions.append(spacer);
-  const token=button('Create feed link','button-secondary',async()=>{token.disabled=true;feedback(error,'');const response=await mutate(()=>request(`/api/admin/sources/${source.id}/feed-token`,{method:'POST'}),'Unable to create a feed link.');if(response){try{const value=await response.json();const href=value.feed_url||value.feed_path;if(!href){throw new Error('missing feed URL')}const link=document.createElement('a');link.href=href;link.textContent=href;link.target='_blank';link.rel='noreferrer';feedResult.replaceChildren(link);feedResult.hidden=false}catch{feedback(error,'The feed link response was invalid.')}}token.disabled=false});actions.append(token);item.append(actions);
+  const token=button(t('source.create_feed_link'),'button-secondary',async()=>{token.disabled=true;feedback(error,'');const response=await mutate(()=>request(`/api/admin/sources/${source.id}/feed-token`,{method:'POST'}),'common.feed_link_failed');if(response){try{const value=await response.json();const href=value.feed_url||value.feed_path;if(!href){throw new Error('missing feed URL')}const link=document.createElement('a');link.href=href;link.textContent=href;link.target='_blank';link.rel='noreferrer';feedResult.replaceChildren(link);feedResult.hidden=false}catch{feedback(error,t('common.feed_response_invalid'))}}token.disabled=false});actions.append(token);item.append(actions);
   const feedResult=document.createElement('p');feedResult.className='feedback success feed-result';feedResult.hidden=true;item.append(feedResult);
-  const history=document.createElement('details');history.className='history';const summary=document.createElement('summary');summary.textContent='Show sync history';history.append(summary);const historyList=document.createElement('ul');history.append(historyList);
-  history.addEventListener('toggle',async()=>{if(!history.open||history.dataset.loaded){return}history.dataset.loaded='true';const message=document.createElement('li');message.textContent='Loading history…';historyList.replaceChildren(message);try{const response=await fetch(`/api/admin/sources/${source.id}/sync-runs`);if(!response.ok){throw new Error('history request failed')}const runs=await response.json();historyList.replaceChildren();if(!runs.length){const empty=document.createElement('li');empty.textContent='No synchronization runs yet.';historyList.append(empty);return}runs.forEach(run=>{const runMessage=document.createElement('li');runMessage.textContent=run.outcome;historyList.append(runMessage)})}catch{historyList.replaceChildren();const failure=document.createElement('li');failure.textContent='History is temporarily unavailable.';historyList.append(failure)}});item.append(history);return item}
-async function load(){list.setAttribute('aria-busy','true');list.replaceChildren(stateMessage('Loading sources…'));try{const response=await fetch('/api/admin/sources');if(!response.ok){throw new Error('source list failed')}const sources=await response.json();sourceCount.textContent=sources.length;activeSourceCount.textContent=sources.filter(source=>source.enabled).length;if(!sources.length){list.replaceChildren(stateMessage('No sources yet.','empty'));const strong=document.createElement('strong');strong.textContent='Your first feed is one step away.';list.firstChild.prepend(strong)}else{list.replaceChildren(...sources.map(renderSource))}feedback(error,'')}catch{sourceCount.textContent='—';activeSourceCount.textContent='—';list.replaceChildren(stateMessage('Sources could not be loaded. Refresh and try again.','error'));feedback(error,'Unable to load sources.')}finally{list.setAttribute('aria-busy','false')}}
-function renderAccount(account){const item=document.createElement('article');item.className='resource-card';const header=document.createElement('div');header.className='resource-card-header';const title=document.createElement('h3');title.textContent=account.display_name;header.append(title,chip(account.status,account.status==='active'?'active':account.status==='disabled'?'disabled':'warning'));item.append(header);const details=document.createElement('div');details.className='resource-meta';details.append(meta('Account ID',account.account_id),meta('Current status',account.status));item.append(details);const actions=document.createElement('div');actions.className='resource-actions';const edit=document.createElement('a');edit.className='button button-quiet';edit.href=`/admin/weread/accounts/${encodeURIComponent(account.account_id)}`;edit.textContent='Manage';actions.append(edit);item.append(actions);return item}
-async function loadAccounts(){accountList.setAttribute('aria-busy','true');accountList.replaceChildren(stateMessage('Loading accounts…'));try{const response=await fetch('/api/admin/weread/accounts');if(!response.ok){throw new Error('account list failed')}const accounts=await response.json();accountCount.textContent=accounts.length;if(!accounts.length){accountList.replaceChildren(stateMessage('No WeRead accounts yet.','empty'));const strong=document.createElement('strong');strong.textContent='Add an account to enable authenticated sync.';accountList.firstChild.prepend(strong)}else{accountList.replaceChildren(...accounts.map(renderAccount))}feedback(accountListError,'')}catch{accountCount.textContent='—';accountList.replaceChildren(stateMessage('Accounts could not be loaded. Refresh and try again.','error'));feedback(accountListError,'Unable to load WeRead accounts.')}finally{accountList.setAttribute('aria-busy','false')}}
+  const history=document.createElement('details');history.className='history';const summary=document.createElement('summary');summary.textContent=t('source.history');history.append(summary);const historyList=document.createElement('ul');history.append(historyList);
+  history.addEventListener('toggle',async()=>{if(!history.open||history.dataset.loaded){return}history.dataset.loaded='true';const message=document.createElement('li');message.textContent=t('source.history_loading');historyList.replaceChildren(message);try{const response=await fetch(`/api/admin/sources/${source.id}/sync-runs`);if(!response.ok){throw new Error('history request failed')}const runs=await response.json();historyList.replaceChildren();if(!runs.length){const empty=document.createElement('li');empty.textContent=t('source.no_history');historyList.append(empty);return}runs.forEach(run=>{const runMessage=document.createElement('li');runMessage.textContent=statusLabel(run.outcome);historyList.append(runMessage)})}catch{historyList.replaceChildren();const failure=document.createElement('li');failure.textContent=t('source.history_unavailable');historyList.append(failure)}});item.append(history);return item}
+async function load(){list.setAttribute('aria-busy','true');list.replaceChildren(stateMessage(t('state.loading_sources')));try{const response=await fetch('/api/admin/sources');if(!response.ok){throw new Error('source list failed')}const sources=await response.json();sourceCount.textContent=sources.length;activeSourceCount.textContent=sources.filter(source=>source.enabled).length;if(!sources.length){list.replaceChildren(stateMessage(t('state.no_sources'),'empty'));const strong=document.createElement('strong');strong.textContent=t('state.first_feed');list.firstChild.prepend(strong)}else{list.replaceChildren(...sources.map(renderSource))}feedback(error,'')}catch{sourceCount.textContent='—';activeSourceCount.textContent='—';list.replaceChildren(stateMessage(t('state.sources_load_failed'),'error'));feedback(error,t('state.load_sources_error'))}finally{list.setAttribute('aria-busy','false')}}
+function renderAccount(account){const item=document.createElement('article');item.className='resource-card';const header=document.createElement('div');header.className='resource-card-header';const title=document.createElement('h3');title.textContent=account.display_name;header.append(title,chip(t(`status.${account.status}`),account.status==='active'?'active':account.status==='disabled'?'disabled':'warning'));item.append(header);const details=document.createElement('div');details.className='resource-meta';details.append(meta(t('account.id'),account.account_id),meta(t('account.current_status'),t(`status.${account.status}`)));item.append(details);const actions=document.createElement('div');actions.className='resource-actions';const edit=document.createElement('a');edit.className='button button-quiet';edit.href=`/admin/weread/accounts/${encodeURIComponent(account.account_id)}`;edit.textContent=t('account.manage');actions.append(edit);item.append(actions);return item}
+async function loadAccounts(){accountList.setAttribute('aria-busy','true');accountList.replaceChildren(stateMessage(t('state.loading_accounts')));try{const response=await fetch('/api/admin/weread/accounts');if(!response.ok){throw new Error('account list failed')}const accounts=await response.json();accountCount.textContent=accounts.length;if(!accounts.length){accountList.replaceChildren(stateMessage(t('state.no_accounts'),'empty'));const strong=document.createElement('strong');strong.textContent=t('state.add_account_hint');accountList.firstChild.prepend(strong)}else{accountList.replaceChildren(...accounts.map(renderAccount))}feedback(accountListError,'')}catch{accountCount.textContent='—';accountList.replaceChildren(stateMessage(t('state.accounts_load_failed'),'error'));feedback(accountListError,t('state.load_accounts_error'))}finally{accountList.setAttribute('aria-busy','false')}}
 document.querySelector('#source-create').addEventListener('submit', async event => {
   event.preventDefault();
   const submit = event.target.querySelector('button[type="submit"]');
@@ -339,29 +365,31 @@ document.querySelector('#source-create').addEventListener('submit', async event 
     if (response.ok) {
       event.target.reset();
       await load();
-      feedback(error, 'Source added.', 'success');
+      feedback(error, t('common.source_added'), 'success');
     } else {
-      feedback(error, await apiErrorMessage(response, 'Source could not be added.'));
+      feedback(error, await apiErrorMessage(response, 'common.source_add_failed'));
     }
   } catch {
-    feedback(error, 'The admin service could not be reached. Try again.');
+    feedback(error, t('common.unreachable'));
   } finally {
     submit.disabled = false;
   }
 });
-document.querySelector('#weread-account').addEventListener('submit',async event=>{event.preventDefault();const submit=event.target.querySelector('button[type="submit"]');submit.disabled=true;feedback(accountResult,'');const form=new FormData(event.target);const account=form.get('account_id');const displayName=form.get('display_name');const path=account?`/api/admin/weread/accounts/${encodeURIComponent(account)}`:'/api/admin/weread/accounts';try{const response=await request(path,{method:account?'PUT':'POST',body:JSON.stringify({account_id:account?account:null,display_name:displayName&&displayName.trim()?displayName.trim():null,cookie_header:form.get('cookie_header'),access_expires_at:new Date(form.get('access_expires_at')).toISOString()})});if(response.ok){const value=await response.json();event.target.reset();feedback(accountResult,`Saved account ${value.account_id}; use this ID when adding a source.`,'success');await loadAccounts()}else{feedback(accountResult,await apiErrorMessage(response,'WeRead account could not be saved; check the values and try again.'))}}catch{feedback(accountResult,'The admin service could not be reached. Try again.')}finally{submit.disabled=false}});
+document.querySelector('#weread-account').addEventListener('submit',async event=>{event.preventDefault();const submit=event.target.querySelector('button[type="submit"]');submit.disabled=true;feedback(accountResult,'');const form=new FormData(event.target);const account=form.get('account_id');const displayName=form.get('display_name');const path=account?`/api/admin/weread/accounts/${encodeURIComponent(account)}`:'/api/admin/weread/accounts';try{const response=await request(path,{method:account?'PUT':'POST',body:JSON.stringify({account_id:account?account:null,display_name:displayName&&displayName.trim()?displayName.trim():null,cookie_header:form.get('cookie_header'),access_expires_at:new Date(form.get('access_expires_at')).toISOString()})});if(response.ok){const value=await response.json();event.target.reset();feedback(accountResult,t('common.account_saved_detail').replace('{id}',value.account_id),'success');await loadAccounts()}else{feedback(accountResult,await apiErrorMessage(response,'common.account_save_failed'))}}catch{feedback(accountResult,t('common.unreachable'))}finally{submit.disabled=false}});
 document.querySelector('#logout').addEventListener('click',async()=>{const logout=document.querySelector('#logout');logout.disabled=true;try{await request('/api/admin/logout',{method:'POST'})}finally{location='/admin/login'}});load();loadAccounts();
 </script></body></html>"##;
     Html(
         template
             .replace("__STYLES__", STYLES)
+            .replace("__LOCALE_PICKER__", LOCALE_PICKER)
             .replace("__USERNAME__", &username)
-            .replace("__CSRF__", &csrf_json),
+            .replace("__CSRF__", &csrf_json)
+            .replace("__I18N__", &i18n_bootstrap(locale)),
     )
 }
 
 /// Renders the authenticated source configuration and lifecycle page.
-pub fn source_page(session: &AdminSession, source: &Source) -> Html<String> {
+pub fn source_page(session: &AdminSession, source: &Source, locale: Locale) -> Html<String> {
     let username = escape_html(session.username());
     let csrf = escape_html(session.csrf_token());
     let csrf_json = serde_json::to_string(&csrf).expect("escaped CSRF token should serialize");
@@ -382,37 +410,58 @@ pub fn source_page(session: &AdminSession, source: &Source) -> Html<String> {
             .unwrap_or_default()
             .as_str(),
     );
-    let status = if source.enabled() {
+    let (status_key, status_text, toggle_key, toggle_text) = if source.enabled() {
+        ("status.enabled", "Enabled", "source.pause_source", "Pause")
+    } else {
+        ("status.paused", "Paused", "source.enable_source", "Enable")
+    };
+    let status_class = if source.enabled() {
         "enabled"
     } else {
         "paused"
     };
-    let gate = escape_html(source.scheduling_gate().as_str());
+    let (gate_key, gate_text) = match source.scheduling_gate() {
+        crate::domain::source::SchedulingGate::Ready => ("status.ready", "Ready"),
+        crate::domain::source::SchedulingGate::AuthenticationRequired => {
+            ("status.authentication_required", "Authentication required")
+        }
+        crate::domain::source::SchedulingGate::RiskControlled => {
+            ("status.risk_controlled", "Risk controlled")
+        }
+    };
     let template = r##"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Edit source — Werrss admin</title>__STYLES__</head>
-<body><header class="site-header"><div class="header-inner"><a class="brand" href="/admin/"><span class="brand-mark" aria-hidden="true">W</span><span class="brand-copy">Werrss<small>Admin console</small></span></a><div class="header-actions"><span class="identity">Signed in as <strong>__USERNAME__</strong></span><a class="button button-quiet" href="/admin/">Dashboard</a></div></div></header><main class="page-shell"><nav class="breadcrumb" aria-label="Breadcrumb"><a href="/admin/">Dashboard</a><span>/</span><span>Edit source</span></nav><section class="page-header"><div><p class="kicker">Source settings</p><h1>Edit source</h1><p>Update how this source is identified, scheduled, and delivered.</p></div><span class="status-chip __STATUS_CLASS__">__STATUS__</span></section><div class="split-panel"><section class="card"><div class="card-header"><div><h2>Configuration</h2><p>Changes take effect on the next synchronization cycle.</p></div><span class="card-icon" aria-hidden="true">⚙</span></div><form id="source"><fieldset class="form-section"><legend>Feed identity</legend><div class="field-grid"><label><span>Book ID</span><input name="book_id" value="__BOOK_ID__" required></label><label><span>Name</span><input name="display_name" value="__DISPLAY_NAME__" required></label><label class="wide"><span class="label-row"><span>Article URL</span><span class="label-hint">Optional for Book ID-only sources</span></span><input name="article_url" type="url" value="__ARTICLE_URL__"><span class="small">Clear it when the source is identified only by Book ID.</span></label><label class="wide"><span class="label-row"><span>WeRead account ID</span><span class="label-hint">Optional</span></span><input name="account_id" value="__ACCOUNT_ID__"><span class="small">Clear it to let the worker choose an enabled account.</span></label></div></fieldset><fieldset class="form-section"><legend>Delivery policy</legend><div class="field-grid"><label><span>Sync interval (seconds)</span><input name="sync_interval_seconds" type="number" min="1" value="__SYNC_INTERVAL__" required></label><label><span>RSS item limit</span><input name="rss_item_limit" type="number" min="1" value="__RSS_ITEM_LIMIT__" required></label><label><span>Priority</span><input name="priority" type="number" value="__PRIORITY__" required></label><label><span>Maximum attempts</span><input name="max_attempts" type="number" min="1" value="__MAX_ATTEMPTS__" required></label></div></fieldset><div class="form-actions"><a class="button button-quiet" href="/admin/">Cancel</a><button class="button-primary" type="submit">Save changes</button></div></form><p id="result" class="feedback" role="status" hidden></p></section><aside class="side-stack"><section class="card"><div class="card-header"><div><h2>Runtime status</h2><p>Current scheduling state.</p></div><span class="card-icon green" aria-hidden="true">✓</span></div><dl class="definition-list"><div><dt>Status</dt><dd>__STATUS__</dd></div><div><dt>Gate</dt><dd>__GATE__</dd></div><div><dt>Revision</dt><dd>__REVISION__</dd></div></dl><div class="form-actions"><button id="toggle" class="button-secondary" type="button">__TOGGLE__ source</button><button id="clear-gate" class="button-quiet" type="button">Clear gate</button></div></section><section class="card danger-zone"><div class="card-header"><div><h2>Danger zone</h2><p>Deleting removes this source and its stored articles.</p></div><span class="card-icon red" aria-hidden="true">!</span></div><button id="delete" class="button-danger" type="button">Delete source</button></section></aside></div></main>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title data-i18n="source.edit_title">Edit source — Werrss admin</title>__STYLES__</head>
+<body><header class="site-header"><div class="header-inner"><a class="brand" href="/admin/"><span class="brand-mark" aria-hidden="true">W</span><span class="brand-copy">Werrss<small data-i18n="app.admin_console">Admin console</small></span></a><div class="header-actions"><span class="identity"><span data-i18n="nav.signed_in_as">Signed in as</span> <strong>__USERNAME__</strong></span><a class="button button-quiet" href="/admin/" data-i18n="nav.dashboard">Dashboard</a>__LOCALE_PICKER__</div></div></header><main class="page-shell"><nav class="breadcrumb" data-i18n-aria-label="common.breadcrumb" aria-label="Breadcrumb"><a href="/admin/" data-i18n="nav.dashboard">Dashboard</a><span>/</span><span data-i18n="source.edit_heading">Edit source</span></nav><section class="page-header"><div><p class="kicker" data-i18n="source.settings_kicker">Source settings</p><h1 data-i18n="source.edit_heading">Edit source</h1><p data-i18n="source.edit_description">Update how this source is identified, scheduled, and delivered.</p></div><span class="status-chip __STATUS_CLASS__" data-i18n="__STATUS_KEY__">__STATUS_TEXT__</span></section><div class="split-panel"><section class="card"><div class="card-header"><div><h2 data-i18n="source.configuration">Configuration</h2><p data-i18n="source.config_description">Changes take effect on the next synchronization cycle.</p></div><span class="card-icon" aria-hidden="true">⚙</span></div><form id="source"><fieldset class="form-section"><legend data-i18n="source.feed_identity">Feed identity</legend><div class="field-grid"><label><span data-i18n="source.book_id">Book ID</span><input name="book_id" value="__BOOK_ID__" required></label><label><span data-i18n="source.name">Name</span><input name="display_name" value="__DISPLAY_NAME__" required></label><label class="wide"><span class="label-row"><span data-i18n="source.article_url">Article URL</span><span class="label-hint" data-i18n="source.article_url_hint">Optional for Book ID-only sources</span></span><input name="article_url" type="url" value="__ARTICLE_URL__"><span class="small" data-i18n="source.article_url_help">Clear it when the source is identified only by Book ID.</span></label><label class="wide"><span class="label-row"><span data-i18n="source.account_id">WeRead account ID</span><span class="label-hint" data-i18n="source.account_id_hint">Optional</span></span><input name="account_id" value="__ACCOUNT_ID__"><span class="small" data-i18n="source.account_id_help">Clear it to let the worker choose an enabled account.</span></label></div></fieldset><fieldset class="form-section"><legend data-i18n="source.delivery_policy">Delivery policy</legend><div class="field-grid"><label><span data-i18n="source.sync_interval">Sync interval (seconds)</span><input name="sync_interval_seconds" type="number" min="1" value="__SYNC_INTERVAL__" required></label><label><span data-i18n="source.rss_item_limit">RSS item limit</span><input name="rss_item_limit" type="number" min="1" value="__RSS_ITEM_LIMIT__" required></label><label><span data-i18n="source.priority">Priority</span><input name="priority" type="number" value="__PRIORITY__" required></label><label><span data-i18n="source.maximum_attempts">Maximum attempts</span><input name="max_attempts" type="number" min="1" value="__MAX_ATTEMPTS__" required></label></div></fieldset><div class="form-actions"><a class="button button-quiet" href="/admin/" data-i18n="action.cancel">Cancel</a><button class="button-primary" type="submit" data-i18n="action.save_changes">Save changes</button></div></form><p id="result" class="feedback" role="status" hidden></p></section><aside class="side-stack"><section class="card"><div class="card-header"><div><h2 data-i18n="source.runtime_status">Runtime status</h2><p data-i18n="source.runtime_status_description">Current scheduling state.</p></div><span class="card-icon green" aria-hidden="true">✓</span></div><dl class="definition-list"><div><dt data-i18n="source.status">Status</dt><dd data-i18n="__STATUS_KEY__">__STATUS_TEXT__</dd></div><div><dt data-i18n="source.gate">Gate</dt><dd>__GATE__</dd></div><div><dt data-i18n="source.revision">Revision</dt><dd>__REVISION__</dd></div></dl><div class="form-actions"><button id="toggle" class="button-secondary" type="button"><span data-i18n="__TOGGLE_KEY__">__TOGGLE_TEXT__</span> <span data-i18n="common.source">source</span></button><button id="clear-gate" class="button-quiet" type="button" data-i18n="source.clear_gate">Clear gate</button></div></section><section class="card danger-zone"><div class="card-header"><div><h2 data-i18n="source.danger_zone">Danger zone</h2><p data-i18n="source.delete_description">Deleting removes this source and its stored articles.</p></div><span class="card-icon red" aria-hidden="true">!</span></div><button id="delete" class="button-danger" type="button" data-i18n="action.delete_source">Delete source</button></section></aside></div></main>
 <script>
+__I18N__
 const sourceId='__SOURCE_ID__';const csrf=__CSRF__;const headers={'content-type':'application/json','x-csrf-token':csrf};const result=document.querySelector('#result');
 const request=(path,options={})=>fetch(path,{...options,headers:{...headers,...(options.headers||{})}});
-async function apiErrorMessage(response,fallback){try{const value=await response.json();if(typeof value.error==='string'&&value.error.trim()){return value.error}}catch{}return fallback}
-async function runControlAction(control,action,fallback){control.disabled=true;try{const response=await action();if(response.ok){return true}result.textContent=await apiErrorMessage(response,fallback)}catch{result.textContent='The admin service could not be reached. Try again.'}finally{control.disabled=false}result.className='feedback error';result.hidden=false;return false}
-document.querySelector('#source').addEventListener('submit',async event=>{event.preventDefault();const submit=event.target.querySelector('button[type="submit"]');submit.disabled=true;result.hidden=true;const form=new FormData(event.target);const value=name=>{const field=form.get(name);return field&&field.toString().trim()?field.toString().trim():null};try{const response=await request(`/api/admin/sources/${sourceId}`,{method:'PUT',body:JSON.stringify({book_id:value('book_id'),display_name:value('display_name'),article_url:value('article_url'),account_id:value('account_id'),sync_interval_seconds:Number(form.get('sync_interval_seconds')),rss_item_limit:Number(form.get('rss_item_limit')),priority:Number(form.get('priority')),max_attempts:Number(form.get('max_attempts'))})});if(response.ok){result.textContent='Source updated.';result.className='feedback success';result.hidden=false;setTimeout(()=>location.reload(),350)}else{result.textContent=await apiErrorMessage(response,'Source could not be updated.');result.className='feedback error';result.hidden=false}}catch{result.textContent='The admin service could not be reached. Try again.';result.className='feedback error';result.hidden=false}finally{submit.disabled=false}});
-document.querySelector('#toggle').addEventListener('click',async()=>{const control=document.querySelector('#toggle');if(await runControlAction(control,()=>request(`/api/admin/sources/${sourceId}/enabled`,{method:'POST',body:JSON.stringify({enabled:__NEXT_ENABLED__})}),'Source status could not be changed.')){location.reload()}});
-document.querySelector('#clear-gate').addEventListener('click',async()=>{const control=document.querySelector('#clear-gate');if(await runControlAction(control,()=>request(`/api/admin/sources/${sourceId}/gate`,{method:'POST',body:JSON.stringify({gate:'ready'})}),'Source gate could not be cleared.')){location.reload()}});
-document.querySelector('#delete').addEventListener('click',async()=>{if(!confirm('Delete this source and its stored articles permanently?')){return}const control=document.querySelector('#delete');if(await runControlAction(control,()=>request(`/api/admin/sources/${sourceId}`,{method:'DELETE'}),'Source could not be deleted.')){location='/admin/'}});
+async function apiErrorMessage(response,fallback){try{const value=await response.json();if(typeof value.error==='string'&&value.error.trim()){return value.error}}catch{}return t(fallback)}
+async function runControlAction(control,action,fallback){control.disabled=true;try{const response=await action();if(response.ok){return true}result.textContent=await apiErrorMessage(response,fallback)}catch{result.textContent=t('common.unreachable')}finally{control.disabled=false}result.className='feedback error';result.hidden=false;return false}
+document.querySelector('#source').addEventListener('submit',async event=>{event.preventDefault();const submit=event.target.querySelector('button[type="submit"]');submit.disabled=true;result.hidden=true;const form=new FormData(event.target);const value=name=>{const field=form.get(name);return field&&field.toString().trim()?field.toString().trim():null};try{const response=await request(`/api/admin/sources/${sourceId}`,{method:'PUT',body:JSON.stringify({book_id:value('book_id'),display_name:value('display_name'),article_url:value('article_url'),account_id:value('account_id'),sync_interval_seconds:Number(form.get('sync_interval_seconds')),rss_item_limit:Number(form.get('rss_item_limit')),priority:Number(form.get('priority')),max_attempts:Number(form.get('max_attempts'))})});if(response.ok){result.textContent=t('source.updated');result.className='feedback success';result.hidden=false;setTimeout(()=>location.reload(),350)}else{result.textContent=await apiErrorMessage(response,'source.update_failed');result.className='feedback error';result.hidden=false}}catch{result.textContent=t('common.unreachable');result.className='feedback error';result.hidden=false}finally{submit.disabled=false}});
+document.querySelector('#toggle').addEventListener('click',async()=>{const control=document.querySelector('#toggle');if(await runControlAction(control,()=>request(`/api/admin/sources/${sourceId}/enabled`,{method:'POST',body:JSON.stringify({enabled:__NEXT_ENABLED__})}),'source.status_change_failed')){location.reload()}});
+document.querySelector('#clear-gate').addEventListener('click',async()=>{const control=document.querySelector('#clear-gate');if(await runControlAction(control,()=>request(`/api/admin/sources/${sourceId}/gate`,{method:'POST',body:JSON.stringify({gate:'ready'})}),'source.gate_clear_failed')){location.reload()}});
+document.querySelector('#delete').addEventListener('click',async()=>{if(!confirm(t('source.delete_confirm'))){return}const control=document.querySelector('#delete');if(await runControlAction(control,()=>request(`/api/admin/sources/${sourceId}`,{method:'DELETE'}),'source.delete_failed')){location='/admin/'}});
 </script></body></html>"##;
     Html(
         template
             .replace("__STYLES__", STYLES)
+            .replace("__LOCALE_PICKER__", LOCALE_PICKER)
             .replace("__USERNAME__", &username)
             .replace("__SOURCE_ID__", &source_id)
             .replace("__BOOK_ID__", &book_id)
             .replace("__DISPLAY_NAME__", &display_name)
             .replace("__ARTICLE_URL__", &article_url)
             .replace("__ACCOUNT_ID__", &account_id)
-            .replace("__STATUS__", status)
-            .replace("__STATUS_CLASS__", status)
-            .replace("__GATE__", &gate)
+            .replace("__STATUS_KEY__", status_key)
+            .replace("__STATUS_TEXT__", status_text)
+            .replace("__STATUS_CLASS__", status_class)
+            .replace(
+                "<dd>__GATE__</dd>",
+                r#"<dd data-i18n="__GATE_KEY__">__GATE_TEXT__</dd>"#,
+            )
+            .replace("__GATE_KEY__", gate_key)
+            .replace("__GATE_TEXT__", gate_text)
             .replace("__REVISION__", &source.feed_revision().to_string())
             .replace(
                 "__SYNC_INTERVAL__",
@@ -421,39 +470,45 @@ document.querySelector('#delete').addEventListener('click',async()=>{if(!confirm
             .replace("__RSS_ITEM_LIMIT__", &source.rss_item_limit().to_string())
             .replace("__PRIORITY__", &source.priority().to_string())
             .replace("__MAX_ATTEMPTS__", &source.max_attempts().to_string())
-            .replace(
-                "__TOGGLE__",
-                if source.enabled() { "Pause" } else { "Enable" },
-            )
+            .replace("__TOGGLE_KEY__", toggle_key)
+            .replace("__TOGGLE__", toggle_text)
             .replace(
                 "__NEXT_ENABLED__",
                 if source.enabled() { "false" } else { "true" },
             )
-            .replace("__CSRF__", &csrf_json),
+            .replace("__CSRF__", &csrf_json)
+            .replace("__I18N__", &i18n_bootstrap(locale)),
     )
 }
 
 /// Renders the authenticated WeRead account list page.
-pub fn weread_accounts_page(session: &AdminSession) -> Html<String> {
+pub fn weread_accounts_page(session: &AdminSession, locale: Locale) -> Html<String> {
     let username = escape_html(session.username());
     let template = r##"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WeRead accounts — Werrss admin</title>__STYLES__</head>
-<body><header class="site-header"><div class="header-inner"><a class="brand" href="/admin/"><span class="brand-mark" aria-hidden="true">W</span><span class="brand-copy">Werrss<small>Admin console</small></span></a><div class="header-actions"><span class="identity">Signed in as <strong>__USERNAME__</strong></span><a class="button button-quiet" href="/admin/">Dashboard</a></div></div></header><main class="page-shell"><nav class="breadcrumb" aria-label="Breadcrumb"><a href="/admin/">Dashboard</a><span>/</span><span>WeRead accounts</span></nav><section class="page-header"><div><p class="kicker">Credentials</p><h1>WeRead accounts</h1><p>Keep authenticated browser sessions healthy without exposing stored cookies.</p></div><a class="button button-primary" href="/admin/#weread-account-card">Add account</a></section><section class="card"><div class="card-header"><div><h2>Account directory</h2><p>Active accounts can be selected for unbound source synchronization.</p></div><span class="card-icon green" aria-hidden="true">W</span></div><div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><span>Credentials are encrypted at rest. Manage an account to replace its cookie header or change its status.</span></div><p id="error" class="feedback" role="alert" hidden></p><div id="accounts" class="resource-grid" aria-live="polite" aria-busy="true"><div class="loading-state">Loading accounts…</div></div></section></main>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title data-i18n="account.accounts_title">WeRead accounts — Werrss admin</title>__STYLES__</head>
+<body><header class="site-header"><div class="header-inner"><a class="brand" href="/admin/"><span class="brand-mark" aria-hidden="true">W</span><span class="brand-copy">Werrss<small data-i18n="app.admin_console">Admin console</small></span></a><div class="header-actions"><span class="identity"><span data-i18n="nav.signed_in_as">Signed in as</span> <strong>__USERNAME__</strong></span><a class="button button-quiet" href="/admin/" data-i18n="nav.dashboard">Dashboard</a>__LOCALE_PICKER__</div></div></header><main class="page-shell"><nav class="breadcrumb" data-i18n-aria-label="common.breadcrumb" aria-label="Breadcrumb"><a href="/admin/" data-i18n="nav.dashboard">Dashboard</a><span>/</span><span data-i18n="account.list_heading">WeRead accounts</span></nav><section class="page-header"><div><p class="kicker" data-i18n="account.credentials_kicker">Credentials</p><h1 data-i18n="account.list_heading">WeRead accounts</h1><p data-i18n="account.page_description">Keep authenticated browser sessions healthy without exposing stored cookies.</p></div><a class="button button-primary" href="/admin/#weread-account-card" data-i18n="action.add_account">Add account</a></section><section class="card"><div class="card-header"><div><h2 data-i18n="account.directory">Account directory</h2><p data-i18n="account.directory_description">Active accounts can be selected for unbound source synchronization.</p></div><span class="card-icon green" aria-hidden="true">W</span></div><div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><span data-i18n="account.credentials_notice">Credentials are encrypted at rest. Manage an account to replace its cookie header or change its status.</span></div><p id="error" class="feedback" role="alert" hidden></p><div id="accounts" class="resource-grid" aria-live="polite" aria-busy="true"><div class="loading-state" data-i18n="state.loading_accounts">Loading accounts…</div></div></section></main>
 <script>
+__I18N__
 const list=document.querySelector('#accounts');const error=document.querySelector('#error');
 function stateMessage(message,kind='loading'){const item=document.createElement('div');item.className=`${kind}-state`;item.textContent=message;return item}
-async function loadAccounts(){list.setAttribute('aria-busy','true');try{const response=await fetch('/api/admin/weread/accounts');if(!response.ok){throw new Error('account list failed')}const accounts=await response.json();if(!accounts.length){list.replaceChildren(stateMessage('No WeRead accounts have been added.','empty'));const strong=document.createElement('strong');strong.textContent='Add your first account from the dashboard.';list.firstChild.prepend(strong);return}list.replaceChildren(...accounts.map(account=>{const item=document.createElement('article');item.className='resource-card';const header=document.createElement('div');header.className='resource-card-header';const title=document.createElement('h3');title.textContent=account.display_name;const status=document.createElement('span');status.className=`status-chip ${account.status==='active'?'active':account.status==='disabled'?'disabled':'warning'}`;status.textContent=account.status;header.append(title,status);item.append(header);const details=document.createElement('div');details.className='resource-meta';const row=document.createElement('div');row.className='resource-meta-row';const label=document.createElement('span');label.textContent='Account ID';const value=document.createElement('strong');value.textContent=account.account_id;row.append(label,value);details.append(row);item.append(details);const edit=document.createElement('a');edit.className='button button-quiet';edit.href=`/admin/weread/accounts/${encodeURIComponent(account.account_id)}`;edit.textContent='Manage account';item.append(edit);return item}))}catch{list.replaceChildren(stateMessage('Accounts could not be loaded. Refresh and try again.','error'));error.textContent='Unable to load WeRead accounts.';error.className='feedback error';error.hidden=false}finally{list.setAttribute('aria-busy','false')}}
+async function loadAccounts(){list.setAttribute('aria-busy','true');try{const response=await fetch('/api/admin/weread/accounts');if(!response.ok){throw new Error('account list failed')}const accounts=await response.json();if(!accounts.length){list.replaceChildren(stateMessage(t('state.no_accounts_page'),'empty'));const strong=document.createElement('strong');strong.textContent=t('state.add_first_account');list.firstChild.prepend(strong);return}list.replaceChildren(...accounts.map(account=>{const item=document.createElement('article');item.className='resource-card';const header=document.createElement('div');header.className='resource-card-header';const title=document.createElement('h3');title.textContent=account.display_name;const status=document.createElement('span');status.className=`status-chip ${account.status==='active'?'active':account.status==='disabled'?'disabled':'warning'}`;status.textContent=statusLabel(account.status);header.append(title,status);item.append(header);const details=document.createElement('div');details.className='resource-meta';const row=document.createElement('div');row.className='resource-meta-row';const label=document.createElement('span');label.textContent=t('account.id');const value=document.createElement('strong');value.textContent=account.account_id;row.append(label,value);details.append(row);item.append(details);const edit=document.createElement('a');edit.className='button button-quiet';edit.href=`/admin/weread/accounts/${encodeURIComponent(account.account_id)}`;edit.textContent=t('account.manage_account');item.append(edit);return item}))}catch{list.replaceChildren(stateMessage(t('state.accounts_page_load_failed'),'error'));error.textContent=t('state.accounts_page_error');error.className='feedback error';error.hidden=false}finally{list.setAttribute('aria-busy','false')}}
 loadAccounts();
 </script></body></html>"##;
     Html(
         template
             .replace("__STYLES__", STYLES)
-            .replace("__USERNAME__", &username),
+            .replace("__LOCALE_PICKER__", LOCALE_PICKER)
+            .replace("__USERNAME__", &username)
+            .replace("__I18N__", &i18n_bootstrap(locale)),
     )
 }
 
 /// Renders the account-specific credential replacement page.
-pub fn weread_account_page(session: &AdminSession, account: &WeReadAccount) -> Html<String> {
+pub fn weread_account_page(
+    session: &AdminSession,
+    account: &WeReadAccount,
+    locale: Locale,
+) -> Html<String> {
     let username = escape_html(session.username());
     let csrf = escape_html(session.csrf_token());
     let csrf_json = serde_json::to_string(&csrf).expect("escaped CSRF token should serialize");
@@ -465,21 +520,28 @@ pub fn weread_account_page(session: &AdminSession, account: &WeReadAccount) -> H
     } else {
         "active"
     };
+    let (toggle_key, toggle_text) = if account.disabled() {
+        ("account.enable_account", "Enable")
+    } else {
+        ("account.disable_account", "Disable")
+    };
     let template = r##"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WeRead account — Werrss admin</title>__STYLES__</head>
-<body><header class="site-header"><div class="header-inner"><a class="brand" href="/admin/"><span class="brand-mark" aria-hidden="true">W</span><span class="brand-copy">Werrss<small>Admin console</small></span></a><div class="header-actions"><span class="identity">Signed in as <strong>__USERNAME__</strong></span><a class="button button-quiet" href="/admin/weread/accounts">Accounts</a></div></div></header><main class="page-shell"><nav class="breadcrumb" aria-label="Breadcrumb"><a href="/admin/">Dashboard</a><span>/</span><a href="/admin/weread/accounts">WeRead accounts</a><span>/</span><span>Manage account</span></nav><section class="page-header"><div><p class="kicker">Credential settings</p><h1>Manage WeRead account</h1><p>Rotate the browser session or update its display name.</p></div><span class="status-chip __STATUS_CLASS__">__STATUS__</span></section><div class="split-panel"><section class="card"><div class="card-header"><div><h2>Account details</h2><p>Account ID <code>__ACCOUNT_ID__</code></p></div><span class="card-icon green" aria-hidden="true">W</span></div><div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><span>For security, the stored cookie is never displayed. Paste a complete fresh Cookie request-header value when rotating credentials.</span></div><form id="account"><label><span class="label-row"><span>Display name</span><span class="label-hint">Optional when wr_name is present</span></span><input name="display_name" value="__DISPLAY_NAME__"><span class="small">You may leave this blank if the cookie contains a usable <code>wr_name</code>.</span></label><label><span>New WeRead Cookie header</span><textarea name="cookie_header" rows="7" required autocomplete="off" placeholder="wr_vid=…; wr_skey=…; wr_rt=…"></textarea></label><label><span>Access token expiry</span><input id="expiry" name="access_expires_at" type="datetime-local" data-value="__EXPIRES_AT__" required></label><div class="form-actions"><a class="button button-quiet" href="/admin/weread/accounts">Cancel</a><button class="button-primary" type="submit">Save changes</button></div></form><p id="result" class="feedback" role="status" hidden></p></section><aside class="side-stack"><section class="card"><div class="card-header"><div><h2>Account status</h2><p>Disabled accounts are skipped by random selection.</p></div><span class="card-icon orange" aria-hidden="true">●</span></div><button id="toggle" class="button-secondary" type="button">__TOGGLE__ account</button></section><section class="card danger-zone"><div class="card-header"><div><h2>Danger zone</h2><p>Deleting removes the stored credentials permanently.</p></div><span class="card-icon red" aria-hidden="true">!</span></div><button id="delete" class="button-danger" type="button">Delete account</button></section></aside></div></main>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title data-i18n="account.account_title">WeRead account — Werrss admin</title>__STYLES__</head>
+<body><header class="site-header"><div class="header-inner"><a class="brand" href="/admin/"><span class="brand-mark" aria-hidden="true">W</span><span class="brand-copy">Werrss<small data-i18n="app.admin_console">Admin console</small></span></a><div class="header-actions"><span class="identity"><span data-i18n="nav.signed_in_as">Signed in as</span> <strong>__USERNAME__</strong></span><a class="button button-quiet" href="/admin/weread/accounts" data-i18n="nav.accounts">Accounts</a>__LOCALE_PICKER__</div></div></header><main class="page-shell"><nav class="breadcrumb" data-i18n-aria-label="common.breadcrumb" aria-label="Breadcrumb"><a href="/admin/" data-i18n="nav.dashboard">Dashboard</a><span>/</span><a href="/admin/weread/accounts" data-i18n="account.list_heading">WeRead accounts</a><span>/</span><span data-i18n="nav.manage_account">Manage account</span></nav><section class="page-header"><div><p class="kicker" data-i18n="account.credential_settings_kicker">Credential settings</p><h1 data-i18n="account.manage_heading">Manage WeRead account</h1><p data-i18n="account.manage_description">Rotate the browser session or update its display name.</p></div><span class="status-chip __STATUS_CLASS__" data-i18n="status.__STATUS__">__STATUS__</span></section><div class="split-panel"><section class="card"><div class="card-header"><div><h2 data-i18n="account.details">Account details</h2><p><span data-i18n="account.id">Account ID</span> <code>__ACCOUNT_ID__</code></p></div><span class="card-icon green" aria-hidden="true">W</span></div><div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><span data-i18n="account.rotation_notice">For security, the stored cookie is never displayed. Paste a complete fresh Cookie request-header value when rotating credentials.</span></div><form id="account"><label><span class="label-row"><span data-i18n="account.display_name">Display name</span><span class="label-hint" data-i18n="account.display_name_hint">Optional when wr_name is present</span></span><input name="display_name" value="__DISPLAY_NAME__"><span class="small" data-i18n="account.display_name_help">You may leave this blank if the cookie contains a usable <code>wr_name</code>.</span></label><label><span data-i18n="account.new_cookie_header">New WeRead Cookie header</span><textarea name="cookie_header" rows="7" required autocomplete="off" data-i18n-placeholder="account.cookie_placeholder" placeholder="wr_vid=…; wr_skey=…; wr_rt=…"></textarea></label><label><span data-i18n="account.access_expiry">Access token expiry</span><input id="expiry" name="access_expires_at" type="datetime-local" data-value="__EXPIRES_AT__" required></label><div class="form-actions"><a class="button button-quiet" href="/admin/weread/accounts" data-i18n="action.cancel">Cancel</a><button class="button-primary" type="submit" data-i18n="action.save_changes">Save changes</button></div></form><p id="result" class="feedback" role="status" hidden></p></section><aside class="side-stack"><section class="card"><div class="card-header"><div><h2 data-i18n="account.account_status">Account status</h2><p data-i18n="account.disabled_help">Disabled accounts are skipped by random selection.</p></div><span class="card-icon orange" aria-hidden="true">●</span></div><button id="toggle" class="button-secondary" type="button" data-i18n="account.__TOGGLE__">__TOGGLE__ account</button></section><section class="card danger-zone"><div class="card-header"><div><h2 data-i18n="source.danger_zone">Danger zone</h2><p data-i18n="account.delete_description">Deleting removes the stored credentials permanently.</p></div><span class="card-icon red" aria-hidden="true">!</span></div><button id="delete" class="button-danger" type="button" data-i18n="action.delete_account">Delete account</button></section></aside></div></main>
 <script>
+__I18N__
 const accountId='__ACCOUNT_ID__';const csrf=__CSRF__;const headers={'content-type':'application/json','x-csrf-token':csrf};const result=document.querySelector('#result');document.querySelector('#expiry').value=new Date(document.querySelector('#expiry').dataset.value).toISOString().slice(0,16);
 const request=(path,options={})=>fetch(path,{...options,headers:{...headers,...(options.headers||{})}});
-async function apiErrorMessage(response,fallback){try{const value=await response.json();if(typeof value.error==='string'&&value.error.trim()){return value.error}}catch{}return fallback}
-async function runControlAction(control,action,fallback){control.disabled=true;try{const response=await action();if(response.ok){return true}result.textContent=await apiErrorMessage(response,fallback)}catch{result.textContent='The admin service could not be reached. Try again.'}finally{control.disabled=false}result.className='feedback error';result.hidden=false;return false}
-document.querySelector('#account').addEventListener('submit',async event=>{event.preventDefault();const submit=event.target.querySelector('button[type="submit"]');submit.disabled=true;result.hidden=true;const form=new FormData(event.target);try{const response=await request(`/api/admin/weread/accounts/${accountId}`,{method:'PUT',body:JSON.stringify({account_id:accountId,display_name:form.get('display_name')&&form.get('display_name').trim()?form.get('display_name').trim():null,cookie_header:form.get('cookie_header'),access_expires_at:new Date(form.get('access_expires_at')).toISOString()})});if(response.ok){result.textContent='Account updated.';result.className='feedback success';result.hidden=false;setTimeout(()=>location.reload(),350)}else{result.textContent=await apiErrorMessage(response,'Account could not be updated.');result.className='feedback error';result.hidden=false}}catch{result.textContent='The admin service could not be reached. Try again.';result.className='feedback error';result.hidden=false}finally{submit.disabled=false}});
-document.querySelector('#toggle').addEventListener('click',async()=>{const control=document.querySelector('#toggle');if(await runControlAction(control,()=>request(`/api/admin/weread/accounts/${accountId}/enabled`,{method:'POST',body:JSON.stringify({enabled:__ENABLED__})}),'Account status could not be changed.')){location.reload()}});
-document.querySelector('#delete').addEventListener('click',async()=>{if(!confirm('Delete this WeRead account permanently?')){return}const control=document.querySelector('#delete');if(await runControlAction(control,()=>request(`/api/admin/weread/accounts/${accountId}`,{method:'DELETE'}),'Account could not be deleted.')){location='/admin/'}});
+async function apiErrorMessage(response,fallback){try{const value=await response.json();if(typeof value.error==='string'&&value.error.trim()){return value.error}}catch{}return t(fallback)}
+async function runControlAction(control,action,fallback){control.disabled=true;try{const response=await action();if(response.ok){return true}result.textContent=await apiErrorMessage(response,fallback)}catch{result.textContent=t('common.unreachable')}finally{control.disabled=false}result.className='feedback error';result.hidden=false;return false}
+document.querySelector('#account').addEventListener('submit',async event=>{event.preventDefault();const submit=event.target.querySelector('button[type="submit"]');submit.disabled=true;result.hidden=true;const form=new FormData(event.target);try{const response=await request(`/api/admin/weread/accounts/${accountId}`,{method:'PUT',body:JSON.stringify({account_id:accountId,display_name:form.get('display_name')&&form.get('display_name').trim()?form.get('display_name').trim():null,cookie_header:form.get('cookie_header'),access_expires_at:new Date(form.get('access_expires_at')).toISOString()})});if(response.ok){result.textContent=t('account.updated');result.className='feedback success';result.hidden=false;setTimeout(()=>location.reload(),350)}else{result.textContent=await apiErrorMessage(response,'account.update_failed');result.className='feedback error';result.hidden=false}}catch{result.textContent=t('common.unreachable');result.className='feedback error';result.hidden=false}finally{submit.disabled=false}});
+document.querySelector('#toggle').addEventListener('click',async()=>{const control=document.querySelector('#toggle');if(await runControlAction(control,()=>request(`/api/admin/weread/accounts/${accountId}/enabled`,{method:'POST',body:JSON.stringify({enabled:__ENABLED__})}),'account.status_change_failed')){location.reload()}});
+document.querySelector('#delete').addEventListener('click',async()=>{if(!confirm(t('account.delete_confirm'))){return}const control=document.querySelector('#delete');if(await runControlAction(control,()=>request(`/api/admin/weread/accounts/${accountId}`,{method:'DELETE'}),'account.delete_failed')){location='/admin/'}});
 </script></body></html>"##;
     Html(
         template
             .replace("__STYLES__", STYLES)
+            .replace("__LOCALE_PICKER__", LOCALE_PICKER)
             .replace("__USERNAME__", &username)
             .replace("__ACCOUNT_ID__", &account_id)
             .replace("__STATUS__", status)
@@ -487,18 +549,17 @@ document.querySelector('#delete').addEventListener('click',async()=>{if(!confirm
             .replace("__DISPLAY_NAME__", &display_name)
             .replace("__EXPIRES_AT__", &expires_at)
             .replace(
-                "__TOGGLE__",
-                if account.disabled() {
-                    "Enable"
-                } else {
-                    "Disable"
-                },
+                r#"<span class="small" data-i18n="account.display_name_help">You may leave this blank if the cookie contains a usable <code>wr_name</code>.</span>"#,
+                r#"<span class="small"><span data-i18n="account.display_name_help_before">You may leave this blank if the cookie contains a usable </span><code>wr_name</code><span data-i18n="account.display_name_help_after">.</span></span>"#,
             )
+            .replace("account.__TOGGLE__", toggle_key)
+            .replace("__TOGGLE__", toggle_text)
             .replace(
                 "__ENABLED__",
                 if account.disabled() { "true" } else { "false" },
             )
-            .replace("__CSRF__", &csrf_json),
+            .replace("__CSRF__", &csrf_json)
+            .replace("__I18N__", &i18n_bootstrap(locale)),
     )
 }
 
@@ -515,6 +576,7 @@ fn escape_html(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::web::auth::AdminAuthenticator;
+    use crate::web::i18n::Locale;
     use secrecy::SecretString;
 
     fn session_for(username: &str) -> AdminSession {
@@ -540,7 +602,7 @@ mod tests {
 
     #[test]
     fn login_page_has_accessible_sign_in_form_and_responsive_styles() {
-        let body = login_page().0;
+        let body = login_page(Locale::English).0;
         assert!(body.contains("<html lang=\"en\">"));
         assert!(body.contains("autocomplete=\"username\""));
         assert!(body.contains("autocomplete=\"current-password\""));
@@ -548,8 +610,31 @@ mod tests {
     }
 
     #[test]
+    fn admin_page_embeds_french_translations_and_language_switcher() {
+        let body = admin_page(&session(), Locale::French).0;
+
+        assert!(body.contains("const translations={"));
+        assert!(body.contains("Ravi de vous revoir。"));
+        assert!(body.contains("id=\"locale\""));
+        assert!(body.contains("werrss_locale="));
+        assert!(!body.contains("__I18N__"));
+        assert!(!body.contains("__LOCALE_PICKER__"));
+        assert!(!body.contains("createTreeWalker"));
+        assert!(!body.contains("textKeys"));
+    }
+
+    #[test]
+    fn login_page_embeds_chinese_translations() {
+        let body = login_page(Locale::Chinese).0;
+
+        assert!(body.contains("document.documentElement.lang='zh'"));
+        assert!(body.contains("欢迎回来"));
+        assert!(body.contains("保存后不会显示敏感信息"));
+    }
+
+    #[test]
     fn admin_page_renders_navigation_and_workspace_summary() {
-        let body = admin_page(&session()).0;
+        let body = admin_page(&session(), Locale::English).0;
         assert!(body.contains("href=\"/admin/weread/accounts\""));
         assert!(body.contains("id=\"source-count\""));
         assert!(body.contains("id=\"active-source-count\""));
@@ -560,26 +645,33 @@ mod tests {
 
     #[test]
     fn admin_page_escapes_username_in_the_navigation() {
-        let body = admin_page(&session_for("<admin> & operator")).0;
+        let body = admin_page(&session_for("<admin> & operator"), Locale::English).0;
         assert!(body.contains("&lt;admin&gt; &amp; operator"));
         assert!(!body.contains("<admin> & operator"));
     }
 
     #[test]
+    fn admin_page_does_not_translate_user_supplied_names() {
+        let body = admin_page(&session_for("Sources"), Locale::French).0;
+
+        assert!(body.contains("<strong>Sources</strong>"));
+    }
+
+    #[test]
     fn admin_page_keeps_credentials_out_of_markup_and_uses_api_error_messages() {
-        let body = admin_page(&session()).0;
+        let body = admin_page(&session(), Locale::English).0;
         assert!(!body.contains("correct horse"));
         assert!(!body.contains("wr_skey=secret"));
         assert!(body.contains("async function apiErrorMessage(response,fallback)"));
         assert!(body.contains("typeof value.error==='string'"));
-        assert!(body.contains("return fallback"));
+        assert!(body.contains("return t(fallback)"));
         assert!(body.contains("accountResult"));
         assert!(body.contains("/api/admin/weread/accounts"));
     }
 
     #[test]
     fn admin_page_uses_absolute_feed_url_when_the_api_provides_one() {
-        let body = admin_page(&session()).0;
+        let body = admin_page(&session(), Locale::English).0;
         assert!(body.contains("const href=value.feed_url||value.feed_path"));
         assert!(body.contains("link.target='_blank'"));
     }
@@ -588,28 +680,41 @@ mod tests {
     fn source_page_groups_configuration_and_lifecycle_controls() {
         let source = Source::new(crate::domain::source::NewSource::test_default())
             .expect("test source should be valid");
-        let body = source_page(&session(), &source).0;
-        assert!(body.contains("<h1>Edit source</h1>"));
-        assert!(body.contains("<legend>Feed identity</legend>"));
-        assert!(body.contains("<legend>Delivery policy</legend>"));
+        let body = source_page(&session(), &source, Locale::English).0;
+        assert!(body.contains("<h1 data-i18n=\"source.edit_heading\">Edit source</h1>"));
+        assert!(body.contains("<legend data-i18n=\"source.feed_identity\">Feed identity</legend>"));
+        assert!(
+            body.contains("<legend data-i18n=\"source.delivery_policy\">Delivery policy</legend>")
+        );
         assert!(body.contains("id=\"toggle\""));
         assert!(body.contains("id=\"clear-gate\""));
         assert!(body.contains("id=\"delete\""));
-        assert!(!body.contains("cookie_header"));
+        assert!(!body.contains("name=\"cookie_header\""));
     }
 
     #[test]
     fn source_page_restores_lifecycle_controls_after_request_failures() {
         let source = Source::new(crate::domain::source::NewSource::test_default())
             .expect("test source should be valid");
-        let body = source_page(&session(), &source).0;
+        let body = source_page(&session(), &source, Locale::English).0;
 
         assert!(body.contains("async function runControlAction(control,action,fallback)"));
-        assert!(body.contains(
-            "catch{result.textContent='The admin service could not be reached. Try again.'}"
-        ));
+        assert!(body.contains("catch{result.textContent=t('common.unreachable')}"));
         assert!(body.contains("finally{control.disabled=false}"));
         assert_eq!(body.matches("if(await runControlAction(control").count(), 3);
+    }
+
+    #[test]
+    fn source_page_exposes_non_ready_gate_as_a_translation_key() {
+        let mut spec = crate::domain::source::NewSource::test_default();
+        spec.scheduling_gate = crate::domain::source::SchedulingGate::AuthenticationRequired;
+        let source = Source::new(spec).expect("test source should be valid");
+        let body = source_page(&session(), &source, Locale::French).0;
+
+        assert!(body.contains(
+            "<dd data-i18n=\"status.authentication_required\">Authentication required</dd>"
+        ));
+        assert!(!body.contains("__GATE__"));
     }
 
     #[test]
@@ -619,7 +724,7 @@ mod tests {
         spec.display_name = "Name<&\"".to_owned();
         spec.article_url = None;
         let source = Source::new(spec).expect("test source should be valid");
-        let body = source_page(&session(), &source).0;
+        let body = source_page(&session(), &source, Locale::English).0;
         assert!(body.contains("name=\"book_id\" value=\"book&lt;&amp;&quot;\""));
         assert!(body.contains("name=\"display_name\" value=\"Name&lt;&amp;&quot;\""));
         assert!(body.contains("name=\"article_url\" type=\"url\" value=\"\""));
@@ -628,12 +733,12 @@ mod tests {
 
     #[test]
     fn account_list_page_has_empty_state_and_safe_account_navigation() {
-        let body = weread_accounts_page(&session()).0;
-        assert!(body.contains("<h1>WeRead accounts</h1>"));
+        let body = weread_accounts_page(&session(), Locale::English).0;
+        assert!(body.contains("<h1 data-i18n=\"account.list_heading\">WeRead accounts</h1>"));
         assert!(body.contains("href=\"/admin/\""));
         assert!(body.contains("No WeRead accounts have been added."));
         assert!(body.contains("/admin/weread/accounts/${encodeURIComponent(account.account_id)}"));
-        assert!(!body.contains("cookie_header"));
+        assert!(!body.contains("name=\"cookie_header\""));
     }
 
     #[test]
@@ -645,12 +750,10 @@ mod tests {
             "2026-10-01T00:00:00Z".parse().unwrap(),
             false,
         );
-        let body = weread_account_page(&session(), &account).0;
+        let body = weread_account_page(&session(), &account, Locale::English).0;
 
         assert!(body.contains("async function runControlAction(control,action,fallback)"));
-        assert!(body.contains(
-            "catch{result.textContent='The admin service could not be reached. Try again.'}"
-        ));
+        assert!(body.contains("catch{result.textContent=t('common.unreachable')}"));
         assert!(body.contains("finally{control.disabled=false}"));
         assert_eq!(body.matches("if(await runControlAction(control").count(), 2);
     }
@@ -664,7 +767,7 @@ mod tests {
             "2026-10-01T00:00:00Z".parse().unwrap(),
             false,
         );
-        let body = weread_account_page(&session(), &account).0;
+        let body = weread_account_page(&session(), &account, Locale::English).0;
         assert!(body.contains("Account details"));
         assert!(body.contains("Optional when wr_name is present"));
         assert!(body.contains("/api/admin/weread/accounts/${accountId}"));
@@ -672,5 +775,38 @@ mod tests {
         assert!(body.contains("method:'DELETE'"));
         assert!(body.contains("data-value=\"2026-10-01T00:00:00+00:00\""));
         assert!(!body.contains("access-token"));
+    }
+
+    #[test]
+    fn disabled_account_page_uses_a_stable_enable_translation_key() {
+        let account = WeReadAccount::from_parts(
+            crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(1)),
+            "Primary".to_owned(),
+            2,
+            "2026-10-01T00:00:00Z".parse().unwrap(),
+            true,
+        );
+        let body = weread_account_page(&session(), &account, Locale::Chinese).0;
+
+        assert!(body.contains("data-i18n=\"account.enable_account\">Enable account</button>"));
+        assert!(!body.contains("account.__TOGGLE__"));
+    }
+
+    #[test]
+    fn account_display_name_help_keeps_the_cookie_name_marked_up() {
+        let account = WeReadAccount::from_parts(
+            crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(1)),
+            "Primary".to_owned(),
+            2,
+            "2026-10-01T00:00:00Z".parse().unwrap(),
+            false,
+        );
+        let body = weread_account_page(&session(), &account, Locale::French).0;
+
+        assert!(body.contains(
+            "<span class=\"small\"><span data-i18n=\"account.display_name_help_before\">"
+        ));
+        assert!(body.contains("<code>wr_name</code>"));
+        assert!(body.contains("data-i18n=\"account.display_name_help_after\">.</span>"));
     }
 }

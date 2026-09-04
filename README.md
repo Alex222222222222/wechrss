@@ -254,24 +254,22 @@ than a commitment:
 
 Structured application logging, sensitive-value redaction, and browser health
 and worker-readiness diagnostics are included in the current runtime; the
-responsive administrator UI polish is also included in the current panel. The
+responsive administrator UI polish and the English, French, and Simplified
+Chinese panel translations are also included in the current panel. The
 remaining roadmap items are future work:
 
-1. **Add internationalization (i18n).** Move user-facing panel messages into
-   translation resources and add additional locale support after the default
-   Chinese-language experience is stable.
-2. **Add QR-code login.** Implement the bounded, single-use login-attempt
+1. **Add QR-code login.** Implement the bounded, single-use login-attempt
    lifecycle and interactive confirmation flow so operators do not need to
    supply credentials manually. This remains deferred after the
    first release.
-3. **Add missed-article repair/backfill jobs.** Queue and process articles
+2. **Add missed-article repair/backfill jobs.** Queue and process articles
    missed during synchronization with bounded retries and deduplication. This
    improves recovery after partial upstream failures but is not required for
    the first release.
-4. **Persist archived assets and rewrite feed URLs.** Store approved media in
+3. **Persist archived assets and rewrite feed URLs.** Store approved media in
    local or object storage so archived articles can remain useful when
    upstream assets change or disappear.
-5. **Evaluate PGMQ as a queue transport optimization.** The current custom
+4. **Evaluate PGMQ as a queue transport optimization.** The current custom
    `jobs` table remains the version-one transport; PGMQ can be evaluated later
    if queue throughput or operational overhead becomes a demonstrated
    bottleneck.
@@ -392,6 +390,16 @@ an enabled, unexpired account at run time.
 
 There is no user-management endpoint. Put the application behind TLS in a
 deployment so the session cookie and credentials are protected in transit.
+
+### Panel language
+
+The admin panel supports English (`en`), French (`fr`), and Simplified Chinese
+(`zh`; `ch` is accepted as an alias when parsing a language preference). It
+uses the saved `werrss_locale` cookie first, then the browser's
+`Accept-Language` header, and falls back to English. Use the language selector
+in the login page or any authenticated admin page to save a preference for
+future visits. User-supplied account names, source names, and API error detail
+are kept separate from the static translation catalog.
 
 ### QR login
 

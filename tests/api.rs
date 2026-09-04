@@ -9,7 +9,7 @@ use axum::{
 use chrono::{Duration, Utc};
 use chrono_tz::UTC;
 use secrecy::SecretString;
-use sqlx::PgPool;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use tower::ServiceExt;
 use uuid::Uuid;
 use werrss::{
@@ -146,7 +146,9 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
         .await
         .expect("accounts page body should be readable");
     let accounts_page_body = String::from_utf8_lossy(&accounts_page_body);
-    assert!(accounts_page_body.contains("<h1>WeRead accounts</h1>"));
+    assert!(
+        accounts_page_body.contains("<h1 data-i18n=\"account.list_heading\">WeRead accounts</h1>")
+    );
     assert!(accounts_page_body.contains("/api/admin/weread/accounts"));
     assert!(!accounts_page_body.contains("correct horse"));
 
@@ -522,6 +524,35 @@ async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool
         .await
         .expect("repeated account delete request should complete");
     assert_eq!(deleted_again.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_login_page_negotiates_the_browser_locale() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://user:pass@localhost/werrss")
+        .expect("lazy test pool should be constructible");
+    let app = admin_app(&pool);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/admin/login")
+                .header(header::ACCEPT_LANGUAGE, "fr-FR, en;q=0.8")
+                .body(Body::empty())
+                .expect("locale request should be valid"),
+        )
+        .await
+        .expect("login page request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("login page body should be readable")
+            .to_vec(),
+    )
+    .expect("login page should be UTF-8");
+    assert!(body.contains("document.documentElement.lang='fr'"));
+    assert!(body.contains("Bienvenue"));
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
