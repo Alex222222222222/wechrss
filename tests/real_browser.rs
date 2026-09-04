@@ -21,7 +21,7 @@ use werrss::{
         article_page::{ArticlePageFetcher, WebDriverArticlePageFetcher},
         browser_pool::BrowserPool,
         pacing::PacingController,
-        webdriver::{BrowserProfile, BrowserViewport, WebDriverFactory},
+        webdriver::{BrowserProfile, BrowserViewport, WebDriverFactory, WebDriverHealthCheck},
     },
     config::BrowserEngine,
     domain::{
@@ -32,6 +32,34 @@ use werrss::{
 
 const PUBLIC_ARTICLE_URL: &str = "https://mp.weixin.qq.com/s/5CqpNShrLGIM93XoJD7s5g";
 const PUBLIC_ARTICLE_TITLE: &str = "我们逃不掉的discouraged 时间";
+
+#[tokio::test]
+#[ignore = "requires an explicitly configured WebDriver sidecar"]
+async fn webdriver_health_probe_reports_sidecar_and_browser_environment() {
+    let endpoint = env::var("WEBDRIVER_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:4444".to_owned())
+        .parse::<Url>()
+        .expect("WEBDRIVER_URL must be a valid URL");
+    let profile = browser_profile_from_environment();
+    let factory = WebDriverFactory::new(endpoint, browser_engine_from_environment())
+        .with_profile(profile.clone());
+    let pool = BrowserPool::new(1).expect("positive browser capacity");
+
+    let result = tokio::time::timeout(Duration::from_secs(45), factory.health_check(&pool))
+        .await
+        .expect("WebDriver health probe timed out")
+        .expect("WebDriver health probe should contact the sidecar");
+    let WebDriverHealthCheck::Ready { environment } = result else {
+        panic!("WebDriver sidecar reported that it is not ready")
+    };
+
+    assert!(environment.inner_width > 0);
+    assert!(environment.inner_height > 0);
+    assert_eq!(environment.language, profile.locale);
+    if let Some(timezone) = profile.expected_timezone {
+        assert_eq!(environment.timezone, timezone.to_string());
+    }
+}
 
 #[tokio::test]
 #[ignore = "requires an explicitly configured WebDriver sidecar and upstream network"]

@@ -29,6 +29,7 @@ rand = "0.9"
 rand_distr = "0.5"
 regex = "1"
 percent-encoding = "2"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 ring = "0.17"
 rss = "2.1"
 scraper = "0.22"

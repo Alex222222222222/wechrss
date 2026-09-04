@@ -102,6 +102,12 @@ pub trait JobHandler: Send + Sync {
     async fn execute(&self, lease: &JobLease, now: DateTime<Utc>) -> JobExecution;
 }
 
+/// Readiness gate for jobs whose handler requires the browser sidecar.
+pub trait BrowserJobReadiness: Send + Sync {
+    /// Returns whether browser-backed jobs may be claimed now.
+    fn browser_jobs_allowed(&self) -> bool;
+}
+
 /// Validated heartbeat and dispatch policy for one worker pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerConfig {
@@ -349,6 +355,7 @@ pub struct Worker<Q, F, H> {
     outcomes: F,
     handler: H,
     config: WorkerConfig,
+    browser_readiness: Option<Arc<dyn BrowserJobReadiness>>,
 }
 
 impl<Q, F, H> Worker<Q, F, H> {
@@ -365,7 +372,17 @@ impl<Q, F, H> Worker<Q, F, H> {
             outcomes,
             handler,
             config,
+            browser_readiness: None,
         })
+    }
+
+    /// Adds a shared browser-readiness gate to this worker.
+    ///
+    /// Database-only jobs remain claimable while the gate is closed. Jobs that
+    /// require a browser are left queued until the gate reports readiness.
+    pub fn with_browser_readiness(mut self, readiness: Arc<dyn BrowserJobReadiness>) -> Self {
+        self.browser_readiness = Some(readiness);
+        self
     }
 
     /// Returns the dispatch and heartbeat policy.
@@ -395,9 +412,31 @@ where
             .await
             .map_err(WorkerError::Job)?;
 
+        let filtered_job_types = self
+            .browser_readiness
+            .as_ref()
+            .filter(|readiness| !readiness.browser_jobs_allowed())
+            .map(|_| {
+                self.config
+                    .allowed_job_types()
+                    .iter()
+                    .copied()
+                    .filter(|job_type| !job_type.requires_browser())
+                    .collect::<Vec<_>>()
+            });
+        if filtered_job_types.is_some() {
+            tracing::debug!(
+                allowed_job_types = ?self.config.allowed_job_types(),
+                "browser-backed worker jobs are temporarily gated"
+            );
+        }
+        let allowed_job_types = filtered_job_types
+            .as_deref()
+            .unwrap_or_else(|| self.config.allowed_job_types());
+
         let Some(lease) = self
             .jobs
-            .claim_next(now, self.config.allowed_job_types())
+            .claim_next(now, allowed_job_types)
             .await
             .map_err(WorkerError::Job)?
         else {

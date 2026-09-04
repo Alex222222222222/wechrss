@@ -71,6 +71,16 @@ There is no separate host or port for the admin panel. For an IPv6 bind, use a
 raw address such as `::1`; the runtime adds the required brackets when it
 constructs the socket address.
 
+## Health endpoints
+
+`GET /api/health` is a process-only liveness check, and `GET /api/ready` checks
+PostgreSQL readiness without depending on the browser sidecar. When a browser
+pool is configured, `GET /api/worker/ready` reports WebDriver availability and
+browser-timezone status separately. It returns `503` until the first successful
+probe and whenever either component is unavailable or mismatched; browser-backed
+worker jobs remain queued during those states while database-only feed rebuilds
+can continue.
+
 ## Environment variable reference
 
 Configuration is loaded once at startup from environment variables. Variables
@@ -242,31 +252,28 @@ These possible features are ordered approximately by user value and operational
 impact, not by implementation difficulty. The list is a planning guide rather
 than a commitment:
 
-Structured application logging and sensitive-value redaction are included in
-the current runtime; the remaining roadmap items are future work:
+Structured application logging, sensitive-value redaction, and browser health
+and worker-readiness diagnostics are included in the current runtime; the
+remaining roadmap items are future work:
 
-1. **Add browser health and worker readiness diagnostics.** Report WebDriver
-   availability and timezone mismatches separately from API liveness and
-   PostgreSQL readiness, and prevent browser jobs from being claimed while the
-   browser sidecar is unhealthy.
-2. **Polish the web UI.** Improve information hierarchy, loading and empty
+1. **Polish the web UI.** Improve information hierarchy, loading and empty
    states, validation feedback, and responsive behavior in the administrator
    panel so routine source and account operations are easier to understand.
-3. **Add internationalization (i18n).** Move user-facing panel messages into
+2. **Add internationalization (i18n).** Move user-facing panel messages into
    translation resources and add additional locale support after the default
    Chinese-language experience is stable.
-4. **Add QR-code login.** Implement the bounded, single-use login-attempt
+3. **Add QR-code login.** Implement the bounded, single-use login-attempt
    lifecycle and interactive confirmation flow so operators do not need to
    supply credentials manually. This remains deferred after the
    first release.
-5. **Add missed-article repair/backfill jobs.** Queue and process articles
+4. **Add missed-article repair/backfill jobs.** Queue and process articles
    missed during synchronization with bounded retries and deduplication. This
    improves recovery after partial upstream failures but is not required for
    the first release.
-6. **Persist archived assets and rewrite feed URLs.** Store approved media in
+5. **Persist archived assets and rewrite feed URLs.** Store approved media in
    local or object storage so archived articles can remain useful when
    upstream assets change or disappear.
-7. **Evaluate PGMQ as a queue transport optimization.** The current custom
+6. **Evaluate PGMQ as a queue transport optimization.** The current custom
    `jobs` table remains the version-one transport; PGMQ can be evaluated later
    if queue throughput or operational overhead becomes a demonstrated
    bottleneck.

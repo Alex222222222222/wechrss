@@ -37,6 +37,7 @@ use sqlx::PgPool;
 
 use crate::{
     application::{
+        browser_health::BrowserHealth,
         feed_rebuild_service::FeedRebuilder,
         feed_service::{
             FeedCacheStatus, FeedDelivery, FeedRebuildQueue, FeedService, FeedServiceError,
@@ -68,15 +69,40 @@ where
     Q: FeedRebuildQueue + 'static,
     B: FeedRebuilder + 'static,
 {
+    feed_router_with_browser_health(
+        token_service,
+        feed_service,
+        pool,
+        timezone,
+        BrowserHealth::new(timezone),
+    )
+}
+
+/// Builds the public feed route with shared browser-health diagnostics.
+pub fn feed_router_with_browser_health<R, C, Q, B>(
+    token_service: FeedTokenService<R>,
+    feed_service: FeedService<C, Q, B>,
+    pool: PgPool,
+    timezone: Tz,
+    browser_health: BrowserHealth,
+) -> Router
+where
+    R: FeedTokenRepository + 'static,
+    C: FeedCacheRepository + 'static,
+    Q: FeedRebuildQueue + 'static,
+    B: FeedRebuilder + 'static,
+{
     let state = Arc::new(FeedApiState {
         token_service,
         feed_service,
         pool,
         timezone,
+        browser_health,
     });
     Router::new()
         .route("/api/health", get(liveness))
         .route("/api/ready", get(readiness::<R, C, Q, B>))
+        .route("/api/worker/ready", get(worker_readiness::<R, C, Q, B>))
         // Axum does not allow a literal suffix in the same segment as a path
         // parameter, so the handler validates the exact `.xml` shape below.
         .route("/feeds/{*feed_path}", get(feed::<R, C, Q, B>))
@@ -88,6 +114,7 @@ struct FeedApiState<R, C, Q, B> {
     feed_service: FeedService<C, Q, B>,
     pool: PgPool,
     timezone: Tz,
+    browser_health: BrowserHealth,
 }
 
 /// Reports that this process is alive without contacting any dependency.
@@ -130,6 +157,45 @@ where
             "status": status,
             "database": database,
             "timezone": state.timezone.to_string(),
+        })),
+    )
+        .into_response()
+}
+
+/// Reports browser-sidecar and browser-timezone readiness independently from
+/// process liveness and PostgreSQL API readiness.
+#[tracing::instrument(skip_all, level = "debug")]
+async fn worker_readiness<R, C, Q, B>(
+    State(state): State<Arc<FeedApiState<R, C, Q, B>>>,
+) -> Response
+where
+    R: FeedTokenRepository + 'static,
+    C: FeedCacheRepository + 'static,
+    Q: FeedRebuildQueue + 'static,
+    B: FeedRebuilder + 'static,
+{
+    let snapshot = state.browser_health.snapshot();
+    let ready = snapshot.worker_ready();
+    let status = if ready { "ready" } else { "not_ready" };
+    let status_code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    tracing::debug!(
+        status,
+        webdriver = ?snapshot.webdriver,
+        timezone = ?snapshot.timezone,
+        "worker readiness probe completed"
+    );
+    (
+        status_code,
+        Json(json!({
+            "status": status,
+            "webdriver": snapshot.webdriver,
+            "timezone": snapshot.timezone,
+            "configured_timezone": snapshot.configured_timezone,
+            "observed_timezone": snapshot.observed_timezone,
         })),
     )
         .into_response()

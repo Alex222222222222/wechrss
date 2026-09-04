@@ -57,12 +57,13 @@ use crate::{
             admin_router_with_identity_resolver_and_server_root_url,
             admin_router_with_server_root_url,
         },
-        api::feed_router,
+        api::feed_router_with_browser_health,
         auth::AdminAuthenticator,
     },
 };
 
 use super::{
+    browser_health::{BrowserHealth, BrowserHealthMonitor},
     feed_rebuild_handler::{
         FeedRebuildJobHandler, FeedRebuildJobHandlerConfig, FeedRebuildJobHandlerConfigError,
     },
@@ -242,6 +243,8 @@ pub struct RuntimeSupervisor {
     plan: RuntimePlan,
     pool: PgPool,
     browser_pool: Option<BrowserPool>,
+    browser_health: BrowserHealth,
+    browser_monitor: Option<BrowserHealthMonitor>,
     credential_refresher: Option<Arc<dyn CredentialRefresher>>,
 }
 
@@ -258,6 +261,14 @@ impl RuntimeSupervisor {
             .await
             .map_err(RuntimeSupervisorError::Migration)?;
         let browser_pool = browser_pool_for_plan(&plan)?;
+        let browser_health = BrowserHealth::new(config.timezone);
+        let browser_monitor = browser_pool.as_ref().map(|browser_pool| {
+            BrowserHealthMonitor::with_browser_pool(
+                browser_factory(&config),
+                browser_health.clone(),
+                browser_pool.clone(),
+            )
+        });
         tracing::info!(
             components = plan.components().len(),
             "runtime supervisor initialized"
@@ -267,6 +278,8 @@ impl RuntimeSupervisor {
             plan,
             pool,
             browser_pool,
+            browser_health,
+            browser_monitor,
             credential_refresher: None,
         })
     }
@@ -279,6 +292,14 @@ impl RuntimeSupervisor {
     pub fn new(config: AppConfig, pool: PgPool) -> Result<Self, RuntimeSupervisorError> {
         let plan = Self::validated_plan(&config)?;
         let browser_pool = browser_pool_for_plan(&plan)?;
+        let browser_health = BrowserHealth::new(config.timezone);
+        let browser_monitor = browser_pool.as_ref().map(|browser_pool| {
+            BrowserHealthMonitor::with_browser_pool(
+                browser_factory(&config),
+                browser_health.clone(),
+                browser_pool.clone(),
+            )
+        });
         tracing::debug!(
             components = plan.components().len(),
             "runtime supervisor created from existing pool"
@@ -288,6 +309,8 @@ impl RuntimeSupervisor {
             plan,
             pool,
             browser_pool,
+            browser_health,
+            browser_monitor,
             credential_refresher: None,
         })
     }
@@ -360,6 +383,16 @@ impl RuntimeSupervisor {
         let (role_shutdown_tx, role_shutdown_rx) = watch::channel(false);
         let mut tasks = JoinSet::new();
 
+        if let Some(monitor) = self.browser_monitor.clone() {
+            let role_shutdown = role_shutdown_rx.clone();
+            let interval = self.config.job_poll_interval;
+            tracing::info!("browser health monitor started");
+            tasks.spawn(async move {
+                monitor.run_until_shutdown(role_shutdown, interval).await;
+                Ok(())
+            });
+        }
+
         for component in self.plan.components().iter().cloned() {
             match component {
                 RuntimeComponent::Api(api) => {
@@ -407,7 +440,9 @@ impl RuntimeSupervisor {
                 RuntimeComponent::Worker(worker) => {
                     for worker_index in 0..worker.concurrency() {
                         let loop_config = worker.loop_config();
-                        let worker = self.build_worker(&worker, worker_index)?;
+                        let worker = self
+                            .build_worker(&worker, worker_index)?
+                            .with_browser_readiness(Arc::new(self.browser_health.clone()));
                         let role_shutdown = role_shutdown_rx.clone();
                         tracing::info!(worker_index, "worker role started");
                         tasks.spawn(async move {
@@ -499,11 +534,12 @@ impl RuntimeSupervisor {
             rebuild_service,
             feed_config,
         );
-        let mut router = feed_router(
+        let mut router = feed_router_with_browser_health(
             FeedTokenService::new(PostgresFeedTokenRepository::new(self.pool.clone())),
             feed_service,
             self.pool.clone(),
             self.config.timezone,
+            self.browser_health.clone(),
         );
         if self.config.admin_enabled {
             let auth = AdminAuthenticator::new(
@@ -530,21 +566,7 @@ impl RuntimeSupervisor {
                 FeedTokenService::new(PostgresFeedTokenRepository::new(self.pool.clone()));
             let sync_runs = PostgresSyncRunRepository::new(self.pool.clone());
             if let Some(browser_pool) = self.browser_pool.clone() {
-                let browser_profile = BrowserProfile {
-                    user_agent: self.config.browser_user_agent.clone(),
-                    viewport: BrowserViewport::new(
-                        self.config.browser_viewport_width,
-                        self.config.browser_viewport_height,
-                    ),
-                    locale: self.config.browser_locale.clone(),
-                    expected_timezone: Some(self.config.timezone),
-                    extra_args: self.config.browser_extra_args.clone(),
-                };
-                let webdriver = WebDriverFactory::new(
-                    self.config.webdriver_url.clone(),
-                    self.config.browser_engine,
-                )
-                .with_profile(browser_profile);
+                let webdriver = browser_factory(&self.config);
                 let identity_resolver =
                     Arc::new(BrowserArticleIdentityResolver::new(webdriver, browser_pool));
                 router = router.merge(admin_router_with_identity_resolver_and_server_root_url(
@@ -649,21 +671,7 @@ impl RuntimeSupervisor {
         &self,
         worker_index: u32,
     ) -> Result<SourceSyncHandler, RuntimeSupervisorError> {
-        let browser_profile = BrowserProfile {
-            user_agent: self.config.browser_user_agent.clone(),
-            viewport: BrowserViewport::new(
-                self.config.browser_viewport_width,
-                self.config.browser_viewport_height,
-            ),
-            locale: self.config.browser_locale.clone(),
-            expected_timezone: Some(self.config.timezone),
-            extra_args: self.config.browser_extra_args.clone(),
-        };
-        let webdriver = WebDriverFactory::new(
-            self.config.webdriver_url.clone(),
-            self.config.browser_engine,
-        )
-        .with_profile(browser_profile);
+        let webdriver = browser_factory(&self.config);
         let acquisition_config = BrowserSourceSyncAcquirerConfig::new(
             self.config.weread_account_id,
             format!("{}-source-worker", self.config.instance_id),
@@ -830,6 +838,20 @@ fn browser_pool_for_plan(
     BrowserPool::new(capacity)
         .map(Some)
         .map_err(RuntimeSupervisorError::BrowserPool)
+}
+
+fn browser_factory(config: &AppConfig) -> WebDriverFactory {
+    let profile = BrowserProfile {
+        user_agent: config.browser_user_agent.clone(),
+        viewport: BrowserViewport::new(
+            config.browser_viewport_width,
+            config.browser_viewport_height,
+        ),
+        locale: config.browser_locale.clone(),
+        expected_timezone: Some(config.timezone),
+        extra_args: config.browser_extra_args.clone(),
+    };
+    WebDriverFactory::new(config.webdriver_url.clone(), config.browser_engine).with_profile(profile)
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {

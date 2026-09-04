@@ -12,8 +12,8 @@
 //! must never claim work that its runtime cannot execute and durably complete.
 //!
 //! API readiness does not depend on WebDriver availability. The API plan only
-//! contains HTTP settings, while browser-dependent worker health remains a
-//! separate concern for the future supervisor.
+//! contains HTTP settings, while the runtime supervisor composes a separate
+//! browser-dependent worker readiness monitor.
 
 use std::time::Duration as StdDuration;
 

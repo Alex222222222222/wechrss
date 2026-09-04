@@ -21,9 +21,10 @@
 //! bounded public page pacing/scroll execution, optional browser-visible
 //! timezone validation, the admin-enrolled cookie-backed WeRead article-list
 //! transport, and authenticated request pacing are executable.
-//! Login/refresh and browser sidecar health checks remain TODOs in the child
-//! modules. Source creation composes the public identity resolver with the
-//! admin API; known book IDs can bypass browser resolution.
+//! Login/refresh remain deferred in the child modules. Browser sidecar health
+//! probing is composed by `application::browser_health`. Source creation
+//! composes the public identity resolver with the admin API; known book IDs
+//! can bypass browser resolution.
 
 pub mod article_page;
 pub mod browser_pool;

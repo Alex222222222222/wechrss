@@ -20,11 +20,10 @@
 //! lease.
 //!
 //! Non-responsibilities: WebDriver commands, navigation, article parsing,
-//! source scheduling, credential persistence, or RSS caching. Browser-side
-//! health checks and fresh-profile lifecycle remain TODOs in
-//! [`super::webdriver`]; browser-visible timezone validation belongs to that
-//! adapter, while pacing and scroll orchestration belong to [`super::pacing`]
-//! and [`super::article_page`].
+//! source scheduling, credential persistence, or RSS caching. Sidecar health
+//! monitoring belongs to `application::browser_health`; browser-visible
+//! timezone validation belongs to the WebDriver adapter, while pacing and
+//! scroll orchestration belong to [`super::pacing`] and [`super::article_page`].
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -37,7 +36,7 @@ use std::time::Duration as StdDuration;
 use chrono::Duration;
 use thiserror::Error;
 use tokio::{
-    sync::{watch, OwnedSemaphorePermit, Semaphore},
+    sync::{watch, OwnedSemaphorePermit, Semaphore, TryAcquireError},
     task::JoinHandle,
     time::{self, MissedTickBehavior},
 };
@@ -383,6 +382,25 @@ impl BrowserPool {
         Ok(PublicBrowserSession::from_permit(permit))
     }
 
+    /// Tries to acquire a clean public browser capability without waiting.
+    ///
+    /// A missing permit means the configured process-local capacity is busy,
+    /// not that the browser sidecar is unhealthy. This is used by health
+    /// probes that share the runtime browser pool with real work.
+    pub async fn try_open_public(&self) -> Result<Option<PublicBrowserSession>, BrowserPoolError> {
+        tracing::trace!("trying to acquire public browser capacity");
+        let permit = match self.permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => return Ok(None),
+            Err(TryAcquireError::Closed) => {
+                tracing::warn!("public browser capacity is closed");
+                return Err(BrowserPoolError::Closed);
+            }
+        };
+        tracing::debug!("acquired public browser capacity without waiting");
+        Ok(Some(PublicBrowserSession::from_permit(permit)))
+    }
+
     /// Acquires local browser capacity and a distributed account lease.
     ///
     /// Local capacity is acquired before the account lease. This prevents a
@@ -521,6 +539,25 @@ mod tests {
         drop(first);
         let second = pool.open_public().await.unwrap();
         assert_ne!(second.session_id(), Uuid::nil());
+    }
+
+    #[tokio::test]
+    async fn try_public_session_reports_busy_without_waiting_for_capacity() {
+        let pool = BrowserPool::new(1).unwrap();
+        let first = pool.open_public().await.unwrap();
+
+        assert!(pool
+            .try_open_public()
+            .await
+            .expect("a busy pool should be queryable")
+            .is_none());
+
+        drop(first);
+        assert!(pool
+            .try_open_public()
+            .await
+            .expect("an available pool should be queryable")
+            .is_some());
     }
 
     #[tokio::test]

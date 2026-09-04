@@ -59,11 +59,11 @@ The current and target contracts must not be confused:
 
 | Area | Executable now | Target contract and implementation gate |
 | --- | --- | --- |
-| Runtime | `RuntimeSupervisor` consumes the validated `RuntimePlan`, opens the shared PostgreSQL pool, applies SQLx migrations, binds the selected API, and supervises scheduler, feed-rebuild, and account-selection-at-job-time source-sync loops with graceful shutdown; an injected refresh transport also enables account-expiry scheduling | QR/login exchange and browser health remain future work; API liveness/readiness and single-admin routes are executable |
+| Runtime | `RuntimeSupervisor` consumes the validated `RuntimePlan`, opens the shared PostgreSQL pool, applies SQLx migrations, binds the selected API, and supervises scheduler, feed-rebuild, and account-selection-at-job-time source-sync loops with graceful shutdown; an injected refresh transport also enables account-expiry scheduling; a shared browser-health monitor gates browser-backed claims | QR/login exchange remains future work; API liveness/readiness, browser-worker readiness, and single-admin routes are executable |
 | Jobs | `0001_jobs.sql` contains `deferred`, separate `claim_count`/`failure_count`, PostgreSQL-clocked SQLx job operations, the worker-facing `JobService` facade, type-aware feed-rebuild/source-sync dispatch, lease-fenced credential-refresh dispatch when a transport is injected, and shutdown-aware heartbeat/outcome execution | Article-backfill dispatch, plus removal of compatibility `now` parameters, remain future work |
 | Configuration | Environment-only `AppConfig` with role, lease, cache, public RSS URL, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint; the supervisor consumes the parsed role and policy values | QR-login configuration remains future work |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, feed-build leases, and encrypted WeRead account credential records with optimistic versions | QR-login state and remaining transaction-scoped views are design-only |
-| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, authenticated WeRead article-list transport through an admin-enrolled cookie and account lease, source-sync finalization through an injected acquisition port, feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, public tokenized feed route, API liveness/readiness routes, and single-admin source/panel routes | Login/QR exchange and browser health remain future work |
+| Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, authenticated WeRead article-list transport through an admin-enrolled cookie and account lease, source-sync finalization through an injected acquisition port, feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, public tokenized feed route, API liveness/readiness and browser-worker readiness routes, and single-admin source/panel routes | Login/QR exchange remains future work |
 | Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, and external-image reporting through ArchiveService | Asset persistence and URL rewriting remain future work |
 
 Environment variables in this document are parsed into `AppConfig`, and
@@ -736,7 +736,9 @@ adapter creates a Thirtyfour session, applies the configured browser profile,
 navigates to the verified URL, rejects an unsafe final URL, resolves short
 links through narrow page-source fallbacks, executes bounded
 navigation/action/settling waits and downward scrolls, and parses common
-rendered WeChat metadata/body selectors. Browser health remains behind a TODO;
+rendered WeChat metadata/body selectors. The health monitor probes the sidecar
+status endpoint before opening a short-lived public session, publishes
+WebDriver and timezone component status, and gates browser-backed worker jobs;
 when `expected_timezone` is configured, session creation validates the
 browser-visible timezone before returning the public capability. IANA links are
 canonicalized by the browser's own `Intl` implementation so a valid alias is
@@ -1074,10 +1076,10 @@ than add more empty module shells. Work proceeds in this order:
 4. Build role-aware runtime composition and integrate the worker loop and
    heartbeat cancellation. The supervisor now covers the API, scheduler,
    database-only feed-rebuild, and account-selection-at-job-time authenticated
-   source-sync worker paths. Degraded browser health behavior remains gated on
-   the future readiness boundary.
-5. Complete the acquisition slice with fresh-profile creation and browser
-   health checks behind the now-executable verified-URL, Thirtyfour,
+   source-sync worker paths. The shared browser-health monitor and worker claim
+   gate are executable.
+5. Complete the acquisition slice with fresh-profile creation behind the
+   now-executable verified-URL, Thirtyfour,
    browser-capability, public pacing/scroll, and expected-timezone ports. Public
    identity resolution, navigation, redirect rejection, common article
    extraction, and bounded public-page pacing/scroll execution are already
@@ -1184,10 +1186,10 @@ archive sanitizer and `ArchiveService` are executable. Acquisition now
 contains executable identity resolution, capability/session ports, local
 capacity/lease ownership, public WebDriver navigation, common article
 extraction, bounded public-page pacing/scroll execution, expected
-browser-timezone validation, and pure current/legacy WeRead article-list
-response parsing, authenticated transport, account leasing, authenticated
-request pacing, and public article handoff are executable; interactive login
-and browser health remain future work.
+browser-timezone validation, browser-sidecar health/readiness monitoring, and
+pure current/legacy WeRead article-list response parsing, authenticated
+transport, account leasing, authenticated request pacing, and public article
+handoff are executable; interactive login remains future work.
 `SourceService` implements source create/read, operator enable/gate changes,
 and the initial-job slice described above. `JobService` implements queue
 lifecycle and transaction-scoped outcome binding; `Worker::run_once` implements

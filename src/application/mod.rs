@@ -14,6 +14,7 @@
 
 pub mod archive_service;
 pub mod auth_service;
+pub mod browser_health;
 pub mod feed_rebuild_handler;
 pub mod feed_rebuild_service;
 pub mod feed_service;

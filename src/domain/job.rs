@@ -82,6 +82,15 @@ impl JobType {
         Self::ArticleBackfill,
         Self::CredentialRefresh,
     ];
+
+    /// Returns whether the job needs the browser sidecar at execution time.
+    ///
+    /// Credential refresh is intentionally excluded: the current runtime
+    /// refresh transport is an injected application service and does not use a
+    /// WebDriver session. Interactive browser login remains a future job kind.
+    pub const fn requires_browser(self) -> bool {
+        matches!(self, Self::SourceSync | Self::ArticleBackfill)
+    }
 }
 
 /// Persisted lifecycle state for a job.
@@ -880,6 +889,14 @@ mod tests {
             now: at(0),
         });
         assert_eq!(empty_key, Err(JobError::EmptyDedupeKey));
+    }
+
+    #[test]
+    fn identifies_only_browser_backed_job_types() {
+        assert!(JobType::SourceSync.requires_browser());
+        assert!(JobType::ArticleBackfill.requires_browser());
+        assert!(!JobType::FeedRebuild.requires_browser());
+        assert!(!JobType::CredentialRefresh.requires_browser());
     }
 
     #[test]

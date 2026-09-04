@@ -1398,6 +1398,31 @@ async fn readiness_returns_service_unavailable_when_database_is_closed(pool: PgP
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn worker_readiness_reports_browser_components_before_the_first_probe(pool: PgPool) {
+    let response = router(&pool)
+        .oneshot(get_request("/api/worker/ready", None))
+        .await
+        .expect("worker readiness request should complete");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("worker readiness body should be readable"),
+        )
+        .expect("worker readiness body should be JSON"),
+        serde_json::json!({
+            "status": "not_ready",
+            "webdriver": "unknown",
+            "timezone": "unknown",
+            "configured_timezone": "UTC",
+            "observed_timezone": null
+        })
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn feed_route_does_not_enumerate_invalid_unknown_or_revoked_tokens(pool: PgPool) {
     let source_id = insert_source(&pool).await;
     let token_service = FeedTokenService::new(PostgresFeedTokenRepository::new(pool.clone()));

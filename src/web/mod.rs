@@ -14,7 +14,8 @@
 //! not Axum handlers.
 //!
 //! API readiness remains available for cached RSS when browser workers are
-//! degraded. Administrative routes are registered only when complete
+//! degraded; `/api/worker/ready` reports the browser components separately.
+//! Administrative routes are registered only when complete
 //! authentication/session configuration is explicitly enabled.
 
 pub mod admin;

@@ -31,11 +31,10 @@
 //! map to typed acquisition errors. Browser failures must not prevent API
 //! replicas from serving persisted RSS cache bytes.
 //!
-//! TODO(implementation): add fresh-profile options and browser health checks.
 //! The concrete session lifecycle, profile application, browser timezone
-//! validation, environment diagnostic, and low-level scroll operation are
-//! implemented here; article extraction and pacing orchestration remain in
-//! [`super::article_page`] and [`super::pacing`].
+//! validation, environment diagnostic, sidecar health probe, and low-level
+//! scroll operation are implemented here; article extraction and pacing
+//! orchestration remain in [`super::article_page`] and [`super::pacing`].
 
 use crate::config::BrowserEngine;
 use chrono_tz::Tz;
@@ -57,6 +56,8 @@ use super::browser_pool::{
 const WEBDRIVER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const WEBDRIVER_PAGE_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const WEBDRIVER_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const WEBDRIVER_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const WEBDRIVER_HEALTH_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Errors raised while creating or operating a WebDriver session.
 #[derive(Debug, Error)]
@@ -195,6 +196,22 @@ pub struct BrowserEnvironment {
     pub inner_height: u32,
 }
 
+/// Result of probing the sidecar status endpoint and one fresh browser
+/// session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebDriverHealthCheck {
+    /// The sidecar answered but reported that it cannot accept sessions.
+    NotReady,
+    /// The local browser pool is busy with real work, so this probe was
+    /// skipped without changing the previous health state.
+    Busy,
+    /// The sidecar accepted a session and its browser environment was read.
+    Ready {
+        /// Values observed from the fresh probe session.
+        environment: BrowserEnvironment,
+    },
+}
+
 impl WebDriverFactory {
     /// Creates a factory for the configured browser sidecar.
     pub fn new(endpoint: Url, engine: BrowserEngine) -> Self {
@@ -215,6 +232,41 @@ impl WebDriverFactory {
         self
     }
 
+    /// Probes the sidecar without exposing its status endpoint to callers.
+    ///
+    /// The status request avoids creating a session when Selenium is still
+    /// starting. Once it reports ready, a short-lived public session verifies
+    /// the browser-visible profile (including the configured timezone) before
+    /// the session is closed again. No account lease or credential is involved.
+    pub async fn health_check(
+        &self,
+        pool: &BrowserPool,
+    ) -> Result<WebDriverHealthCheck, WebDriverError> {
+        let ready = self.sidecar_ready().await?;
+        if !ready {
+            return Ok(WebDriverHealthCheck::NotReady);
+        }
+
+        let Some(session) = self
+            .try_open_public_with_timeout(pool, WEBDRIVER_HEALTH_SESSION_TIMEOUT)
+            .await?
+        else {
+            return Ok(WebDriverHealthCheck::Busy);
+        };
+        let environment = session.environment().await;
+        let close = session.close().await;
+        match (environment, close) {
+            (Ok(environment), Ok(())) => Ok(WebDriverHealthCheck::Ready { environment }),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    /// Returns the expected timezone used by health-monitor classification.
+    pub(crate) const fn expected_timezone(&self) -> Option<Tz> {
+        self.profile.expected_timezone
+    }
+
     /// Opens a clean public-page browser session using one pool permit.
     ///
     /// If WebDriver session creation or the configured browser-environment
@@ -225,9 +277,48 @@ impl WebDriverFactory {
         &self,
         pool: &BrowserPool,
     ) -> Result<PublicBrowserSession, WebDriverError> {
+        self.open_public_with_timeout(pool, WEBDRIVER_REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn open_public_with_timeout(
+        &self,
+        pool: &BrowserPool,
+        request_timeout: std::time::Duration,
+    ) -> Result<PublicBrowserSession, WebDriverError> {
         tracing::debug!(engine = ?self.engine, endpoint_host = ?self.endpoint.host_str(), "opening public WebDriver session");
         let session = pool.open_public().await?;
-        let client = match connect(self.endpoint.clone(), self.engine, &self.profile).await {
+        self.attach_public_client(session, request_timeout).await
+    }
+
+    async fn try_open_public_with_timeout(
+        &self,
+        pool: &BrowserPool,
+        request_timeout: std::time::Duration,
+    ) -> Result<Option<PublicBrowserSession>, WebDriverError> {
+        tracing::debug!(engine = ?self.engine, endpoint_host = ?self.endpoint.host_str(), "trying to open public WebDriver health session");
+        let Some(session) = pool.try_open_public().await? else {
+            tracing::debug!("skipping WebDriver health session while browser capacity is busy");
+            return Ok(None);
+        };
+        self.attach_public_client(session, request_timeout)
+            .await
+            .map(Some)
+    }
+
+    async fn attach_public_client(
+        &self,
+        session: PublicBrowserSession,
+        request_timeout: std::time::Duration,
+    ) -> Result<PublicBrowserSession, WebDriverError> {
+        let client = match connect(
+            self.endpoint.clone(),
+            self.engine,
+            &self.profile,
+            request_timeout,
+        )
+        .await
+        {
             Ok(client) => client,
             Err(error) => {
                 tracing::warn!(engine = ?self.engine, error_kind = "connect", "unable to create public WebDriver session");
@@ -272,7 +363,14 @@ impl WebDriverFactory {
         else {
             return Ok(None);
         };
-        let client = match connect(self.endpoint.clone(), self.engine, &self.profile).await {
+        let client = match connect(
+            self.endpoint.clone(),
+            self.engine,
+            &self.profile,
+            WEBDRIVER_REQUEST_TIMEOUT,
+        )
+        .await
+        {
             Ok(client) => client,
             Err(error) => {
                 tracing::warn!(account_id = %account_id, engine = ?self.engine, error_kind = "connect", "unable to create authenticated WebDriver session");
@@ -303,6 +401,44 @@ impl WebDriverFactory {
         let canonical_expected_timezone = canonical_timezone(client, expected_timezone).await?;
         validate_expected_environment(&canonical_expected_timezone, &environment)
     }
+
+    async fn sidecar_ready(&self) -> Result<bool, WebDriverError> {
+        let status_url = webdriver_status_url(&self.endpoint)?;
+        let client = reqwest::Client::builder()
+            .timeout(WEBDRIVER_HEALTH_TIMEOUT)
+            .build()
+            .map_err(|_| WebDriverError::Connect("WebDriver health probe failed".to_owned()))?;
+        let response = client
+            .get(status_url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|_| WebDriverError::Connect("WebDriver health probe failed".to_owned()))?;
+        if !response.status().is_success() {
+            return Err(WebDriverError::Connect(
+                "WebDriver health probe returned an unsuccessful status".to_owned(),
+            ));
+        }
+        let payload = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|_| WebDriverError::Connect("WebDriver health probe failed".to_owned()))?;
+        parse_webdriver_status(&payload)
+    }
+}
+
+fn webdriver_status_url(endpoint: &Url) -> Result<Url, WebDriverError> {
+    endpoint
+        .join("/status")
+        .map_err(|_| WebDriverError::Connect("WebDriver health probe failed".to_owned()))
+}
+
+fn parse_webdriver_status(payload: &serde_json::Value) -> Result<bool, WebDriverError> {
+    let value = payload.get("value").unwrap_or(payload);
+    value
+        .get("ready")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| WebDriverError::Connect("invalid WebDriver health response".to_owned()))
 }
 
 fn validate_expected_environment(
@@ -323,11 +459,12 @@ async fn connect(
     endpoint: Url,
     engine: BrowserEngine,
     profile: &BrowserProfile,
+    request_timeout: std::time::Duration,
 ) -> Result<WebDriver, String> {
     tracing::trace!(engine = ?engine, endpoint_host = ?endpoint.host_str(), "connecting to WebDriver sidecar");
     let capabilities = capabilities_for(engine, profile)?;
     let driver = WebDriver::builder(endpoint.as_str(), capabilities)
-        .request_timeout(WEBDRIVER_REQUEST_TIMEOUT)
+        .request_timeout(request_timeout)
         .connect()
         .await
         .map_err(|error| error.to_string())?;
@@ -1374,6 +1511,42 @@ mod tests {
         );
 
         assert_eq!(error.safe_message(), "WebDriver command failed");
+    }
+
+    #[test]
+    fn webdriver_health_parser_accepts_selenium_envelopes_and_legacy_payloads() {
+        assert!(parse_webdriver_status(&json!({
+            "value": {"ready": true, "message": "ready", "build": {}}
+        }))
+        .unwrap());
+        assert!(!parse_webdriver_status(&json!({
+            "ready": false,
+            "message": "starting"
+        }))
+        .unwrap());
+    }
+
+    #[test]
+    fn webdriver_health_parser_rejects_malformed_status_without_echoing_body() {
+        let error = parse_webdriver_status(&json!({
+            "value": {"message": "private response body"}
+        }))
+        .expect_err("ready must be a boolean");
+
+        assert_eq!(
+            error.safe_message(),
+            "WebDriver session could not be created"
+        );
+        assert!(!error.to_string().contains("private response body"));
+    }
+
+    #[test]
+    fn webdriver_health_always_targets_the_sidecar_status_endpoint() {
+        let endpoint = "http://webdriver.test/wd/hub/".parse::<Url>().unwrap();
+        assert_eq!(
+            webdriver_status_url(&endpoint).unwrap().as_str(),
+            "http://webdriver.test/status"
+        );
     }
 
     #[tokio::test]

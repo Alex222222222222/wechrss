@@ -9,8 +9,8 @@
 > cookie and derived token values are encrypted before persistence and are
 > never returned. A
 > deployment-specific refresh
-> transport can be injected into the runtime worker; QR/login exchange and
-> browser health checks remain unfinished. The single-admin API and panel are
+> transport can be injected into the runtime worker; QR/login exchange remains
+> unfinished. The single-admin API and panel are
 > available when explicitly enabled. API
 > liveness/readiness endpoints are available. Source synchronization uses the
 > enrolled cookie header for every authenticated WeRead request; the account ID
@@ -197,7 +197,9 @@ the pod loopback address (`http://127.0.0.1:4444`) to reach Firefox; the
 WebDriver port is not exposed by the ClusterIP Service. The sample runs both
 containers as non-root, gives Firefox an in-memory `/dev/shm`, and uses
 `/api/health` for Werrss liveness, `/api/ready` for PostgreSQL-backed Werrss
-readiness, and `/status` for WebDriver health. Before applying it, create the
+readiness, `/api/worker/ready` for the application's browser-worker
+diagnostic, and `/status` for direct WebDriver health. Before applying it,
+create the
 referenced `werrss-runtime` Secret with at least these keys using your
 secret-management process:
 
@@ -285,9 +287,10 @@ private-key, password, and related connection options remain in `DATABASE_URL`
 and its query parameters.
 
 For a sidecar in the same Pod, set `TZ` and install `tzdata` in the browser
-image. Do not rely on the node timezone. The application should expose a
-readiness diagnostic that reports its configured timezone and the browser
-session should verify the browser-visible timezone during session setup.
+image. Do not rely on the node timezone. The application exposes
+`/api/worker/ready`, which reports its configured timezone and the browser
+session's observed timezone separately; the browser session also verifies the
+browser-visible timezone during setup.
 
 The WebDriver port remains Pod-internal. NetworkPolicy should prevent external
 clients from reaching it. Asset storage requires persistent volumes only when
@@ -296,11 +299,11 @@ ephemeral profile and never receives account credentials.
 
 API readiness is exposed at `/api/ready` and requires PostgreSQL; it does not
 fail solely because WebDriver is unavailable, allowing persisted RSS feeds to
-remain serviceable. Browser and
-browser-timezone health are exposed as degraded component status and stop
-workers from claiming browser jobs. A worker-only process may make browser
-availability part of its own readiness condition. Liveness is exposed at
-`/api/health` and is a local process check.
+remain serviceable. Browser and browser-timezone health are exposed at
+`/api/worker/ready` as separate components and stop workers from claiming
+browser jobs. A worker-only process uses the shared health state to gate
+browser jobs; only a process with the API role exposes `/api/worker/ready`.
+Liveness is exposed at `/api/health` and is a local process check.
 
 The first usable version includes a small authenticated admin panel for source
 management, synchronization status, feed-link copying, and safe error states.

@@ -15,8 +15,8 @@ use werrss::{
     application::{
         job_service::{JobService, JobServiceConfig},
         worker::{
-            JobExecution, JobHandler, Worker, WorkerConfig, WorkerLoopConfig, WorkerLoopStats,
-            WorkerRun,
+            BrowserJobReadiness, JobExecution, JobHandler, Worker, WorkerConfig, WorkerLoopConfig,
+            WorkerLoopStats, WorkerRun,
         },
     },
     domain::job::{JobStatus, JobType, NewJob},
@@ -61,6 +61,15 @@ impl JobHandler for RecordingHandler {
     async fn execute(&self, lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
         self.seen.lock().await.push(lease.job.job_type());
         self.outcome.clone()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FixedBrowserReadiness(bool);
+
+impl BrowserJobReadiness for FixedBrowserReadiness {
+    fn browser_jobs_allowed(&self) -> bool {
+        self.0
     }
 }
 
@@ -195,6 +204,118 @@ async fn allowed_kind_filter_leaves_disallowed_job_queued() {
         .expect("queue read should succeed")
         .expect("disallowed job should remain claimable");
     assert_eq!(lease.job.status(), JobStatus::Running);
+}
+
+#[tokio::test]
+async fn unhealthy_browser_gate_leaves_browser_jobs_queued_but_runs_feed_rebuilds() {
+    let repository = MemoryJobRepository::new();
+    repository
+        .enqueue(job("source", JobType::SourceSync))
+        .await
+        .expect("source job should enqueue");
+    repository
+        .enqueue(job("feed", JobType::FeedRebuild))
+        .await
+        .expect("feed rebuild job should enqueue");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let worker = build_worker(
+        repository.clone(),
+        RecordingHandler {
+            seen: seen.clone(),
+            outcome: JobExecution::Succeeded,
+        },
+        vec![JobType::SourceSync, JobType::FeedRebuild],
+    )
+    .with_browser_readiness(Arc::new(FixedBrowserReadiness(false)));
+
+    let WorkerRun::Completed { job, .. } = worker
+        .run_once(at(1))
+        .await
+        .expect("database-only work should remain executable")
+    else {
+        panic!("the feed rebuild should be claimed while the browser is unhealthy")
+    };
+    assert_eq!(job.job_type(), JobType::FeedRebuild);
+    assert_eq!(*seen.lock().await, vec![JobType::FeedRebuild]);
+
+    let source_lease = repository
+        .claim_next(
+            "test-reader",
+            at(1),
+            Duration::seconds(1),
+            &[JobType::SourceSync],
+        )
+        .await
+        .expect("queue read should succeed")
+        .expect("browser-backed source job should remain queued");
+    assert_eq!(source_lease.job.job_type(), JobType::SourceSync);
+}
+
+#[tokio::test]
+async fn healthy_browser_gate_allows_source_sync_jobs() {
+    let repository = MemoryJobRepository::new();
+    repository
+        .enqueue(job("source-ready", JobType::SourceSync))
+        .await
+        .expect("source job should enqueue");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let worker = build_worker(
+        repository,
+        RecordingHandler {
+            seen: seen.clone(),
+            outcome: JobExecution::Succeeded,
+        },
+        vec![JobType::SourceSync],
+    )
+    .with_browser_readiness(Arc::new(FixedBrowserReadiness(true)));
+
+    let WorkerRun::Completed { job, .. } = worker
+        .run_once(at(1))
+        .await
+        .expect("healthy browser should allow source work")
+    else {
+        panic!("a source job should be claimed when browser readiness is true")
+    };
+    assert_eq!(job.job_type(), JobType::SourceSync);
+    assert_eq!(*seen.lock().await, vec![JobType::SourceSync]);
+}
+
+#[tokio::test]
+async fn unhealthy_browser_gate_returns_idle_when_only_browser_jobs_are_due() {
+    let repository = MemoryJobRepository::new();
+    repository
+        .enqueue(job("source-only", JobType::SourceSync))
+        .await
+        .expect("source job should enqueue");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let worker = build_worker(
+        repository.clone(),
+        RecordingHandler {
+            seen: seen.clone(),
+            outcome: JobExecution::Succeeded,
+        },
+        vec![JobType::SourceSync],
+    )
+    .with_browser_readiness(Arc::new(FixedBrowserReadiness(false)));
+
+    assert_eq!(
+        worker
+            .run_once(at(1))
+            .await
+            .expect("a gated queue should be polled successfully"),
+        WorkerRun::Idle
+    );
+    assert!(seen.lock().await.is_empty());
+    assert!(repository
+        .claim_next(
+            "test-reader",
+            at(1),
+            Duration::seconds(1),
+            &[JobType::SourceSync],
+        )
+        .await
+        .expect("queue read should succeed")
+        .is_some());
 }
 
 #[tokio::test]
