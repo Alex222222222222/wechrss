@@ -21,7 +21,8 @@
 //! bounded public page pacing/scroll execution, optional browser-visible
 //! timezone validation, the admin-enrolled cookie-backed WeRead article-list
 //! transport, and authenticated request pacing are executable.
-//! Login/refresh remain deferred in the child modules. Browser sidecar health
+//! QR login is implemented through the application login-attempt port;
+//! credential refresh remains a separate application service. Browser sidecar health
 //! probing is composed by `application::browser_health`. Source creation
 //! composes the public identity resolver with the admin API; known book IDs
 //! can bypass browser resolution.
@@ -32,3 +33,4 @@ pub mod identity;
 pub mod pacing;
 pub mod webdriver;
 pub mod weread;
+pub mod weread_qr;

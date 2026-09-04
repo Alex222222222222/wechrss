@@ -34,8 +34,8 @@ running any component.
 ## First usable version scope
 
 The first usable version includes a small authenticated admin panel for source
-management, manual WeRead credential enrollment, synchronization status,
-feed-link copying, and operator-facing error states. It has one administrator
+management, manual and QR-code WeRead credential enrollment, synchronization
+status, feed-link copying, and operator-facing error states. It has one administrator
 whose username and password are supplied
 through `ADMIN_USERNAME` and `ADMIN_PASSWORD`; there is no user-management
 lifecycle in the first version. The panel uses the same API and
@@ -47,10 +47,8 @@ needed to run the release image. The checked-in Dockerfile and GitHub Actions
 workflow build every branch and publish a release image to GHCR for `v*.*.*`
 tags.
 
-The following items are intentionally deferred until after the first release:
+The following item is intentionally deferred until after the first release:
 
-- QR-code login, because it requires interactive user confirmation and a
-  dedicated login-attempt lifecycle; and
 - a queue and handler for articles missed during synchronization. This is a
   useful repair/backfill improvement, but the first release relies on the
   normal source synchronization path.
@@ -258,18 +256,14 @@ responsive administrator UI polish and the English, French, and Simplified
 Chinese panel translations are also included in the current panel. The
 remaining roadmap items are future work:
 
-1. **Add QR-code login.** Implement the bounded, single-use login-attempt
-   lifecycle and interactive confirmation flow so operators do not need to
-   supply credentials manually. This remains deferred after the
-   first release.
-2. **Add missed-article repair/backfill jobs.** Queue and process articles
+1. **Add missed-article repair/backfill jobs.** Queue and process articles
    missed during synchronization with bounded retries and deduplication. This
    improves recovery after partial upstream failures but is not required for
    the first release.
-3. **Persist archived assets and rewrite feed URLs.** Store approved media in
+2. **Persist archived assets and rewrite feed URLs.** Store approved media in
    local or object storage so archived articles can remain useful when
    upstream assets change or disappear.
-4. **Evaluate PGMQ as a queue transport optimization.** The current custom
+3. **Evaluate PGMQ as a queue transport optimization.** The current custom
    `jobs` table remains the version-one transport; PGMQ can be evaluated later
    if queue throughput or operational overhead becomes a demonstrated
    bottleneck.
@@ -315,8 +309,11 @@ returns only the generated account ID and non-secret status metadata. `GET
 /api/admin/weread/accounts/{account_id}` returns that same metadata for
 checking an enrollment. Re-authentication uses the protected `PUT
 /api/admin/weread/accounts/{account_id}` route and keeps the same account ID
-for existing source references. QR login is not part of this flow, and
-credentials cannot be read back through the panel.
+for existing source references. Credentials cannot be read back through the
+panel. The QR flow is available from the same panel: it provisions a new or
+selected account only after the administrator confirms the short-lived code,
+and keeps the temporary QR attempt and upstream credentials out of status
+responses.
 
 A deployment-specific
 `CredentialRefresher` can be injected into `RuntimeSupervisor`; that enables
@@ -403,25 +400,32 @@ are kept separate from the static translation catalog.
 
 ### QR login
 
-QR login is intentionally not implemented yet and requires user interaction.
-The planned flow is:
+The admin panel includes an interactive QR login flow for enrolling a new or
+existing WeRead account without copying a cookie header. It follows a bounded,
+single-use lifecycle:
 
 1. create a short-lived, single-use login attempt bound to one account;
-2. display the upstream QR image or safe equivalent without logging its value;
+2. display the server-generated QR SVG without logging its value;
 3. poll with a bounded interval and deadline, handling pending, scanned,
    confirmed, expired, cancelled, and risk-controlled states;
-4. exchange the confirmed result for credentials through a dedicated
-   `CredentialRefresher`/login transport; and
+4. exchange the confirmed result through the WeRead QR transport; and
 5. validate the account identity, encrypt the credentials, provision the
    account, and discard the temporary login state.
 
-The eventual route must require administrator authentication, CSRF protection,
-login rate limiting, single-use attempt expiry, and explicit cancellation.
-QR contents and upstream credentials must never be persisted or returned in
-status responses. Until that boundary exists, operators must not expect a QR
-endpoint or attempt to place login secrets in environment variables or source
-files. Automated tests can cover the state machine and expiry transitions;
-the real QR scan remains an opt-in manual test.
+The routes are `POST /api/admin/weread/qr` to start, `GET
+/api/admin/weread/qr/{attempt_id}` to poll, and `DELETE
+/api/admin/weread/qr/{attempt_id}` to cancel. All three routes require
+administrator authentication and CSRF protection because a successful poll
+finalizes account persistence. Attempt creation is bounded, expires after five
+minutes by default, and successful attempts are consumed before account
+persistence. QR contents and upstream credentials are never logged, persisted
+as attempt state, or returned in status responses.
+
+The attempt manager is process-local. With more than one API replica, route the
+start, poll, and cancel requests for one attempt to the same replica until
+durable encrypted attempt storage is added. The real QR scan remains an opt-in
+manual test; automated tests cover state transitions, expiry, cancellation,
+response redaction, and admin provisioning.
 
 ## Test coverage
 

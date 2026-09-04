@@ -29,6 +29,7 @@ rand = "0.9"
 rand_distr = "0.5"
 regex = "1"
 percent-encoding = "2"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 ring = "0.17"
 rss = "2.1"

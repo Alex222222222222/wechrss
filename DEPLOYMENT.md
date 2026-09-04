@@ -7,10 +7,9 @@
 > are available as an application service. Administrators can enroll an
 > already-issued WeRead web cookie header from the protected `/admin` panel;
 > cookie and derived token values are encrypted before persistence and are
-> never returned. A
-> deployment-specific refresh
-> transport can be injected into the runtime worker; QR/login exchange remains
-> unfinished. The single-admin API and panel are
+> never returned. A deployment-specific refresh transport can be injected into
+> the runtime worker; the single-admin API and panel also expose the bounded
+> WeRead QR-login exchange. The single-admin API and panel are
 > available when explicitly enabled. API
 > liveness/readiness endpoints are available. Source synchronization uses the
 > enrolled cookie header for every authenticated WeRead request; the account ID
@@ -152,9 +151,9 @@ percent-decodes that cookie value and uses it as the display name. The response
 contains only the account UUID and status metadata. Use that UUID
 as a source's `account_id` when a source must stay pinned to one account; leave
 the field empty to randomly use any enabled, unexpired enrolled account. To
-rotate a session, submit the new cookie using the same account ID. QR-code
-login remains deferred, and no cookie should be placed in a ConfigMap or
-container image.
+rotate a session, submit the new cookie using the same account ID. The panel
+also supports QR-code enrollment through its short-lived, single-use login
+attempt flow. No cookie should be placed in a ConfigMap or container image.
 
 #### Authenticated browser diagnostic
 
@@ -312,12 +311,14 @@ It has one administrator configured through `ADMIN_USERNAME` and
 `ADMIN_ENABLED=true`, an independent `SESSION_SIGNING_KEY`, and expose it only
 through the deployment's TLS-protected ingress. `/admin/login` starts the
 non-interactive login flow; successful API login returns a CSRF token for
-state-changing requests.
-Interactive QR-code login is deferred until after the first release because it
-requires user interaction and a dedicated login-attempt lifecycle. A durable
-queue and handler for articles missed during synchronization is also deferred;
-it is a post-release repair/backfill improvement rather than a first-release
-requirement.
+state-changing requests. After signing in, the admin panel can start a QR
+attempt, display its SVG, poll its status, and cancel it. All three QR routes
+require the admin session and CSRF token because a successful poll finalizes
+account persistence. Attempts are process-local, so a multi-replica deployment
+must use sticky routing for one attempt until durable encrypted attempt storage
+is introduced. A durable queue and handler for articles missed during
+synchronization is deferred; it is a post-release repair/backfill improvement
+rather than a first-release requirement.
 
 ## Timezone verification
 

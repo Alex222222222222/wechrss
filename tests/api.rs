@@ -1,5 +1,6 @@
 //! PostgreSQL-backed integration coverage for the public feed HTTP boundary.
 
+use async_trait::async_trait;
 use axum::{
     body::{to_bytes, Body},
     extract::ConnectInfo,
@@ -10,6 +11,7 @@ use chrono::{Duration, Utc};
 use chrono_tz::UTC;
 use secrecy::SecretString;
 use sqlx::{postgres::PgPoolOptions, PgPool};
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 use uuid::Uuid;
 use werrss::{
@@ -23,6 +25,10 @@ use werrss::{
             FeedRebuildJobConfig, FeedService, FeedServiceConfig, PostgresFeedRebuildQueue,
         },
         feed_token_service::FeedTokenService,
+        qr_login::{
+            QrAuthenticatedSession, QrLoginChallenge, QrLoginManager, QrLoginService,
+            QrLoginTransport, QrLoginTransportError, QrLoginTransportPoll,
+        },
         source_service::SourceService,
     },
     domain::source::{FeedRevision, SourceId},
@@ -44,7 +50,13 @@ use werrss::{
         unit_of_work::UnitOfWorkFactory,
     },
     rss::renderer::{RenderArticle, RenderFeedInput, RssRenderer},
-    web::{admin::admin_router_with_server_root_url, api::feed_router, auth::AdminAuthenticator},
+    web::{
+        admin::{
+            admin_router_with_server_root_url, admin_router_with_server_root_url_and_qr_login,
+        },
+        api::feed_router,
+        auth::AdminAuthenticator,
+    },
 };
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -632,7 +644,7 @@ async fn admin_source_update_endpoints(pool: PgPool) {
     let source_page_body =
         String::from_utf8_lossy(&to_bytes(source_page.into_body(), usize::MAX).await.unwrap())
             .to_string();
-    assert!(source_page_body.contains("<h1>Edit source</h1>"));
+    assert!(source_page_body.contains("<h1 data-i18n=\"source.edit_heading\">Edit source</h1>"));
     assert!(source_page_body.contains("name=\"book_id\" value=\"book-admin\""));
 
     let updated = app
@@ -1137,6 +1149,24 @@ async fn every_protected_admin_route_rejects_an_unauthenticated_request(pool: Pg
             Some(serde_json::json!({"enabled": true})),
             StatusCode::UNAUTHORIZED,
         ),
+        (
+            "POST",
+            "/api/admin/weread/qr",
+            Some(serde_json::json!({"account_id": null, "display_name": null})),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "GET",
+            "/api/admin/weread/qr/00000000-0000-0000-0000-000000000001",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "DELETE",
+            "/api/admin/weread/qr/00000000-0000-0000-0000-000000000001",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
         ("GET", "/api/admin/sources", None, StatusCode::UNAUTHORIZED),
         (
             "POST",
@@ -1305,6 +1335,337 @@ async fn admin_can_provision_weread_account_with_empty_optional_cookie_values(po
     assert_eq!(status["account_id"], account_id.to_string());
     assert_eq!(status["display_name"], "Alex Hua");
     assert_eq!(status["disabled"], false);
+}
+
+#[derive(Clone)]
+struct TestQrTransport {
+    result: Arc<Mutex<Option<Result<QrLoginTransportPoll, QrLoginTransportError>>>>,
+}
+
+impl TestQrTransport {
+    fn new(result: Result<QrLoginTransportPoll, QrLoginTransportError>) -> Self {
+        Self {
+            result: Arc::new(Mutex::new(Some(result))),
+        }
+    }
+}
+
+#[async_trait]
+impl QrLoginTransport for TestQrTransport {
+    async fn begin(&self) -> Result<QrLoginChallenge, QrLoginTransportError> {
+        QrLoginChallenge::new("integration-test-uid")
+    }
+
+    async fn poll(
+        &self,
+        _challenge: &QrLoginChallenge,
+    ) -> Result<QrLoginTransportPoll, QrLoginTransportError> {
+        self.result
+            .lock()
+            .expect("test QR result mutex should not be poisoned")
+            .take()
+            .unwrap_or(Ok(QrLoginTransportPoll::Waiting))
+    }
+
+    async fn cancel(&self, _challenge: &QrLoginChallenge) -> Result<(), QrLoginTransportError> {
+        Ok(())
+    }
+}
+
+fn test_qr_session() -> QrAuthenticatedSession {
+    QrAuthenticatedSession::new(
+        "qr-access-secret",
+        "qr-refresh-secret",
+        "wr_vid=qr-vid; wr_skey=qr-access-secret; wr_rt=qr-refresh-secret; wr_name=QR%20User",
+        Utc::now() + Duration::hours(1),
+        None,
+    )
+    .expect("test QR session should be valid")
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_qr_login_requires_admin_authentication_and_csrf(pool: PgPool) {
+    let manager = Arc::new(QrLoginManager::new(TestQrTransport::new(Ok(
+        QrLoginTransportPoll::Waiting,
+    ))));
+    let app = admin_app_with_qr_login(&pool, None, Some(manager));
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(json_request(
+            "/api/admin/weread/qr",
+            serde_json::json!({"account_id": null, "display_name": null}),
+        ))
+        .await
+        .expect("unauthenticated QR start should complete");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let (cookie, _) = admin_session(&app).await;
+    let missing_csrf = app
+        .oneshot(admin_request(
+            "/api/admin/weread/qr",
+            &cookie,
+            None,
+            Some(serde_json::json!({"account_id": null, "display_name": null})),
+        ))
+        .await
+        .expect("QR start without CSRF should complete");
+    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_qr_login_poll_requires_csrf(pool: PgPool) {
+    let manager = Arc::new(QrLoginManager::new(TestQrTransport::new(Ok(
+        QrLoginTransportPoll::Waiting,
+    ))));
+    let app = admin_app_with_qr_login(&pool, None, Some(manager));
+    let (cookie, csrf) = admin_session(&app).await;
+    let start = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/qr",
+            &cookie,
+            Some(&csrf),
+            Some(serde_json::json!({"account_id": null, "display_name": null})),
+        ))
+        .await
+        .expect("QR start should complete");
+    assert_eq!(start.status(), StatusCode::OK);
+    let start: serde_json::Value = serde_json::from_slice(
+        &to_bytes(start.into_body(), usize::MAX)
+            .await
+            .expect("QR start body should be readable"),
+    )
+    .expect("QR start should return JSON");
+    let attempt_id = start["attempt_id"]
+        .as_str()
+        .expect("QR start should return an attempt ID")
+        .to_owned();
+
+    let missing_csrf = app
+        .oneshot(admin_request(
+            &format!("/api/admin/weread/qr/{attempt_id}"),
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("QR poll without CSRF should complete");
+    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_qr_login_provisions_a_new_account_without_returning_secrets(pool: PgPool) {
+    let manager = Arc::new(QrLoginManager::new(TestQrTransport::new(Ok(
+        QrLoginTransportPoll::Authenticated(test_qr_session()),
+    ))));
+    let app = admin_app_with_qr_login(&pool, None, Some(manager));
+    let (cookie, csrf) = admin_session(&app).await;
+
+    let start = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/qr",
+            &cookie,
+            Some(&csrf),
+            Some(serde_json::json!({"account_id": null, "display_name": null})),
+        ))
+        .await
+        .expect("QR start should complete");
+    assert_eq!(start.status(), StatusCode::OK);
+    assert_eq!(
+        start
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let start_body = to_bytes(start.into_body(), usize::MAX)
+        .await
+        .expect("QR start body should be readable");
+    let start: serde_json::Value =
+        serde_json::from_slice(&start_body).expect("QR start should return JSON");
+    assert!(start["qr_svg"].as_str().unwrap().contains("<svg"));
+    assert!(!String::from_utf8_lossy(&start_body).contains("qr-access-secret"));
+    assert!(!String::from_utf8_lossy(&start_body).contains("integration-test-uid"));
+    let attempt_id = start["attempt_id"]
+        .as_str()
+        .expect("QR start should return an attempt ID")
+        .to_owned();
+
+    let completed = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/api/admin/weread/qr/{attempt_id}"),
+            &cookie,
+            Some(&csrf),
+            None,
+        ))
+        .await
+        .expect("QR poll should complete");
+    assert_eq!(completed.status(), StatusCode::CREATED);
+    let completed_body = to_bytes(completed.into_body(), usize::MAX)
+        .await
+        .expect("QR completion body should be readable");
+    let completed: serde_json::Value =
+        serde_json::from_slice(&completed_body).expect("QR completion should return JSON");
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["account"]["display_name"], "QR User");
+    assert!(!String::from_utf8_lossy(&completed_body).contains("qr-access-secret"));
+    assert!(!String::from_utf8_lossy(&completed_body).contains("qr-refresh-secret"));
+
+    let account_id = completed["account"]["account_id"]
+        .as_str()
+        .expect("completion should return account ID")
+        .parse::<Uuid>()
+        .expect("account ID should be a UUID");
+    let (stored_name, ciphertext): (String, Vec<u8>) = sqlx::query_as(
+        "SELECT display_name, credentials_ciphertext FROM weread_accounts WHERE account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .expect("QR login should persist an account");
+    assert_eq!(stored_name, "QR User");
+    assert!(!String::from_utf8_lossy(&ciphertext).contains("qr-access-secret"));
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_qr_login_replaces_an_existing_account_without_changing_its_id(pool: PgPool) {
+    let manager = Arc::new(QrLoginManager::new(TestQrTransport::new(Ok(
+        QrLoginTransportPoll::Authenticated(test_qr_session()),
+    ))));
+    let app = admin_app_with_qr_login(&pool, None, Some(manager));
+    let (cookie, csrf) = admin_session(&app).await;
+    let account_id = Uuid::from_u128(42);
+    let initial = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/accounts",
+            &cookie,
+            Some(&csrf),
+            Some(serde_json::json!({
+                "account_id": account_id,
+                "display_name": "Initial name",
+                "cookie_header": "wr_vid=old-vid; wr_skey=old-access; wr_rt=old-refresh",
+                "access_expires_at": (Utc::now() + Duration::days(30)).to_rfc3339(),
+            })),
+        ))
+        .await
+        .expect("initial account provisioning should complete");
+    assert_eq!(initial.status(), StatusCode::CREATED);
+
+    let start = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/qr",
+            &cookie,
+            Some(&csrf),
+            Some(serde_json::json!({
+                "account_id": account_id,
+                "display_name": "QR replacement",
+            })),
+        ))
+        .await
+        .expect("QR start should complete");
+    assert_eq!(start.status(), StatusCode::OK);
+    let start: serde_json::Value = serde_json::from_slice(
+        &to_bytes(start.into_body(), usize::MAX)
+            .await
+            .expect("QR start body should be readable"),
+    )
+    .expect("QR start should return JSON");
+    let attempt_id = start["attempt_id"]
+        .as_str()
+        .expect("QR start should return an attempt ID")
+        .to_owned();
+
+    let completed = app
+        .oneshot(admin_request(
+            &format!("/api/admin/weread/qr/{attempt_id}"),
+            &cookie,
+            Some(&csrf),
+            None,
+        ))
+        .await
+        .expect("QR poll should complete");
+    assert_eq!(completed.status(), StatusCode::OK);
+    let completed: serde_json::Value = serde_json::from_slice(
+        &to_bytes(completed.into_body(), usize::MAX)
+            .await
+            .expect("QR completion body should be readable"),
+    )
+    .expect("QR completion should return JSON");
+    assert_eq!(completed["account"]["account_id"], account_id.to_string());
+    assert_eq!(completed["account"]["display_name"], "QR replacement");
+    assert_eq!(completed["account"]["credential_version"], 2);
+
+    let (stored_name, stored_version): (String, i64) = sqlx::query_as(
+        "SELECT display_name, credential_version FROM weread_accounts WHERE account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .expect("replaced account should remain queryable");
+    assert_eq!(stored_name, "QR replacement");
+    assert_eq!(stored_version, 2);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_qr_login_cancellation_consumes_the_attempt(pool: PgPool) {
+    let manager = Arc::new(QrLoginManager::new(TestQrTransport::new(Ok(
+        QrLoginTransportPoll::Waiting,
+    ))));
+    let app = admin_app_with_qr_login(&pool, None, Some(manager));
+    let (cookie, csrf) = admin_session(&app).await;
+    let start = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/qr",
+            &cookie,
+            Some(&csrf),
+            Some(serde_json::json!({"account_id": null, "display_name": "To cancel"})),
+        ))
+        .await
+        .expect("QR start should complete");
+    let start: serde_json::Value = serde_json::from_slice(
+        &to_bytes(start.into_body(), usize::MAX)
+            .await
+            .expect("QR start body should be readable"),
+    )
+    .expect("QR start should return JSON");
+    let attempt_id = start["attempt_id"].as_str().unwrap();
+
+    let cancelled = app
+        .clone()
+        .oneshot(admin_request_with_method(
+            &format!("/api/admin/weread/qr/{attempt_id}"),
+            &cookie,
+            Some(&csrf),
+            None,
+            "DELETE",
+        ))
+        .await
+        .expect("QR cancellation should complete");
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    let cancelled: serde_json::Value = serde_json::from_slice(
+        &to_bytes(cancelled.into_body(), usize::MAX)
+            .await
+            .expect("cancellation body should be readable"),
+    )
+    .expect("cancellation should return JSON");
+    assert_eq!(cancelled["status"], "cancelled");
+
+    let after_cancel = app
+        .oneshot(admin_request(
+            &format!("/api/admin/weread/qr/{attempt_id}"),
+            &cookie,
+            Some(&csrf),
+            None,
+        ))
+        .await
+        .expect("poll after cancellation should complete");
+    assert_eq!(after_cancel.status(), StatusCode::NOT_FOUND);
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -1637,40 +1998,64 @@ fn admin_app(pool: &PgPool) -> axum::Router {
 }
 
 fn admin_app_with_server_root_url(pool: &PgPool, root: Option<&str>) -> axum::Router {
+    admin_app_with_qr_login(pool, root, None)
+}
+
+fn admin_app_with_qr_login(
+    pool: &PgPool,
+    root: Option<&str>,
+    qr_login: Option<Arc<dyn QrLoginService>>,
+) -> axum::Router {
     let auth = AdminAuthenticator::new(
         "admin".to_owned(),
         SecretString::new("correct horse".to_owned().into_boxed_str()),
         SecretString::new("independent signing key".to_owned().into_boxed_str()),
     )
     .expect("test admin auth should be valid");
-    admin_router_with_server_root_url(
-        auth,
-        SourceService::new(
-            PostgresSourceRepository::new(pool.clone()),
-            UnitOfWorkFactory::new(pool.clone()),
+    let sources = SourceService::new(
+        PostgresSourceRepository::new(pool.clone()),
+        UnitOfWorkFactory::new(pool.clone()),
+    );
+    let feed_tokens = FeedTokenService::new(PostgresFeedTokenRepository::new(pool.clone()));
+    let sync_runs = PostgresSyncRunRepository::new(pool.clone());
+    let weread_auth = AuthService::new(
+        AuthServiceDependencies {
+            accounts: PostgresCredentialRepository::new(pool.clone()),
+            leases: PostgresAccountLeaseRepository::new(pool.clone()),
+            refresher: ManualCredentialRefresher,
+            cipher: RingCredentialCipher::new(&SecretString::new(
+                "integration credential key".to_owned().into_boxed_str(),
+            ))
+            .expect("test credential cipher should be valid"),
+        },
+        AuthServiceConfig::new(
+            Duration::minutes(5),
+            Duration::minutes(10),
+            Duration::minutes(1),
+        )
+        .expect("test auth configuration should be valid"),
+    );
+    let root = root.map(|value| value.parse().expect("test server root URL should parse"));
+    let router = match qr_login {
+        Some(qr_login) => admin_router_with_server_root_url_and_qr_login(
+            auth,
+            sources,
+            feed_tokens,
+            sync_runs,
+            weread_auth,
+            root,
+            qr_login,
         ),
-        FeedTokenService::new(PostgresFeedTokenRepository::new(pool.clone())),
-        PostgresSyncRunRepository::new(pool.clone()),
-        AuthService::new(
-            AuthServiceDependencies {
-                accounts: PostgresCredentialRepository::new(pool.clone()),
-                leases: PostgresAccountLeaseRepository::new(pool.clone()),
-                refresher: ManualCredentialRefresher,
-                cipher: RingCredentialCipher::new(&SecretString::new(
-                    "integration credential key".to_owned().into_boxed_str(),
-                ))
-                .expect("test credential cipher should be valid"),
-            },
-            AuthServiceConfig::new(
-                Duration::minutes(5),
-                Duration::minutes(10),
-                Duration::minutes(1),
-            )
-            .expect("test auth configuration should be valid"),
+        None => admin_router_with_server_root_url(
+            auth,
+            sources,
+            feed_tokens,
+            sync_runs,
+            weread_auth,
+            root,
         ),
-        root.map(|value| value.parse().expect("test server root URL should parse")),
-    )
-    .layer(Extension(ConnectInfo(std::net::SocketAddr::from((
+    };
+    router.layer(Extension(ConnectInfo(std::net::SocketAddr::from((
         [127, 0, 0, 1],
         43_210,
     )))))

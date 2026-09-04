@@ -7,7 +7,8 @@
 //!
 //! Authenticated source work is constructed for worker roles and resolves a
 //! usable WeRead account at job time and injects the encrypted cookie enrolled
-//! through the admin panel. QR login remains intentionally deferred.
+//! through the admin panel. QR login is exposed by the admin router through a
+//! bounded application login-attempt manager.
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration as StdDuration};
 

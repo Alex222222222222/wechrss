@@ -22,12 +22,17 @@ use uuid::Uuid;
 
 use crate::{
     acquisition::identity::{ArticleIdentityResolver, IdentityError, UrlArticleIdentityResolver},
+    acquisition::weread_qr::WereadQrHttpTransport,
     application::{
         auth_service::{
             AuthService, AuthServiceError, CredentialProvision, ManualCredentialRefresher,
             RingCredentialCipher,
         },
         feed_token_service::{FeedTokenService, FeedTokenServiceError},
+        qr_login::{
+            QrAuthenticatedSession, QrLoginError, QrLoginManager, QrLoginPollResult,
+            QrLoginService, QrLoginState,
+        },
         source_service::{SourceService, SourceServiceError},
     },
     domain::{
@@ -100,6 +105,29 @@ pub fn admin_router_with_server_root_url(
     )
 }
 
+/// Builds the administration routes with an injected QR-login service and the
+/// compatibility URL-only identity resolver.
+pub fn admin_router_with_server_root_url_and_qr_login(
+    auth: AdminAuthenticator,
+    sources: AdminSourceService,
+    feed_tokens: AdminTokenService,
+    sync_runs: PostgresSyncRunRepository,
+    weread_auth: AdminAuthService,
+    server_root_url: Option<url::Url>,
+    qr_login: Arc<dyn QrLoginService>,
+) -> Router {
+    admin_router_with_identity_resolver_and_server_root_url_and_qr_login(
+        auth,
+        sources,
+        feed_tokens,
+        sync_runs,
+        weread_auth,
+        Arc::new(UrlArticleIdentityResolver),
+        server_root_url,
+        qr_login,
+    )
+}
+
 /// Builds the administration routes with a configured article identity
 /// resolver. Runtime deployments should provide the browser-backed resolver;
 /// the compatibility constructor above remains useful for long URLs and tests.
@@ -133,6 +161,34 @@ pub fn admin_router_with_identity_resolver_and_server_root_url(
     identity_resolver: Arc<dyn ArticleIdentityResolver>,
     server_root_url: Option<url::Url>,
 ) -> Router {
+    admin_router_with_identity_resolver_and_server_root_url_and_qr_login(
+        auth,
+        sources,
+        feed_tokens,
+        sync_runs,
+        weread_auth,
+        identity_resolver,
+        server_root_url,
+        Arc::new(QrLoginManager::new(WereadQrHttpTransport::default())),
+    )
+}
+
+/// Builds the administration routes with an injected QR-login service.
+///
+/// The injected boundary keeps HTTP integration tests independent of WeRead
+/// and allows deployments to replace the upstream transport with an approved
+/// adapter without changing the account API.
+#[allow(clippy::too_many_arguments)]
+pub fn admin_router_with_identity_resolver_and_server_root_url_and_qr_login(
+    auth: AdminAuthenticator,
+    sources: AdminSourceService,
+    feed_tokens: AdminTokenService,
+    sync_runs: PostgresSyncRunRepository,
+    weread_auth: AdminAuthService,
+    identity_resolver: Arc<dyn ArticleIdentityResolver>,
+    server_root_url: Option<url::Url>,
+    qr_login: Arc<dyn QrLoginService>,
+) -> Router {
     let state = Arc::new(AdminApiState {
         auth,
         sources,
@@ -141,6 +197,7 @@ pub fn admin_router_with_identity_resolver_and_server_root_url(
         weread_auth,
         identity_resolver,
         server_root_url,
+        qr_login,
     });
     Router::new()
         .route("/", get(root_redirect))
@@ -169,6 +226,11 @@ pub fn admin_router_with_identity_resolver_and_server_root_url(
             "/api/admin/weread/accounts/{account_id}/enabled",
             post(set_weread_account_enabled),
         )
+        .route("/api/admin/weread/qr", post(start_weread_qr_login))
+        .route(
+            "/api/admin/weread/qr/{attempt_id}",
+            get(poll_weread_qr_login).delete(cancel_weread_qr_login),
+        )
         .route("/api/admin/sources", get(list_sources).post(create_source))
         .route(
             "/api/admin/sources/{source_id}",
@@ -195,6 +257,7 @@ struct AdminApiState {
     weread_auth: AdminAuthService,
     identity_resolver: Arc<dyn ArticleIdentityResolver>,
     server_root_url: Option<url::Url>,
+    qr_login: Arc<dyn QrLoginService>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,9 +306,190 @@ struct SetEnabledRequest {
     enabled: bool,
 }
 
+#[derive(Deserialize)]
+struct StartQrLoginRequest {
+    account_id: Option<Uuid>,
+    display_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct QrLoginStartResponse {
+    attempt_id: Uuid,
+    account_id: Uuid,
+    qr_svg: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Serialize)]
+struct QrLoginCompletionResponse {
+    status: QrLoginState,
+    account: WeReadAccountResponse,
+}
+
 #[tracing::instrument(skip_all, level = "debug")]
 async fn root_redirect() -> Redirect {
     Redirect::temporary("/admin/")
+}
+
+#[tracing::instrument(skip_all, level = "debug")]
+async fn start_weread_qr_login(
+    State(state): State<Arc<AdminApiState>>,
+    headers: HeaderMap,
+    Json(request): Json<StartQrLoginRequest>,
+) -> Response {
+    let _session = match protected_mutation(&state, &headers) {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    let account_id = match request.account_id {
+        Some(value) if !value.is_nil() => Some(WeReadAccountId::from_uuid(value)),
+        Some(_) => return validation_error("account_id must be a non-nil UUID"),
+        None => None,
+    };
+    match state.qr_login.start(account_id, request.display_name).await {
+        Ok(started) => {
+            tracing::info!(account_id = %started.account_id, "administrator started WeRead QR login");
+            let mut response = Json(QrLoginStartResponse {
+                attempt_id: started.attempt_id,
+                account_id: started.account_id.as_uuid(),
+                qr_svg: started.qr_svg,
+                expires_at: started.expires_at,
+            })
+            .into_response();
+            // The SVG contains a short-lived login capability. Prevent
+            // browsers and reverse proxies from storing the start response.
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "administrator could not start WeRead QR login");
+            qr_login_error_response(error)
+        }
+    }
+}
+
+#[tracing::instrument(skip_all, level = "debug")]
+async fn poll_weread_qr_login(
+    State(state): State<Arc<AdminApiState>>,
+    Path(attempt_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let _session = match protected_mutation(&state, &headers) {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    let attempt_id = match Uuid::parse_str(&attempt_id) {
+        Ok(value) if !value.is_nil() => value,
+        _ => return validation_error("attempt_id must be a non-nil UUID"),
+    };
+    match state.qr_login.poll(attempt_id).await {
+        Ok(QrLoginPollResult::Status(status)) => Json(status).into_response(),
+        Ok(QrLoginPollResult::Authenticated {
+            account_id,
+            requested_display_name,
+            session,
+        }) => complete_weread_qr_login(&state, account_id, requested_display_name, session).await,
+        Err(error) => {
+            tracing::warn!(attempt_id = %attempt_id, error = %error, "administrator QR login poll failed");
+            qr_login_error_response(error)
+        }
+    }
+}
+
+#[tracing::instrument(skip_all, level = "debug")]
+async fn cancel_weread_qr_login(
+    State(state): State<Arc<AdminApiState>>,
+    Path(attempt_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let _session = match protected_mutation(&state, &headers) {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    let attempt_id = match Uuid::parse_str(&attempt_id) {
+        Ok(value) if !value.is_nil() => value,
+        _ => return validation_error("attempt_id must be a non-nil UUID"),
+    };
+    match state.qr_login.cancel(attempt_id).await {
+        Ok(status) => {
+            tracing::info!(attempt_id = %attempt_id, "administrator cancelled WeRead QR login");
+            Json(status).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(attempt_id = %attempt_id, error = %error, "administrator could not cancel WeRead QR login");
+            qr_login_error_response(error)
+        }
+    }
+}
+
+async fn complete_weread_qr_login(
+    state: &AdminApiState,
+    account_id: WeReadAccountId,
+    requested_display_name: Option<String>,
+    session: QrAuthenticatedSession,
+) -> Response {
+    let display_name = match display_name_from_values(
+        requested_display_name.as_deref(),
+        session.display_name(),
+        session.cookie_header(),
+    ) {
+        Ok(display_name) => display_name,
+        Err(error) => return validation_error(error),
+    };
+    let credentials = match crate::domain::credentials::WeReadCredentials::new(
+        session.access_token().to_owned(),
+        session.refresh_token().to_owned(),
+        session.access_expires_at(),
+        Utc::now(),
+    ) {
+        Ok(credentials) => match credentials.with_web_cookie(session.cookie_header().to_owned()) {
+            Ok(credentials) => credentials,
+            Err(_) => return validation_error("QR login returned invalid credentials"),
+        },
+        Err(_) => return validation_error("QR login returned invalid credentials"),
+    };
+    let provision = CredentialProvision {
+        account_id,
+        display_name,
+        credentials,
+    };
+    let existing = match state.weread_auth.account(account_id).await {
+        Ok(_) => true,
+        Err(AuthServiceError::AccountNotFound { .. }) => false,
+        Err(error) => return auth_service_error_response(error),
+    };
+    let result = if existing {
+        state
+            .weread_auth
+            .replace(provision, "admin:qr-login")
+            .await
+            .map(|account| (StatusCode::OK, account))
+    } else {
+        state
+            .weread_auth
+            .provision(provision)
+            .await
+            .map(|account| (StatusCode::CREATED, account))
+    };
+    match result {
+        Ok((status, account)) => {
+            tracing::info!(account_id = %account.account_id(), status = ?status, "WeRead QR login credentials stored");
+            (
+                status,
+                Json(QrLoginCompletionResponse {
+                    status: QrLoginState::Completed,
+                    account: WeReadAccountResponse::from(account),
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            tracing::warn!(account_id = %account_id, error = %error, "WeRead QR login credentials could not be stored");
+            auth_service_error_response(error)
+        }
+    }
 }
 
 impl From<crate::domain::credentials::WeReadAccount> for WeReadAccountResponse {
@@ -509,28 +753,42 @@ fn credentials_from_request(
 fn display_name_from_request(
     request: &ProvisionWeReadAccountRequest,
 ) -> Result<String, Box<Response>> {
-    if let Some(display_name) = request
-        .display_name
-        .as_deref()
+    display_name_from_values(
+        request.display_name.as_deref(),
+        None,
+        request.cookie_header.trim(),
+    )
+    .map_err(|error| Box::new(validation_error(error)))
+}
+
+fn display_name_from_values(
+    requested: Option<&str>,
+    upstream: Option<&str>,
+    cookie_header: &str,
+) -> Result<String, &'static str> {
+    if let Some(display_name) = requested
+        .map(str::trim)
+        .filter(|display_name| !display_name.is_empty())
+    {
+        return Ok(display_name.to_owned());
+    }
+    if let Some(display_name) = upstream
         .map(str::trim)
         .filter(|display_name| !display_name.is_empty())
     {
         return Ok(display_name.to_owned());
     }
 
-    let encoded_name = cookie_value(request.cookie_header.trim(), "wr_name").ok_or_else(|| {
-        Box::new(validation_error(
-            "display_name must be provided or cookie_header must contain a non-empty wr_name",
-        ))
-    })?;
+    let encoded_name = cookie_value(cookie_header, "wr_name")
+        .ok_or("display_name must be provided or cookie_header must contain a non-empty wr_name")?;
     let display_name = percent_decode_str(&encoded_name)
         .decode_utf8()
-        .map_err(|_| Box::new(validation_error("cookie_header wr_name is not valid UTF-8")))?;
+        .map_err(|_| "cookie_header wr_name is not valid UTF-8")?;
     let display_name = display_name.trim();
     if display_name.is_empty() {
-        return Err(Box::new(validation_error(
+        return Err(
             "display_name must be provided or cookie_header must contain a non-empty wr_name",
-        )));
+        );
     }
     Ok(display_name.to_owned())
 }
@@ -1324,6 +1582,23 @@ fn auth_service_error_response(error: AuthServiceError) -> Response {
         StatusCode::CONFLICT => "a WeRead account with this account_id already exists",
         StatusCode::UNPROCESSABLE_ENTITY => "invalid WeRead credentials",
         _ => "WeRead account service temporarily unavailable",
+    };
+    (status, Json(json!({ "error": message }))).into_response()
+}
+
+fn qr_login_error_response(error: QrLoginError) -> Response {
+    tracing::warn!(error = %error, "returning WeRead QR login error");
+    let status = match error {
+        QrLoginError::AttemptNotFound => StatusCode::NOT_FOUND,
+        QrLoginError::TooManyActiveAttempts => StatusCode::TOO_MANY_REQUESTS,
+        QrLoginError::Transport(_) | QrLoginError::InvalidDeadline | QrLoginError::QrCode => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    };
+    let message = match status {
+        StatusCode::NOT_FOUND => "QR login attempt not found or already consumed",
+        StatusCode::TOO_MANY_REQUESTS => "too many QR login attempts are active",
+        _ => "WeRead QR login is temporarily unavailable",
     };
     (status, Json(json!({ "error": message }))).into_response()
 }

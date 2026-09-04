@@ -1,8 +1,8 @@
 //! Non-interactive WeRead authentication lifecycle.
 //!
 //! This service implements the safe part of account authentication for the
-//! first usable runtime: an operator or a future QR-login adapter can
-//! provision credentials, the service encrypts them before persistence, and
+//! first usable runtime: an operator or the QR-login adapter can provision
+//! credentials, the service encrypts them before persistence, and
 //! expired access credentials are refreshed once under the same distributed
 //! account lease used by source synchronization. QR rendering, polling, and
 //! browser interaction remain outside this boundary.
@@ -421,7 +421,7 @@ where
     R: CredentialRefresher,
     C: CredentialCipher,
 {
-    /// Encrypts and stores credentials received from an operator or future
+    /// Encrypts and stores credentials received from an operator or an
     /// interactive-login adapter.
     #[tracing::instrument(skip_all, fields(account_id = %provision.account_id))]
     pub async fn provision(

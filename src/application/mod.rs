@@ -20,6 +20,7 @@ pub mod feed_rebuild_service;
 pub mod feed_service;
 pub mod feed_token_service;
 pub mod job_service;
+pub mod qr_login;
 pub mod runtime;
 pub mod runtime_supervisor;
 pub mod scheduler;

@@ -162,6 +162,9 @@ button:disabled, .button[aria-disabled="true"] { cursor: not-allowed; opacity: .
 .feedback.error { color: var(--danger); background: var(--danger-soft); }
 .feedback.success { color: var(--success); background: var(--success-soft); }
 .feedback.info { color: #4352a4; background: var(--brand-soft); }
+#qr-image { display: grid; width: min(100%, 260px); min-height: 220px; place-items: center; border: 1px solid var(--line); border-radius: var(--radius-md); margin: 6px auto 15px; padding: 10px; background: #fff; }
+#qr-image:empty { display: none; }
+#qr-image img { display: block; width: 100%; height: auto; }
 
 form { display: grid; gap: 17px; }
 .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 17px 15px; }
@@ -274,6 +277,19 @@ code { border-radius: 5px; padding: 2px 5px; color: #344054; background: #f2f4f7
 
 const LOCALE_PICKER: &str = r##"<label class="locale-picker"><span class="sr-only" data-i18n="language.label">Language</span><select id="locale" data-i18n-aria-label="language.label" aria-label="Language"><option value="en" data-i18n="language.english">English</option><option value="fr" data-i18n="language.french">Français</option><option value="zh" data-i18n="language.chinese">中文</option></select></label>"##;
 
+const QR_LOGIN_CARD: &str = r##"<section class="card" id="weread-qr-card"><div class="card-header"><div><h2 data-i18n="account.qr_heading">Sign in with QR code</h2><p data-i18n="account.qr_description">Scan a fresh WeRead code to enroll an account without copying cookies.</p></div><span class="card-icon" aria-hidden="true">▣</span></div><div class="notice"><span class="notice-icon" aria-hidden="true">i</span><span data-i18n="account.qr_notice">The QR code is short-lived and shown only while this page is open.</span></div><form id="weread-qr"><label><span class="label-row"><span data-i18n="account.id">Account ID</span><span class="label-hint" data-i18n="account.id_hint_qr">Optional; leave empty for a new account</span></span><input name="account_id" type="text" autocomplete="off" data-i18n-placeholder="account.id_placeholder_qr" placeholder="Optional existing account UUID"></label><label><span data-i18n="account.display_name">Display name</span><input name="display_name" type="text" autocomplete="off" data-i18n-placeholder="account.display_name_placeholder_qr" placeholder="Optional override"></label><div class="form-actions"><button class="button-secondary" type="submit" data-i18n="account.start_qr">Start QR login</button></div></form><div id="qr-session" hidden><div id="qr-image" aria-live="polite"></div><p id="qr-status" class="feedback info" role="status"></p><button id="qr-cancel" class="button-quiet" type="button" data-i18n="account.cancel_qr">Cancel QR login</button></div><p id="qr-result" class="feedback" role="status" hidden></p></section>"##;
+
+const QR_LOGIN_SCRIPT: &str = r##"
+const qrForm=document.querySelector('#weread-qr');const qrSession=document.querySelector('#qr-session');const qrImage=document.querySelector('#qr-image');const qrStatus=document.querySelector('#qr-status');const qrResult=document.querySelector('#qr-result');const qrCancel=document.querySelector('#qr-cancel');let qrAttemptId=null;let qrTimer=null;let qrPollGeneration=0;let qrStartInFlight=false;
+function qrMessage(status){return t('account.qr_'+status)}
+function stopQrTimer(){if(qrTimer){clearTimeout(qrTimer);qrTimer=null}}
+function finishQrAttempt(){qrAttemptId=null;qrPollGeneration++;stopQrTimer();qrForm.querySelector('button[type="submit"]').disabled=false}
+function showQrResult(message,kind='error'){qrResult.textContent=message;qrResult.className='feedback '+kind;qrResult.hidden=!message}
+async function pollQr(attemptId,generation){if(!attemptId||generation!==qrPollGeneration||attemptId!==qrAttemptId){return}try{const response=await request('/api/admin/weread/qr/'+encodeURIComponent(attemptId));if(generation!==qrPollGeneration||attemptId!==qrAttemptId){return}if(!response.ok){const message=await apiErrorMessage(response,'account.qr_poll_failed');showQrResult(message);stopQrTimer();return}const value=await response.json();if(generation!==qrPollGeneration||attemptId!==qrAttemptId){return}if(value.status==='completed'){showQrResult(t('common.account_saved_detail').replace('{id}',value.account.account_id),'success');qrSession.hidden=true;finishQrAttempt();await loadAccounts();return}if(value.status==='expired'||value.status==='risk_controlled'){showQrResult(qrMessage(value.status));qrSession.hidden=true;finishQrAttempt();return}qrStatus.textContent=qrMessage(value.status);qrTimer=setTimeout(()=>pollQr(attemptId,generation),2000)}catch{if(generation===qrPollGeneration&&attemptId===qrAttemptId){showQrResult(t('common.unreachable'));stopQrTimer()}}}
+qrForm.addEventListener('submit',async event=>{event.preventDefault();if(qrAttemptId||qrStartInFlight){return}const submit=qrForm.querySelector('button[type="submit"]');qrStartInFlight=true;submit.disabled=true;showQrResult('');const form=new FormData(qrForm);const accountId=form.get('account_id');try{const response=await request('/api/admin/weread/qr',{method:'POST',body:JSON.stringify({account_id:accountId&&accountId.trim()?accountId.trim():null,display_name:form.get('display_name')&&form.get('display_name').trim()?form.get('display_name').trim():null})});if(!response.ok){showQrResult(await apiErrorMessage(response,'account.qr_start_failed'));return}const value=await response.json();qrAttemptId=value.attempt_id;const generation=qrPollGeneration;qrImage.replaceChildren();const image=document.createElement('img');image.alt=t('account.qr_image_alt');image.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(value.qr_svg);qrImage.append(image);qrStatus.textContent=t('account.qr_waiting_for_scan');qrSession.hidden=false;stopQrTimer();pollQr(value.attempt_id,generation)}catch{showQrResult(t('common.unreachable'))}finally{qrStartInFlight=false;if(!qrAttemptId){submit.disabled=false}}});
+qrCancel.addEventListener('click',async()=>{const attemptId=qrAttemptId;const generation=qrPollGeneration;if(!attemptId){return}qrCancel.disabled=true;try{const response=await request('/api/admin/weread/qr/'+encodeURIComponent(attemptId),{method:'DELETE'});if(generation!==qrPollGeneration||attemptId!==qrAttemptId){return}if(response.ok){showQrResult(t('account.qr_cancelled'),'info');qrSession.hidden=true;finishQrAttempt()}else{showQrResult(await apiErrorMessage(response,'account.qr_cancel_failed'))}}catch{if(generation===qrPollGeneration&&attemptId===qrAttemptId){showQrResult(t('common.unreachable'))}}finally{qrCancel.disabled=false}});
+"##;
+
 fn i18n_bootstrap(locale: Locale) -> String {
     let translations = super::i18n::translations_json(locale)
         .replace('<', "\\u003c")
@@ -384,7 +400,15 @@ document.querySelector('#logout').addEventListener('click',async()=>{const logou
             .replace("__LOCALE_PICKER__", LOCALE_PICKER)
             .replace("__USERNAME__", &username)
             .replace("__CSRF__", &csrf_json)
-            .replace("__I18N__", &i18n_bootstrap(locale)),
+            .replace("__I18N__", &i18n_bootstrap(locale))
+            .replace(
+                r#"<section class="card" id="create">"#,
+                &format!("{QR_LOGIN_CARD}<section class=\"card\" id=\"create\">"),
+            )
+            .replace(
+                "</script></body></html>",
+                &format!("{QR_LOGIN_SCRIPT}</script></body></html>"),
+            ),
     )
 }
 
@@ -641,6 +665,20 @@ mod tests {
         assert!(body.contains("id=\"account-count\""));
         assert!(body.contains("id=\"sources\" class=\"resource-grid\""));
         assert!(body.contains("id=\"weread-accounts\" class=\"resource-grid\""));
+    }
+
+    #[test]
+    fn admin_page_exposes_the_qr_login_form_and_lifecycle_script() {
+        let body = admin_page(&session(), Locale::English).0;
+        assert!(body.contains("id=\"weread-qr-card\""));
+        assert!(body.contains("id=\"weread-qr\""));
+        assert!(body.contains("/api/admin/weread/qr"));
+        assert!(body.contains("const response=await request('/api/admin/weread/qr/'"));
+        assert!(body.contains("data:image/svg+xml"));
+        assert!(body.contains("clearTimeout(qrTimer)"));
+        assert!(body.contains("qrAttemptId||qrStartInFlight"));
+        assert!(body.contains("pollQr(value.attempt_id,generation)"));
+        assert!(body.contains("generation!==qrPollGeneration||attemptId!==qrAttemptId"));
     }
 
     #[test]
