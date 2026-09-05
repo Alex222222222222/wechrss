@@ -31,10 +31,11 @@
 //! acquisition path did not provide that field; repository upserts preserve a
 //! previously known value instead of interpreting absence as deletion.
 //!
-//! Asset policy: version one stores no binary asset rows. `cover_url` and
-//! approved URLs inside sanitized HTML remain metadata/external references;
-//! optional checksum-based asset archiving can add a separate relationship
-//! later without changing article identity.
+//! Asset policy: the default version-one mode stores no binary asset rows.
+//! When the database asset backend is enabled, the application persists
+//! checksum-deduplicated binary rows and article relationships in the same
+//! unit of work, then rewrites successfully archived URLs without changing
+//! article identity. Local and S3 backends remain future implementations.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

@@ -22,11 +22,16 @@ use uuid::Uuid;
 use crate::{
     acquisition::weread::WeReadArticleReference,
     application::{
+        asset_archive_service::AssetArchiveService,
         source_service::SourceReader,
         source_sync_handler::SourceSyncAcquirer,
-        sync_service::{classify_acquisition_error, SyncAcquisitionError, SyncService},
+        sync_service::{
+            classify_acquisition_error, should_preserve_cached_asset_representation,
+            should_reconcile_assets, SyncAcquisitionError, SyncService,
+        },
         worker::{JobExecution, JobHandler},
     },
+    archive::url_rewriter::rewrite_sanitized_html,
     domain::{
         job::{JobType, NewJob},
         pacing::QuietHours,
@@ -36,6 +41,7 @@ use crate::{
     persistence::{
         repositories::{
             article_repository::{ArticleRepository, ArticleTransactionRepository},
+            asset_repository::{AssetRepositoryError, AssetTransactionRepository},
             job_repository::{JobEnqueueTransaction, JobLease, JobOutcome, JobOutcomeTransaction},
             source_repository::SourceTransactionRepository,
         },
@@ -143,6 +149,8 @@ pub struct ArticleBackfillJobHandlerDependencies<S, A, C> {
     pub acquirer: C,
     /// Article normalization and sanitization policy.
     pub sync_service: SyncService,
+    /// Optional best-effort anonymous asset fetcher. `None` is disabled mode.
+    pub asset_archiver: Option<AssetArchiveService>,
 }
 
 /// Retry policy for article-backfill persistence and upstream failures.
@@ -353,6 +361,7 @@ where
                 };
             }
         };
+        let prepared = self.archive_assets(prepared).await;
 
         match self
             .persist_success(lease, source_id, prepared, finished_at)
@@ -380,6 +389,29 @@ where
     A: ArticleRepository,
     C: SourceSyncAcquirer,
 {
+    async fn archive_assets(
+        &self,
+        prepared: crate::application::sync_service::PreparedArticle,
+    ) -> crate::application::sync_service::PreparedArticle {
+        let Some(archiver) = &self.dependencies.asset_archiver else {
+            return prepared;
+        };
+        let Some(referer) = prepared.article().original_url.as_ref() else {
+            tracing::warn!(
+                review_id = %prepared.article().review_id,
+                "asset caching skipped because article referer is missing"
+            );
+            return prepared;
+        };
+        if prepared.external_assets().is_empty() {
+            return prepared;
+        }
+        let fetched = archiver
+            .fetch_assets(referer, prepared.external_assets())
+            .await;
+        prepared.with_fetched_assets(fetched)
+    }
+
     async fn persist_success(
         &self,
         lease: &JobLease,
@@ -387,10 +419,11 @@ where
         prepared: crate::application::sync_service::PreparedArticle,
         finished_at: DateTime<Utc>,
     ) -> Result<(), ()> {
+        let asset_inputs = prepared.fetched_assets().to_vec();
         let mut unit_of_work = self
             .dependencies
             .unit_of_work
-            .begin()
+            .begin_with_assets(&asset_inputs)
             .await
             .map_err(|_| ())?;
         // Source-owned writes use the source row as their first lock. Source
@@ -401,10 +434,139 @@ where
             sources.find_for_update(source_id).await.map_err(|_| ())?
         };
 
-        let changed = {
+        let article = prepared.article().clone();
+        let fetched_assets = prepared.fetched_assets().to_vec();
+        let mut article_to_persist = article.clone();
+        let changed = if let Some(archiver) = &self.dependencies.asset_archiver {
+            // Lock the stored observation before mutating asset relationships.
+            // The final article upsert is deliberately postponed until after
+            // asset persistence so its feed-visible result compares the final
+            // representation with the previously published representation.
+            let current_article = {
+                let mut articles = unit_of_work.articles();
+                articles
+                    .find_for_update(article.source_id, &article.review_id)
+                    .await
+                    .map_err(|_| ())?
+            };
+            let accepted = current_article
+                .as_ref()
+                .is_none_or(|current| article.observation_version >= current.observation_version());
+            if !accepted {
+                // A delayed observation must not replace the article or its
+                // asset relationships.
+                false
+            } else {
+                // Only an accepted full observation owns the current set of
+                // asset relationships. Partial observations preserve links
+                // from the accepted article version.
+                let current_has_cached_representation = current_article
+                    .as_ref()
+                    .is_some_and(|current| current.content_html().contains("/assets/"));
+                let preserve_cached_representation = should_preserve_cached_asset_representation(
+                    current_article
+                        .as_ref()
+                        .map(|current| current.content_html()),
+                    prepared.external_assets().len(),
+                    fetched_assets.len(),
+                );
+                if preserve_cached_representation {
+                    if let Some(current) = current_article.as_ref() {
+                        tracing::warn!(
+                            source_id = %source_id,
+                            review_id = %article.review_id,
+                            fetched_assets = fetched_assets.len(),
+                            expected_assets = prepared.external_assets().len(),
+                            "asset acquisition was incomplete during backfill; preserving the previously archived article"
+                        );
+                        article_to_persist.content_html = current.content_html().to_owned();
+                        article_to_persist.content_hash = current.content_hash().map(str::to_owned);
+                    }
+                } else if should_reconcile_assets(&article, article.observation_version) {
+                    let stored = {
+                        let mut assets = unit_of_work.assets(archiver.policy());
+                        assets
+                            .replace_for_article(
+                                article.source_id,
+                                &article.review_id,
+                                &fetched_assets,
+                            )
+                            .await
+                    };
+                    match stored {
+                        Ok(stored) => {
+                            let replacements = stored
+                                .iter()
+                                .map(|asset| {
+                                    (
+                                        asset.source_url().clone(),
+                                        format!("/assets/{}", asset.id()),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            let rewritten_html =
+                                rewrite_sanitized_html(&article.content_html, &replacements);
+                            if rewritten_html != article.content_html {
+                                article_to_persist.content_html = rewritten_html;
+                                article_to_persist.content_hash =
+                                    Some(crate::application::archive_service::sha256_hex(
+                                        article_to_persist.content_html.as_bytes(),
+                                    ));
+                            }
+                        }
+                        Err(
+                            error @ (AssetRepositoryError::CapacityExceeded { .. }
+                            | AssetRepositoryError::AssetTooLarge { .. }
+                            | AssetRepositoryError::TooManyAssets { .. }),
+                        ) => {
+                            if current_has_cached_representation {
+                                if let Some(current) = current_article.as_ref() {
+                                    article_to_persist.content_html =
+                                        current.content_html().to_owned();
+                                    article_to_persist.content_hash =
+                                        current.content_hash().map(str::to_owned);
+                                }
+                                tracing::warn!(
+                                    source_id = %source_id,
+                                    review_id = %article.review_id,
+                                    error = %error,
+                                    "asset replacement was rejected during backfill; preserving the previously archived article"
+                                );
+                            } else {
+                                let mut assets = unit_of_work.assets(archiver.policy());
+                                assets
+                                    .clear_for_article(article.source_id, &article.review_id)
+                                    .await
+                                    .map_err(|_| ())?;
+                                tracing::warn!(
+                                    source_id = %source_id,
+                                    review_id = %article.review_id,
+                                    error = %error,
+                                    "asset was not cached during backfill; article remains external and stale asset links were cleared"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                source_id = %source_id,
+                                review_id = %article.review_id,
+                                error = %error,
+                                "asset persistence failed during backfill"
+                            );
+                            return Err(());
+                        }
+                    }
+                }
+                let result = {
+                    let mut articles = unit_of_work.articles();
+                    articles.upsert(article_to_persist).await.map_err(|_| ())?
+                };
+                result.feed_visible_change()
+            }
+        } else {
             let mut articles = unit_of_work.articles();
             articles
-                .upsert(prepared.article().clone())
+                .upsert(article_to_persist)
                 .await
                 .map_err(|_| ())?
                 .feed_visible_change()

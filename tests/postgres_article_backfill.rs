@@ -10,6 +10,10 @@ use std::{
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::{PgPool, Row};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use uuid::Uuid;
 use werrss::{
     acquisition::{
@@ -21,11 +25,13 @@ use werrss::{
             article_backfill_job, ArticleBackfillJobHandler, ArticleBackfillJobHandlerConfig,
             ArticleBackfillJobHandlerDependencies,
         },
+        asset_archive_service::AssetArchiveService,
         job_service::{JobService, JobServiceConfig},
         source_sync_handler::SourceSyncAcquirer,
         sync_service::SyncAcquisitionError,
         worker::{JobExecution, JobHandler, Worker, WorkerConfig, WorkerRun},
     },
+    archive::asset_store::AssetCachePolicy,
     domain::{
         article::{ArticleObservationVersion, NewArticle},
         job::{JobStatus, JobType},
@@ -151,6 +157,176 @@ async fn backfill_repairs_an_incomplete_article_and_invalidates_its_feed_atomica
     .await
     .unwrap();
     assert_eq!(rebuild_count, 1);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn backfill_with_asset_archiving_does_not_bump_revision_for_unchanged_article(pool: PgPool) {
+    let (asset_archiver, asset_server, asset_url) = asset_archiver_fixture(2).await;
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_id).await;
+    let reference = reference(
+        "asset-idempotent-backfill",
+        "https://mp.weixin.qq.com/s/asset-idempotent-backfill",
+    );
+    let source = source(&pool, source_id).await;
+    let mut article_page = page(&reference, "Asset idempotent backfill");
+    article_page.content_html = format!("<p>repaired</p><img src=\"{asset_url}\">");
+
+    let first_job_id = enqueue_backfill(&pool, &source, &reference).await;
+    let first_lease = claim(&pool, "asset-backfill-worker", Utc::now()).await;
+    let first_handler = handler_with_archiver(
+        &pool,
+        FakeAcquirer {
+            page: article_page.clone(),
+            timeout: false,
+            no_account: false,
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        ArticleBackfillJobHandlerConfig::new(Duration::seconds(30)).unwrap(),
+        Some(asset_archiver.clone()),
+    );
+    assert_eq!(
+        first_handler.execute(&first_lease, Utc::now()).await,
+        JobExecution::Committed
+    );
+
+    let second_job_id = enqueue_backfill(&pool, &source, &reference).await;
+    let second_lease = claim(&pool, "asset-backfill-worker", Utc::now()).await;
+    let second_handler = handler_with_archiver(
+        &pool,
+        FakeAcquirer {
+            page: article_page,
+            timeout: false,
+            no_account: false,
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        ArticleBackfillJobHandlerConfig::new(Duration::seconds(30)).unwrap(),
+        Some(asset_archiver),
+    );
+    assert_eq!(
+        second_handler.execute(&second_lease, Utc::now()).await,
+        JobExecution::Committed
+    );
+
+    let revision: i64 = sqlx::query_scalar("SELECT feed_revision FROM sources WHERE id = $1")
+        .bind(source_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        revision, 1,
+        "the unchanged archived article must be idempotent"
+    );
+
+    let article_html: String = sqlx::query_scalar(
+        "SELECT content_html FROM articles WHERE source_id = $1 AND review_id = $2",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-idempotent-backfill")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(article_html.contains("/assets/"));
+
+    for job_id in [first_job_id, second_job_id] {
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "succeeded"
+        );
+    }
+    asset_server
+        .await
+        .expect("asset fixture should serve both backfill fetches");
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn backfill_preserves_cached_article_when_asset_fetch_is_incomplete(pool: PgPool) {
+    let (asset_archiver, asset_server, asset_url) = asset_archiver_fixture(1).await;
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_id).await;
+    let reference = reference(
+        "asset-fetch-failure-backfill",
+        "https://mp.weixin.qq.com/s/asset-fetch-failure-backfill",
+    );
+    let source = source(&pool, source_id).await;
+    let mut article_page = page(&reference, "Asset fetch failure backfill");
+    article_page.content_html = format!("<p>repaired</p><img src=\"{asset_url}\">");
+
+    enqueue_backfill(&pool, &source, &reference).await;
+    let first_lease = claim(&pool, "backfill-asset-worker", Utc::now()).await;
+    let first_handler = handler_with_archiver(
+        &pool,
+        FakeAcquirer {
+            page: article_page.clone(),
+            timeout: false,
+            no_account: false,
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        ArticleBackfillJobHandlerConfig::new(Duration::seconds(30)).unwrap(),
+        Some(asset_archiver.clone()),
+    );
+    assert_eq!(
+        first_handler.execute(&first_lease, Utc::now()).await,
+        JobExecution::Committed
+    );
+
+    let cached_html: String = sqlx::query_scalar(
+        "SELECT content_html FROM articles WHERE source_id = $1 AND review_id = $2",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-fetch-failure-backfill")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(cached_html.contains("/assets/"));
+
+    enqueue_backfill(&pool, &source, &reference).await;
+    let second_lease = claim(&pool, "backfill-asset-worker", Utc::now()).await;
+    let second_handler = handler_with_archiver(
+        &pool,
+        FakeAcquirer {
+            page: article_page,
+            timeout: false,
+            no_account: false,
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        ArticleBackfillJobHandlerConfig::new(Duration::seconds(30)).unwrap(),
+        Some(asset_archiver),
+    );
+    assert_eq!(
+        second_handler.execute(&second_lease, Utc::now()).await,
+        JobExecution::Committed
+    );
+
+    let persisted_html: String = sqlx::query_scalar(
+        "SELECT content_html FROM articles WHERE source_id = $1 AND review_id = $2",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-fetch-failure-backfill")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted_html, cached_html);
+
+    let relationship_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM article_assets WHERE source_id = $1 AND review_id = $2",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-fetch-failure-backfill")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(relationship_count, 1);
+
+    asset_server
+        .await
+        .expect("asset fixture should serve the initial backfill fetch");
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -472,6 +648,15 @@ fn handler_with_config(
     acquirer: FakeAcquirer,
     config: ArticleBackfillJobHandlerConfig,
 ) -> BackfillHandler {
+    handler_with_archiver(pool, acquirer, config, None)
+}
+
+fn handler_with_archiver(
+    pool: &PgPool,
+    acquirer: FakeAcquirer,
+    config: ArticleBackfillJobHandlerConfig,
+    asset_archiver: Option<AssetArchiveService>,
+) -> BackfillHandler {
     ArticleBackfillJobHandler::new(
         ArticleBackfillJobHandlerDependencies {
             sources: PostgresSourceRepository::new(pool.clone()),
@@ -479,9 +664,73 @@ fn handler_with_config(
             unit_of_work: UnitOfWorkFactory::new(pool.clone()),
             acquirer,
             sync_service: werrss::application::sync_service::SyncService::new(),
+            asset_archiver,
         },
         config,
     )
+}
+
+async fn asset_archiver_fixture(
+    requests: usize,
+) -> (AssetArchiveService, tokio::task::JoinHandle<()>, String) {
+    asset_archiver_fixture_with_policy(requests, AssetCachePolicy::default()).await
+}
+
+async fn asset_archiver_fixture_with_policy(
+    requests: usize,
+    policy: AssetCachePolicy,
+) -> (AssetArchiveService, tokio::task::JoinHandle<()>, String) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("asset fixture listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("asset fixture listener should have an address");
+    let server = tokio::spawn(async move {
+        for _ in 0..requests {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("asset fixture request should connect");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("asset fixture request should be readable");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = b"\x89PNG\r\n\x1a\nasset-fixture";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("asset fixture response headers should be writable");
+            stream
+                .write_all(body)
+                .await
+                .expect("asset fixture response body should be writable");
+        }
+    });
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("assets.example.test", address)
+        .build()
+        .expect("asset fixture client should be constructible");
+    let asset_url = "http://assets.example.test/image.png".to_owned();
+    let service = AssetArchiveService::with_client_for_test(policy, None, client);
+    (service, server, asset_url)
 }
 
 fn worker(

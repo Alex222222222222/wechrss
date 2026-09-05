@@ -46,7 +46,8 @@ use crate::{
     },
     domain::feed::FeedCache,
     persistence::repositories::{
-        feed_cache_repository::FeedCacheRepository, feed_token_repository::FeedTokenRepository,
+        asset_repository::PostgresAssetStore, feed_cache_repository::FeedCacheRepository,
+        feed_token_repository::FeedTokenRepository,
     },
 };
 
@@ -69,12 +70,13 @@ where
     Q: FeedRebuildQueue + 'static,
     B: FeedRebuilder + 'static,
 {
-    feed_router_with_browser_health(
+    feed_router_with_browser_health_and_assets(
         token_service,
         feed_service,
         pool,
         timezone,
         BrowserHealth::new(timezone),
+        None,
     )
 }
 
@@ -92,12 +94,38 @@ where
     Q: FeedRebuildQueue + 'static,
     B: FeedRebuilder + 'static,
 {
+    feed_router_with_browser_health_and_assets(
+        token_service,
+        feed_service,
+        pool,
+        timezone,
+        browser_health,
+        None,
+    )
+}
+
+/// Builds the public routes with optional database-backed asset serving.
+pub fn feed_router_with_browser_health_and_assets<R, C, Q, B>(
+    token_service: FeedTokenService<R>,
+    feed_service: FeedService<C, Q, B>,
+    pool: PgPool,
+    timezone: Tz,
+    browser_health: BrowserHealth,
+    asset_store: Option<PostgresAssetStore>,
+) -> Router
+where
+    R: FeedTokenRepository + 'static,
+    C: FeedCacheRepository + 'static,
+    Q: FeedRebuildQueue + 'static,
+    B: FeedRebuilder + 'static,
+{
     let state = Arc::new(FeedApiState {
         token_service,
         feed_service,
         pool,
         timezone,
         browser_health,
+        asset_store,
     });
     Router::new()
         .route("/api/health", get(liveness))
@@ -106,6 +134,7 @@ where
         // Axum does not allow a literal suffix in the same segment as a path
         // parameter, so the handler validates the exact `.xml` shape below.
         .route("/feeds/{*feed_path}", get(feed::<R, C, Q, B>))
+        .route("/assets/{asset_id}", get(asset::<R, C, Q, B>))
         .with_state(state)
 }
 
@@ -115,6 +144,7 @@ struct FeedApiState<R, C, Q, B> {
     pool: PgPool,
     timezone: Tz,
     browser_health: BrowserHealth,
+    asset_store: Option<PostgresAssetStore>,
 }
 
 /// Reports that this process is alive without contacting any dependency.
@@ -271,6 +301,85 @@ where
             empty_response(StatusCode::SERVICE_UNAVAILABLE)
         }
     }
+}
+
+async fn asset<R, C, Q, B>(
+    State(state): State<Arc<FeedApiState<R, C, Q, B>>>,
+    Path(asset_id): Path<String>,
+    headers: HeaderMap,
+) -> Response
+where
+    R: FeedTokenRepository + 'static,
+    C: FeedCacheRepository + 'static,
+    Q: FeedRebuildQueue + 'static,
+    B: FeedRebuilder + 'static,
+{
+    let Ok(asset_id) = asset_id.parse::<uuid::Uuid>() else {
+        return empty_response(StatusCode::NOT_FOUND);
+    };
+    let Some(store) = &state.asset_store else {
+        return empty_response(StatusCode::NOT_FOUND);
+    };
+    let asset = match store.read_and_touch(asset_id).await {
+        Ok(Some(asset)) => asset,
+        Ok(None) => return empty_response(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(asset_id = %asset_id, error = %error, "asset read failed");
+            return empty_response(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+    let crate::archive::asset_store::AssetRead::Available {
+        media_type,
+        checksum,
+        bytes,
+    } = asset
+    else {
+        tracing::debug!(asset_id = %asset_id, "asset bytes are missing");
+        let mut response = empty_response(StatusCode::SERVICE_UNAVAILABLE);
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        return response;
+    };
+
+    let etag_value = format!("\"sha256:{checksum}\"");
+    let not_modified = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == etag_value);
+    let etag = match HeaderValue::try_from(etag_value) {
+        Ok(value) => value,
+        Err(_) => return empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let status = if not_modified {
+        StatusCode::NOT_MODIFIED
+    } else {
+        StatusCode::OK
+    };
+    let content_length = bytes.len();
+    let mut response = Response::new(Body::from(if not_modified { Vec::new() } else { bytes }));
+    *response.status_mut() = status;
+    let response_headers = response.headers_mut();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&media_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    response_headers.insert(header::ETAG, etag);
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    response_headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    if let Ok(value) = HeaderValue::try_from(content_length.to_string()) {
+        // A 304 may carry Content-Length, but it must describe the selected
+        // 200 representation rather than the empty response body.
+        response_headers.insert(header::CONTENT_LENGTH, value);
+    }
+    response
 }
 
 fn cached_response(

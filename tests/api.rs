@@ -20,6 +20,7 @@ use werrss::{
             AuthService, AuthServiceConfig, AuthServiceDependencies, ManualCredentialRefresher,
             RingCredentialCipher,
         },
+        browser_health::BrowserHealth,
         feed_rebuild_service::{FeedRebuildConfig, FeedRebuildDependencies, FeedRebuildService},
         feed_service::{
             FeedRebuildJobConfig, FeedService, FeedServiceConfig, PostgresFeedRebuildQueue,
@@ -31,11 +32,13 @@ use werrss::{
         },
         source_service::SourceService,
     },
+    archive::asset_store::AssetCachePolicy,
     domain::source::{FeedRevision, SourceId},
     persistence::{
         repositories::{
             account_lease_repository::PostgresAccountLeaseRepository,
             article_repository::PostgresArticleRepository,
+            asset_repository::PostgresAssetStore,
             credential_repository::PostgresCredentialRepository,
             feed_cache_repository::{
                 FeedBuildLeaseRepository, FeedCachePublishResult, FeedCacheRepository,
@@ -54,7 +57,7 @@ use werrss::{
         admin::{
             admin_router_with_server_root_url, admin_router_with_server_root_url_and_qr_login,
         },
-        api::feed_router,
+        api::{feed_router, feed_router_with_browser_health_and_assets},
         auth::AdminAuthenticator,
     },
 };
@@ -1906,7 +1909,102 @@ async fn feed_route_builds_and_returns_a_feed_on_a_cache_miss(pool: PgPool) {
     assert_eq!(queued, 0);
 }
 
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn disabled_asset_cache_does_not_expose_asset_route(pool: PgPool) {
+    let app = router(&pool);
+    let response = app
+        .oneshot(get_request(&format!("/assets/{}", Uuid::new_v4()), None))
+        .await
+        .expect("disabled asset request should complete");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn asset_route_serves_cached_bytes_and_honors_etag(pool: PgPool) {
+    let asset_id = insert_asset_fixture(&pool).await;
+    let app = router_with_assets(
+        &pool,
+        Some(PostgresAssetStore::new(
+            pool.clone(),
+            AssetCachePolicy::default(),
+        )),
+    );
+    let path = format!("/assets/{asset_id}");
+
+    let response = app
+        .clone()
+        .oneshot(get_request(&path, None))
+        .await
+        .expect("asset request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+    assert_eq!(response.headers()[header::CONTENT_LENGTH], "15");
+    assert_eq!(
+        response.headers()[header::ETAG],
+        "\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""
+    );
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    let etag = response.headers()[header::ETAG]
+        .to_str()
+        .expect("asset ETag should be valid")
+        .to_owned();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("asset body should be readable");
+    assert_eq!(body.as_ref(), b"\x89PNG\r\n\x1a\nfixture");
+
+    let not_modified = app
+        .oneshot(get_request(&path, Some(&etag)))
+        .await
+        .expect("conditional asset request should complete");
+    assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(not_modified.headers()[header::CONTENT_LENGTH], "15");
+    assert_eq!(
+        to_bytes(not_modified.into_body(), usize::MAX)
+            .await
+            .expect("empty conditional body should be readable")
+            .len(),
+        0
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn asset_route_reports_a_repairable_cache_miss_and_retains_metadata(pool: PgPool) {
+    let asset_id = insert_asset_fixture(&pool).await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL")
+        .execute(&pool)
+        .await
+        .expect("asset data should be evictable");
+    let app = router_with_assets(
+        &pool,
+        Some(PostgresAssetStore::new(
+            pool.clone(),
+            AssetCachePolicy::default(),
+        )),
+    );
+
+    let response = app
+        .oneshot(get_request(&format!("/assets/{asset_id}"), None))
+        .await
+        .expect("missing asset request should complete");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "60");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM asset_records WHERE id = $1")
+            .bind(asset_id)
+            .fetch_one(&pool)
+            .await
+            .expect("asset metadata should remain queryable"),
+        1
+    );
+}
+
 fn router(pool: &PgPool) -> axum::Router {
+    router_with_assets(pool, None)
+}
+
+fn router_with_assets(pool: &PgPool, asset_store: Option<PostgresAssetStore>) -> axum::Router {
     let token_service = FeedTokenService::new(PostgresFeedTokenRepository::new(pool.clone()));
     let queue = PostgresFeedRebuildQueue::new(
         PostgresJobRepository::new(pool.clone()),
@@ -1935,7 +2033,17 @@ fn router(pool: &PgPool) -> axum::Router {
         rebuild_service,
         FeedServiceConfig::default(),
     );
-    feed_router(token_service, feed_service, pool.clone(), UTC)
+    if asset_store.is_none() {
+        return feed_router(token_service, feed_service, pool.clone(), UTC);
+    }
+    feed_router_with_browser_health_and_assets(
+        token_service,
+        feed_service,
+        pool.clone(),
+        UTC,
+        BrowserHealth::new(UTC),
+        asset_store,
+    )
 }
 
 fn get_request(path: &str, etag: Option<&str>) -> Request<Body> {
@@ -2137,6 +2245,52 @@ async fn insert_source(pool: &PgPool) -> SourceId {
     .await
     .expect("source should be insertable");
     source_id
+}
+
+async fn insert_asset_fixture(pool: &PgPool) -> Uuid {
+    let source_id = insert_source(pool).await;
+    let review_id = "api-asset-article";
+    sqlx::query(
+        "INSERT INTO articles (source_id, review_id, title, original_url, published_at, content_html, content_hash, observation_version, fetched_at)
+         VALUES ($1, $2, 'Asset article', 'https://mp.weixin.qq.com/s/api-asset-article', CURRENT_TIMESTAMP, '<p>asset</p>', 'asset-hash', 1, CURRENT_TIMESTAMP)",
+    )
+    .bind(source_id.as_uuid())
+    .bind(review_id)
+    .execute(pool)
+    .await
+    .expect("asset article should be insertable");
+
+    let asset_id = Uuid::new_v4();
+    let blob_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO asset_blobs (id, checksum_algorithm, checksum, byte_size, media_type, data)
+         VALUES ($1, 'sha256', repeat('a', 64), 15, 'image/png', $2)",
+    )
+    .bind(blob_id)
+    .bind(b"\x89PNG\r\n\x1a\nfixture".as_slice())
+    .execute(pool)
+    .await
+    .expect("asset blob should be insertable");
+    sqlx::query(
+        "INSERT INTO asset_records (id, source_url, version, final_url, blob_id)
+         VALUES ($1, 'https://cdn.example/api-asset.png', 1, 'https://cdn.example/api-asset.png', $2)",
+    )
+    .bind(asset_id)
+    .bind(blob_id)
+    .execute(pool)
+    .await
+    .expect("asset record should be insertable");
+    sqlx::query(
+        "INSERT INTO article_assets (source_id, review_id, asset_record_id, occurrence, referer_url)
+         VALUES ($1, $2, $3, 0, 'https://mp.weixin.qq.com/s/api-asset-article')",
+    )
+    .bind(source_id.as_uuid())
+    .bind(review_id)
+    .bind(asset_id)
+    .execute(pool)
+    .await
+    .expect("article asset relationship should be insertable");
+    asset_id
 }
 
 async fn publish_cache(pool: &PgPool, source_id: SourceId) {

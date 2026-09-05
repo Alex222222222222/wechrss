@@ -41,6 +41,7 @@ use crate::{
         repositories::{
             account_lease_repository::PostgresAccountLeaseRepository,
             article_repository::PostgresArticleRepository,
+            asset_repository::PostgresAssetStore,
             credential_repository::PostgresCredentialRepository,
             feed_cache_repository::{
                 PostgresFeedBuildLeaseRepository, PostgresFeedCacheRepository,
@@ -58,7 +59,7 @@ use crate::{
             admin_router_with_identity_resolver_and_server_root_url,
             admin_router_with_server_root_url,
         },
-        api::feed_router_with_browser_health,
+        api::feed_router_with_browser_health_and_assets,
         auth::AdminAuthenticator,
     },
 };
@@ -68,6 +69,7 @@ use super::{
         ArticleBackfillJobHandler, ArticleBackfillJobHandlerConfig,
         ArticleBackfillJobHandlerConfigError, ArticleBackfillJobHandlerDependencies,
     },
+    asset_archive_service::{AssetArchiveService, AssetArchiveServiceError},
     browser_health::{BrowserHealth, BrowserHealthMonitor},
     feed_rebuild_handler::{
         FeedRebuildJobHandler, FeedRebuildJobHandlerConfig, FeedRebuildJobHandlerConfigError,
@@ -410,6 +412,16 @@ impl RuntimeSupervisor {
         let (role_shutdown_tx, role_shutdown_rx) = watch::channel(false);
         let mut tasks = JoinSet::new();
 
+        if let Some(policy) = self.config.asset_archive.database_policy() {
+            let store = PostgresAssetStore::new(self.pool.clone(), policy);
+            let role_shutdown = role_shutdown_rx.clone();
+            tracing::info!("database asset-cache maintenance started");
+            tasks.spawn(async move {
+                run_asset_maintenance(store, role_shutdown).await;
+                Ok(())
+            });
+        }
+
         if let Some(monitor) = self.browser_monitor.clone() {
             let role_shutdown = role_shutdown_rx.clone();
             let interval = self.config.job_poll_interval;
@@ -561,12 +573,18 @@ impl RuntimeSupervisor {
             rebuild_service,
             feed_config,
         );
-        let mut router = feed_router_with_browser_health(
+        let asset_store = self
+            .config
+            .asset_archive
+            .database_policy()
+            .map(|policy| PostgresAssetStore::new(self.pool.clone(), policy));
+        let mut router = feed_router_with_browser_health_and_assets(
             FeedTokenService::new(PostgresFeedTokenRepository::new(self.pool.clone())),
             feed_service,
             self.pool.clone(),
             self.config.timezone,
             self.browser_health.clone(),
+            asset_store,
         );
         if self.config.admin_enabled {
             let auth = AdminAuthenticator::new(
@@ -633,13 +651,18 @@ impl RuntimeSupervisor {
         let handler_config = FeedRebuildJobHandlerConfig::new(retry_after)
             .map_err(RuntimeSupervisorError::FeedRebuildHandlerConfig)?;
         let feed_handler = FeedRebuildJobHandler::new(rebuild_service, handler_config);
+        let asset_archiver = if plan.source_sync_enabled() {
+            self.build_asset_archiver()?
+        } else {
+            None
+        };
         let source_sync = plan
             .source_sync_enabled()
-            .then(|| self.build_source_sync_handler(worker_index))
+            .then(|| self.build_source_sync_handler(worker_index, asset_archiver.clone()))
             .transpose()?;
         let article_backfill = plan
             .source_sync_enabled()
-            .then(|| self.build_article_backfill_handler(worker_index))
+            .then(|| self.build_article_backfill_handler(worker_index, asset_archiver))
             .transpose()?;
         let handler = RuntimeJobHandler::new(feed_handler, source_sync);
         let handler = match article_backfill {
@@ -705,6 +728,7 @@ impl RuntimeSupervisor {
     fn build_source_sync_handler(
         &self,
         worker_index: u32,
+        asset_archiver: Option<AssetArchiveService>,
     ) -> Result<SourceSyncHandler, RuntimeSupervisorError> {
         let acquirer = self.build_source_sync_acquirer(worker_index)?;
         let handler_config = SourceSyncJobHandlerConfig::new(
@@ -723,6 +747,7 @@ impl RuntimeSupervisor {
                 unit_of_work: UnitOfWorkFactory::new(self.pool.clone()),
                 acquirer,
                 sync_service: SyncService::new(),
+                asset_archiver,
             },
             handler_config,
         ))
@@ -731,6 +756,7 @@ impl RuntimeSupervisor {
     fn build_article_backfill_handler(
         &self,
         worker_index: u32,
+        asset_archiver: Option<AssetArchiveService>,
     ) -> Result<ArticleBackfillHandler, RuntimeSupervisorError> {
         let acquirer = self.build_source_sync_acquirer(worker_index)?;
         let handler_config = ArticleBackfillJobHandlerConfig::new(chrono_duration(
@@ -746,9 +772,19 @@ impl RuntimeSupervisor {
                 unit_of_work: UnitOfWorkFactory::new(self.pool.clone()),
                 acquirer,
                 sync_service: SyncService::new(),
+                asset_archiver,
             },
             handler_config,
         ))
+    }
+
+    fn build_asset_archiver(&self) -> Result<Option<AssetArchiveService>, RuntimeSupervisorError> {
+        let Some(policy) = self.config.asset_archive.database_policy() else {
+            return Ok(None);
+        };
+        AssetArchiveService::new(policy, self.config.browser_user_agent.clone())
+            .map(Some)
+            .map_err(RuntimeSupervisorError::AssetArchive)
     }
 
     fn build_source_sync_acquirer(
@@ -936,6 +972,43 @@ async fn drain_tasks(
     Ok(())
 }
 
+/// Periodically enforces database asset age/size limits and removes orphaned
+/// metadata. Maintenance is deliberately best effort: a transient database
+/// failure must not terminate otherwise healthy API or worker roles.
+async fn run_asset_maintenance(store: PostgresAssetStore, mut shutdown: watch::Receiver<bool>) {
+    const INTERVAL: StdDuration = StdDuration::from_secs(60 * 60);
+
+    if *shutdown.borrow() {
+        return;
+    }
+    let mut ticker = tokio::time::interval(INTERVAL);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    tracing::debug!("database asset-cache maintenance stopped");
+                    return;
+                }
+            }
+            _ = ticker.tick() => {
+                match store.maintenance().await {
+                    Ok(result) if result.changed() => {
+                        tracing::info!(
+                            stale_blobs = result.stale_blobs,
+                            size_evicted_blobs = result.size_evicted_blobs,
+                            orphan_records = result.orphan_records,
+                            orphan_blobs = result.orphan_blobs,
+                            "database asset-cache maintenance changed state"
+                        );
+                    }
+                    Ok(_) => tracing::debug!("database asset-cache maintenance found no work"),
+                    Err(error) => tracing::warn!(error = %error, "database asset-cache maintenance failed"),
+                }
+            }
+        }
+    }
+}
+
 fn chrono_duration(
     value: StdDuration,
     field: &'static str,
@@ -1015,6 +1088,9 @@ pub enum RuntimeSupervisorError {
     /// Authentication refresh handler construction failed.
     #[error(transparent)]
     AuthService(#[from] super::auth_service::AuthServiceError),
+    /// The optional database asset HTTP client could not be constructed.
+    #[error(transparent)]
+    AssetArchive(#[from] AssetArchiveServiceError),
     /// Worker construction failed.
     #[error(transparent)]
     WorkerConfig(#[from] super::worker::WorkerConfigError),

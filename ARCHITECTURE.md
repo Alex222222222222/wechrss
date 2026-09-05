@@ -66,7 +66,7 @@ The current and target contracts must not be confused:
 | Configuration | Environment-only `AppConfig` with role, lease, cache, public RSS URL, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint; the supervisor consumes the parsed role and policy values | QR-attempt policy is currently bounded in the application manager; durable multi-replica attempt storage remains future work |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, feed-build leases, and encrypted WeRead account credential records with optimistic versions | QR attempts are intentionally process-local; durable encrypted attempt storage and remaining transaction-scoped views are future work |
 | Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, authenticated WeRead article-list transport through an admin-enrolled cookie and account lease, source-sync finalization through an injected acquisition port, feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, public tokenized feed route, API liveness/readiness and browser-worker readiness routes, single-admin source/panel routes, and the WeRead QR login transport | Login/QR exchange is executable; durable multi-replica QR attempt storage remains future work |
-| Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, and external-image reporting through ArchiveService | Asset persistence and URL rewriting remain future work |
+| Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, bounded anonymous image acquisition with article `Referer`/`Origin`/User-Agent, PostgreSQL binary persistence, add-time checksum/raw-byte deduplication, stable URL rewriting, asset serving, and age/size/orphan maintenance | Automatic missing-asset repair, refresh-lineage controls, and local-directory/S3 backends remain future work; the target follow-up contract is documented in [docs/ASSET_CACHING.md](docs/ASSET_CACHING.md) |
 
 Environment variables in this document are parsed into `AppConfig`, and
 `application::runtime::RuntimePlan` is the side-effect-free boundary that
@@ -171,9 +171,15 @@ reused for public article extraction.
    This content fetch does not receive WeRead credentials and does not depend
    on the account login; it uses bounded waits and controlled scrolls for
    lazy-loaded content, then normalizes metadata, HTML, and asset references.
-6. HTML is sanitized. Version one may retain approved external asset URLs and
-   skip binary asset downloads; an optional asset-archive mode stores assets and
-   rewrites those URLs to local media URLs.
+6. HTML is sanitized. In the default disabled mode, approved external asset
+   URLs remain in the article. When the database asset-cache backend is
+   enabled, the target asset path fetches each image with a separate anonymous
+   HTTP request using the page's `Referer`, `Origin` when required, and
+   User-Agent, deduplicates it while adding the asset, and rewrites successful
+   records to stable local media URLs. It does not send WeRead cookies or
+   acquire an account lease for public image hosts. Automatic repair of
+   evicted bytes or expired signed URLs remains future work; the current asset
+   route returns a bounded retryable miss without re-acquiring the article.
 7. Browser and network acquisition finishes before the final database
    transaction begins. Lease heartbeats continue independently while upstream
    work is in progress.
@@ -765,9 +771,9 @@ changes are out of scope.
 
 PostgreSQL connection management, migrations, transactions, and repositories.
 Repositories own SQL and map rows to domain values. Job claiming, leases,
-deduplication, distributed account leases, and feed-cache reads/writes are
-persistence responsibilities. `UnitOfWork` is the only cross-repository
-transaction owner.
+deduplication, distributed account leases, feed-cache reads/writes, and the
+optional database asset cache are persistence responsibilities. `UnitOfWork`
+is the only cross-repository transaction owner.
 
 ### Archive
 
@@ -777,13 +783,14 @@ Sanitization is required and is implemented as a pure allowlist boundary in
 HTML with lowercase SHA-256, and returns the same deduplicated external image
 URLs in first-seen order. Empty sanitized output has no content hash, allowing
 partial list observations to remain distinct from archived article content.
-Asset persistence, checksum-based deduplication, and URL rewriting are
-optional in version one. When enabled, the `AssetStore` abstraction supports a
-local persistent volume first and S3-compatible storage later. Without it,
-approved external asset URLs remain in sanitized HTML and the application does
-not need binary asset storage or media delivery. Any future asset downloader
-must apply SSRF-safe network policy and bounded idempotent writes; the current
-`ArchiveService` never performs network I/O.
+The optional database asset backend now implements checksum-based
+deduplication, bounded anonymous HTTP acquisition, stable URL rewriting, and
+binary-byte eviction. Its target and follow-up behavior is specified in
+[`docs/ASSET_CACHING.md`](docs/ASSET_CACHING.md): `database` is the canonical
+PostgreSQL-backed backend, `ASSET_MAX_SIZE_MB` defaults to 10, and aggregate
+size accounting includes only present raw binary bytes. The pure
+`ArchiveService` still never performs network I/O; the separate asset fetcher
+applies the bounded SSRF-safe URL policy and idempotent writes.
 
 ### RSS
 
@@ -840,7 +847,7 @@ WEBDRIVER_URL / BROWSER_ENGINE / WORKER_CONCURRENCY
 BROWSER_USER_AGENT / BROWSER_LOCALE / BROWSER_VIEWPORT_WIDTH /
 BROWSER_VIEWPORT_HEIGHT / BROWSER_EXTRA_ARGS /
 WEREAD_ACCOUNT_ID / WEREAD_ARTICLE_LIST_URL
-APP_INSTANCE_ID / HTTP_BIND / HTTP_PORT
+APP_INSTANCE_ID / HTTP_BIND / HTTP_PORT / LOG_LEVEL
 APP_ROLES
 APP_TIMEZONE / QUIET_HOURS_START / QUIET_HOURS_END
 JOB_POLL_SECONDS / JOB_LEASE_SECONDS / JOB_HEARTBEAT_SECONDS /
@@ -851,13 +858,19 @@ RSS_CACHE_TTL_SECONDS / RSS_STALE_WHILE_REVALIDATE_SECONDS /
 RSS_CACHE_MISS_WAIT_MS / SERVER_ROOT_URL
 FEED_BUILD_LEASE_SECONDS / FEED_BUILD_HEARTBEAT_SECONDS
 PACING_* / SCROLL_*
-ASSET_ARCHIVE_BACKEND / ASSET_ARCHIVE_LOCAL_PATH /
-ASSET_ARCHIVE_S3_ENDPOINT / ASSET_ARCHIVE_S3_BUCKET /
-ASSET_ARCHIVE_S3_REGION / ASSET_ARCHIVE_S3_ACCESS_KEY /
-ASSET_ARCHIVE_S3_SECRET_KEY
+ASSET_ARCHIVE_BACKEND / ASSET_CACHE_MAX_SIZE_MB /
+ASSET_CACHE_MAX_AGE_DAYS / ASSET_MAX_SIZE_MB /
+ASSET_MAX_COUNT_PER_ARTICLE / ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB /
+ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS / ASSET_FETCH_TIMEOUT_SECONDS /
+ASSET_MAX_REDIRECTS
 ADMIN_ENABLED / ADMIN_USERNAME / ADMIN_PASSWORD / SESSION_SIGNING_KEY /
 CREDENTIAL_ENCRYPTION_KEY
 ```
+
+`ASSET_ARCHIVE_BACKEND` accepts `disabled`, `database`, and the compatible
+`postgres` alias. Local-directory and S3 storage, automatic asset repair, and
+asset refresh settings are roadmap items and are not accepted environment
+variables in the current runtime.
 
 `APP_TIMEZONE` is an IANA timezone name and defaults to `UTC`. `APP_ROLES`
 defaults to `api`; API and worker startup additionally require
@@ -936,9 +949,20 @@ enrolled account when each job runs; without one, the job records a warning and
 waits for the source's next due interval. Worker concurrency is
 configured independently from API replica count. `SERVER_ROOT_URL` is an optional
 validated public HTTP(S) URL for generated RSS channel links and is required
-when the worker role is enabled. `ASSET_ARCHIVE_BACKEND` is the enum `disabled | local | s3`
-and defaults to `disabled`; local paths or object-store credentials are
-validated only for the selected enabled backend.
+when the worker role is enabled. The current asset-cache implementation accepts
+only `disabled | database` and defaults to `disabled`; `database` is the
+canonical PostgreSQL-backed value. `local` and `s3` are reserved for future
+implementations. Local paths or object-store credentials are not part of the
+first implementation; the target cache limits and fetch settings are defined in
+[`docs/ASSET_CACHING.md`](docs/ASSET_CACHING.md).
+
+The target asset-recovery admission limit is cluster-wide: all replicas must
+use one PostgreSQL transaction-admission lock, check active-job deduplication
+before capacity, and reserve public-repair capacity for internal refresh work.
+Capacity waits use the existing non-failure deferred state, while refresh
+eligibility is provider-confirmed and its durable attempt budget is carried
+across replacement signed-URL versions. Permanent or exhausted repair lineages
+are circuit-broken until a new asset observation is published.
 
 The current loader requires a feed-build lease to exceed its heartbeat
 interval. Once RSS rendering exposes a configurable maximum render duration,
@@ -1142,9 +1166,10 @@ source-scoped RSS ordering, typed sync outcomes, bounded counters, and safe
 failure summaries. The sync-run repository's transaction-scoped `UnitOfWork`
 view is also included in that implementation. `SourceService` and
 `JobService` provide source lifecycle and worker queue orchestration, while
-`ArchiveService` provides pure content normalization and hashing. Credential
-persistence, binary asset persistence, URL rewriting, and other repository
-views remain future work. The pure RSS renderer in
+`ArchiveService` provides pure content normalization and hashing. The
+database asset repository, anonymous asset fetcher, stable asset route, and
+maintenance loop are executable when enabled; local/S3 storage, automatic
+repair, and other repository views remain future work. The pure RSS renderer in
 `src/rss/renderer.rs` is executable and produces revision-tagged cache
 candidates. The cache-first `FeedService` in
 `src/application/feed_service.rs` is also executable: it serves fresh rows,
@@ -1184,9 +1209,10 @@ authenticated admin panel can provision accounts through CSRF-protected routes
 while returning only non-secret status metadata. Active
 accounts can be scheduled for refresh when a transport is injected. Concrete
 source-sync acquisition/runtime composition uses an admin-enrolled encrypted
-cookie header. Binary asset
-persistence, and URL rewriting remain documentation-only; the pure
-archive sanitizer and `ArchiveService` are executable. Acquisition now
+cookie header. Binary asset persistence and URL rewriting use the optional
+database backend; local/S3 storage and automatic repair remain
+documentation-only. The pure archive sanitizer and `ArchiveService` are
+executable. Acquisition now
 contains executable identity resolution, capability/session ports, local
 capacity/lease ownership, public WebDriver navigation, common article
 extraction, bounded public-page pacing/scroll execution, expected

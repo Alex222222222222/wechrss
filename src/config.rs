@@ -29,10 +29,11 @@
 //! RSS_CACHE_MISS_WAIT_MS / SERVER_ROOT_URL
 //! FEED_BUILD_LEASE_SECONDS / FEED_BUILD_HEARTBEAT_SECONDS
 //! PACING_* / SCROLL_*
-//! ASSET_ARCHIVE_BACKEND / ASSET_ARCHIVE_LOCAL_PATH /
-//! ASSET_ARCHIVE_S3_ENDPOINT / ASSET_ARCHIVE_S3_BUCKET /
-//! ASSET_ARCHIVE_S3_REGION / ASSET_ARCHIVE_S3_ACCESS_KEY /
-//! ASSET_ARCHIVE_S3_SECRET_KEY
+//! ASSET_ARCHIVE_BACKEND / ASSET_CACHE_MAX_SIZE_MB /
+//! ASSET_CACHE_MAX_AGE_DAYS / ASSET_MAX_SIZE_MB /
+//! ASSET_MAX_COUNT_PER_ARTICLE / ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB /
+//! ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS / ASSET_FETCH_TIMEOUT_SECONDS /
+//! ASSET_MAX_REDIRECTS
 //! ADMIN_ENABLED / ADMIN_USERNAME / ADMIN_PASSWORD / SESSION_SIGNING_KEY /
 //! CREDENTIAL_ENCRYPTION_KEY
 //! ```
@@ -69,9 +70,12 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
-use crate::domain::credentials::WeReadAccountId;
 use crate::domain::pacing::{
     DelayDistribution, PacingError, PacingPolicy, QuietHours, MAX_SCROLL_PIXELS, MAX_SCROLL_STEPS,
+};
+use crate::{
+    archive::asset_store::{AssetCachePolicy, AssetCachePolicyError},
+    domain::credentials::WeReadAccountId,
 };
 
 const MAX_CONFIGURED_DELAY_MS: f64 = 300_000.0;
@@ -142,12 +146,14 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "SCROLL_MAX_PIXELS",
     "SCROLL_MAX_OPERATION_SECONDS",
     "ASSET_ARCHIVE_BACKEND",
-    "ASSET_ARCHIVE_LOCAL_PATH",
-    "ASSET_ARCHIVE_S3_ENDPOINT",
-    "ASSET_ARCHIVE_S3_BUCKET",
-    "ASSET_ARCHIVE_S3_REGION",
-    "ASSET_ARCHIVE_S3_ACCESS_KEY",
-    "ASSET_ARCHIVE_S3_SECRET_KEY",
+    "ASSET_CACHE_MAX_SIZE_MB",
+    "ASSET_CACHE_MAX_AGE_DAYS",
+    "ASSET_MAX_SIZE_MB",
+    "ASSET_MAX_COUNT_PER_ARTICLE",
+    "ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB",
+    "ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS",
+    "ASSET_FETCH_TIMEOUT_SECONDS",
+    "ASSET_MAX_REDIRECTS",
     "ADMIN_ENABLED",
     "ADMIN_USERNAME",
     "ADMIN_PASSWORD",
@@ -260,30 +266,27 @@ impl Default for AppRoles {
     }
 }
 
-/// Asset storage policy. Binary asset archiving remains optional in version
-/// one; disabled mode does not require any asset-store configuration.
-#[derive(Debug)]
+/// Asset storage policy. Binary asset archiving is disabled by default; the
+/// first enabled implementation stores metadata and bytes in PostgreSQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssetArchiveConfig {
     /// Keep approved external asset URLs and do not persist binary assets.
     Disabled,
-    /// Store binary assets below a persistent local directory.
-    Local {
-        /// Persistent local asset directory.
-        path: String,
+    /// Store binary assets and URL metadata in PostgreSQL.
+    Database {
+        /// Limits applied to acquisition, storage, and maintenance.
+        policy: AssetCachePolicy,
     },
-    /// Store binary assets in an S3-compatible object store.
-    S3 {
-        /// Endpoint used by the object-store client.
-        endpoint: Url,
-        /// Object-store bucket name.
-        bucket: String,
-        /// Object-store region or signing scope.
-        region: String,
-        /// Object-store access key.
-        access_key: SecretString,
-        /// Object-store secret key.
-        secret_key: SecretString,
-    },
+}
+
+impl AssetArchiveConfig {
+    /// Returns the database policy when binary caching is enabled.
+    pub const fn database_policy(&self) -> Option<AssetCachePolicy> {
+        match self {
+            Self::Disabled => None,
+            Self::Database { policy } => Some(*policy),
+        }
+    }
 }
 
 /// Browser implementation selected for a WebDriver sidecar.
@@ -837,12 +840,14 @@ struct RawConfig {
     scroll_max_pixels: Option<u32>,
     scroll_max_operation_seconds: Option<u64>,
     asset_archive_backend: Option<String>,
-    asset_archive_local_path: Option<String>,
-    asset_archive_s3_endpoint: Option<String>,
-    asset_archive_s3_bucket: Option<String>,
-    asset_archive_s3_region: Option<String>,
-    asset_archive_s3_access_key: Option<String>,
-    asset_archive_s3_secret_key: Option<String>,
+    asset_cache_max_size_mb: Option<u64>,
+    asset_cache_max_age_days: Option<u64>,
+    asset_max_size_mb: Option<u64>,
+    asset_max_count_per_article: Option<u32>,
+    asset_max_fetch_bytes_per_article_mb: Option<u64>,
+    asset_max_fetch_time_per_article_seconds: Option<u64>,
+    asset_fetch_timeout_seconds: Option<u64>,
+    asset_max_redirects: Option<u32>,
     admin_enabled: Option<String>,
     admin_username: Option<String>,
     admin_password: Option<String>,
@@ -1051,71 +1056,76 @@ fn asset_archive_config(raw: &RawConfig) -> Result<AssetArchiveConfig, ConfigErr
         .unwrap_or("disabled")
         .trim()
         .to_ascii_lowercase();
+    let policy = asset_cache_policy(raw)?;
     match backend.as_str() {
         "disabled" => Ok(AssetArchiveConfig::Disabled),
-        "local" => Ok(AssetArchiveConfig::Local {
-            path: required_path(
-                raw.asset_archive_local_path.clone(),
-                "ASSET_ARCHIVE_LOCAL_PATH",
-            )?,
-        }),
-        "s3" => {
-            let endpoint = required(
-                raw.asset_archive_s3_endpoint.clone(),
-                "ASSET_ARCHIVE_S3_ENDPOINT",
-            )?
-            .trim()
-            .parse::<Url>()
-            .map_err(|_| ConfigError::InvalidValue {
-                variable: "ASSET_ARCHIVE_S3_ENDPOINT",
-                reason: "expected an http or https URL without credentials",
-            })?;
-            if !matches!(endpoint.scheme(), "http" | "https")
-                || endpoint.host().is_none()
-                || !endpoint.username().is_empty()
-                || endpoint.password().is_some()
-                || endpoint.query().is_some()
-                || endpoint.fragment().is_some()
-            {
-                return Err(ConfigError::InvalidValue {
-                    variable: "ASSET_ARCHIVE_S3_ENDPOINT",
-                    reason: "expected an http or https URL without credentials",
-                });
-            }
-            Ok(AssetArchiveConfig::S3 {
-                endpoint,
-                bucket: required(
-                    raw.asset_archive_s3_bucket.clone(),
-                    "ASSET_ARCHIVE_S3_BUCKET",
-                )?
-                .trim()
-                .to_owned(),
-                region: required(
-                    raw.asset_archive_s3_region.clone(),
-                    "ASSET_ARCHIVE_S3_REGION",
-                )?
-                .trim()
-                .to_owned(),
-                access_key: SecretString::new(
-                    required(
-                        raw.asset_archive_s3_access_key.clone(),
-                        "ASSET_ARCHIVE_S3_ACCESS_KEY",
-                    )?
-                    .into_boxed_str(),
-                ),
-                secret_key: SecretString::new(
-                    required(
-                        raw.asset_archive_s3_secret_key.clone(),
-                        "ASSET_ARCHIVE_S3_SECRET_KEY",
-                    )?
-                    .into_boxed_str(),
-                ),
-            })
-        }
+        "database" | "postgres" => Ok(AssetArchiveConfig::Database { policy }),
         _ => Err(ConfigError::InvalidValue {
             variable: "ASSET_ARCHIVE_BACKEND",
-            reason: "expected disabled, local, or s3",
+            reason: "expected disabled or database (postgres is an alias)",
         }),
+    }
+}
+
+fn asset_cache_policy(raw: &RawConfig) -> Result<AssetCachePolicy, ConfigError> {
+    let policy = AssetCachePolicy::new(
+        decimal_megabytes(
+            raw.asset_cache_max_size_mb.unwrap_or(5_000),
+            "ASSET_CACHE_MAX_SIZE_MB",
+        )?,
+        Duration::from_secs(
+            raw.asset_cache_max_age_days
+                .unwrap_or(30)
+                .checked_mul(24 * 60 * 60)
+                .ok_or(ConfigError::InvalidValue {
+                    variable: "ASSET_CACHE_MAX_AGE_DAYS",
+                    reason: "is too large",
+                })?,
+        ),
+        decimal_megabytes(raw.asset_max_size_mb.unwrap_or(10), "ASSET_MAX_SIZE_MB")?,
+        raw.asset_max_count_per_article.unwrap_or(100),
+        decimal_megabytes(
+            raw.asset_max_fetch_bytes_per_article_mb.unwrap_or(100),
+            "ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB",
+        )?,
+        Duration::from_secs(raw.asset_max_fetch_time_per_article_seconds.unwrap_or(120)),
+        Duration::from_secs(raw.asset_fetch_timeout_seconds.unwrap_or(30)),
+        raw.asset_max_redirects.unwrap_or(5),
+    )
+    .map_err(|error| match error {
+        AssetCachePolicyError::ZeroLimit { field } => ConfigError::InvalidValue {
+            variable: asset_policy_variable(field),
+            reason: "must be greater than zero",
+        },
+        AssetCachePolicyError::ZeroDuration { field } => ConfigError::InvalidValue {
+            variable: asset_policy_variable(field),
+            reason: "must be greater than zero",
+        },
+        AssetCachePolicyError::TimeoutExceedsArticleBudget => ConfigError::InvalidValue {
+            variable: "ASSET_FETCH_TIMEOUT_SECONDS",
+            reason: "must not exceed ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS",
+        },
+    })?;
+    Ok(policy)
+}
+
+fn decimal_megabytes(value: u64, variable: &'static str) -> Result<u64, ConfigError> {
+    value
+        .checked_mul(1_000_000)
+        .ok_or(ConfigError::InvalidValue {
+            variable,
+            reason: "is too large",
+        })
+}
+
+fn asset_policy_variable(field: &str) -> &'static str {
+    match field {
+        "max_asset_size_bytes" => "ASSET_MAX_SIZE_MB",
+        "max_count_per_article" => "ASSET_MAX_COUNT_PER_ARTICLE",
+        "max_fetch_bytes_per_article" => "ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB",
+        "max_fetch_time_per_article" => "ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS",
+        "fetch_timeout" => "ASSET_FETCH_TIMEOUT_SECONDS",
+        _ => "ASSET_ARCHIVE_BACKEND",
     }
 }
 
@@ -1123,17 +1133,6 @@ fn required(value: Option<String>, variable: &'static str) -> Result<String, Con
     value
         .filter(|value| !value.trim().is_empty())
         .ok_or(ConfigError::Missing { variable })
-}
-
-fn required_path(value: Option<String>, variable: &'static str) -> Result<String, ConfigError> {
-    match value {
-        None => Err(ConfigError::Missing { variable }),
-        Some(value) if value.trim().is_empty() => Err(ConfigError::InvalidValue {
-            variable,
-            reason: "must not be empty",
-        }),
-        Some(value) => Ok(value.trim().to_owned()),
-    }
 }
 
 fn parse_optional_http_url(
@@ -1555,15 +1554,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_local_archive_paths() {
+    fn rejects_unimplemented_asset_backends() {
         let mut environment = valid_environment();
         environment.push(("ASSET_ARCHIVE_BACKEND".to_owned(), "local".to_owned()));
-        environment.push(("ASSET_ARCHIVE_LOCAL_PATH".to_owned(), " ".to_owned()));
 
         assert!(matches!(
             AppConfig::from_env_iter(environment),
             Err(ConfigError::InvalidValue {
-                variable: "ASSET_ARCHIVE_LOCAL_PATH",
+                variable: "ASSET_ARCHIVE_BACKEND",
                 ..
             })
         ));
@@ -1802,73 +1800,83 @@ mod tests {
     }
 
     #[test]
-    fn parses_local_and_s3_asset_modes_and_validates_selected_settings() {
+    fn parses_database_asset_mode_and_all_cache_limits() {
         let mut environment =
-            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "local");
-        environment.push((
-            "ASSET_ARCHIVE_LOCAL_PATH".to_owned(),
-            " /var/lib/werrss/assets ".to_owned(),
-        ));
-        let config = AppConfig::from_env_iter(environment).unwrap();
-        assert!(matches!(
-            config.asset_archive,
-            AssetArchiveConfig::Local { ref path } if path == "/var/lib/werrss/assets"
-        ));
-
-        let mut environment =
-            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "s3");
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", " database ");
         environment.extend([
+            ("ASSET_CACHE_MAX_SIZE_MB".to_owned(), "12".to_owned()),
+            ("ASSET_CACHE_MAX_AGE_DAYS".to_owned(), "0".to_owned()),
+            ("ASSET_MAX_SIZE_MB".to_owned(), "2".to_owned()),
+            ("ASSET_MAX_COUNT_PER_ARTICLE".to_owned(), "7".to_owned()),
             (
-                "ASSET_ARCHIVE_S3_ENDPOINT".to_owned(),
-                "https://objects.example.test".to_owned(),
-            ),
-            ("ASSET_ARCHIVE_S3_BUCKET".to_owned(), "werrss".to_owned()),
-            ("ASSET_ARCHIVE_S3_REGION".to_owned(), "us-east-1".to_owned()),
-            (
-                "ASSET_ARCHIVE_S3_ACCESS_KEY".to_owned(),
-                "access".to_owned(),
+                "ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB".to_owned(),
+                "8".to_owned(),
             ),
             (
-                "ASSET_ARCHIVE_S3_SECRET_KEY".to_owned(),
-                "secret".to_owned(),
+                "ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS".to_owned(),
+                "40".to_owned(),
             ),
+            ("ASSET_FETCH_TIMEOUT_SECONDS".to_owned(), "10".to_owned()),
+            ("ASSET_MAX_REDIRECTS".to_owned(), "2".to_owned()),
         ]);
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        let AssetArchiveConfig::Database { policy } = config.asset_archive else {
+            panic!("database backend should be selected");
+        };
+        assert_eq!(policy.max_cache_size_bytes(), 12_000_000);
+        assert_eq!(policy.max_age(), Duration::ZERO);
+        assert_eq!(policy.max_asset_size_bytes(), 2_000_000);
+        assert_eq!(policy.max_count_per_article(), 7);
+        assert_eq!(policy.max_fetch_bytes_per_article(), 8_000_000);
+        assert_eq!(policy.max_fetch_time_per_article(), Duration::from_secs(40));
+        assert_eq!(policy.fetch_timeout(), Duration::from_secs(10));
+        assert_eq!(policy.max_redirects(), 2);
+    }
+
+    #[test]
+    fn accepts_postgres_as_the_database_asset_backend_alias() {
+        let environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "postgres");
+
         assert!(matches!(
             AppConfig::from_env_iter(environment).unwrap().asset_archive,
-            AssetArchiveConfig::S3 { .. }
+            AssetArchiveConfig::Database { .. }
         ));
+    }
 
-        let mut environment =
-            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "s3");
+    #[test]
+    fn rejects_invalid_asset_cache_limits() {
+        for (variable, value) in [
+            ("ASSET_MAX_SIZE_MB", "0"),
+            ("ASSET_MAX_COUNT_PER_ARTICLE", "0"),
+            ("ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB", "0"),
+            ("ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS", "0"),
+            ("ASSET_FETCH_TIMEOUT_SECONDS", "0"),
+        ] {
+            assert!(matches!(
+                AppConfig::from_env_iter(replace_environment(
+                    valid_environment(),
+                    variable,
+                    value,
+                )),
+                Err(ConfigError::InvalidValue { variable: actual, .. }) if actual == variable
+            ));
+        }
+
+        let mut environment = valid_environment();
         environment.extend([
             (
-                "ASSET_ARCHIVE_S3_ENDPOINT".to_owned(),
-                "https://user:password@objects.example.test".to_owned(),
+                "ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS".to_owned(),
+                "10".to_owned(),
             ),
-            ("ASSET_ARCHIVE_S3_BUCKET".to_owned(), "werrss".to_owned()),
-            ("ASSET_ARCHIVE_S3_REGION".to_owned(), "us-east-1".to_owned()),
-            (
-                "ASSET_ARCHIVE_S3_ACCESS_KEY".to_owned(),
-                "access".to_owned(),
-            ),
-            (
-                "ASSET_ARCHIVE_S3_SECRET_KEY".to_owned(),
-                "secret".to_owned(),
-            ),
+            ("ASSET_FETCH_TIMEOUT_SECONDS".to_owned(), "11".to_owned()),
         ]);
         assert!(matches!(
             AppConfig::from_env_iter(environment),
             Err(ConfigError::InvalidValue {
-                variable: "ASSET_ARCHIVE_S3_ENDPOINT",
+                variable: "ASSET_FETCH_TIMEOUT_SECONDS",
                 ..
-            })
-        ));
-
-        let environment = replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "s3");
-        assert!(matches!(
-            AppConfig::from_env_iter(environment),
-            Err(ConfigError::Missing {
-                variable: "ASSET_ARCHIVE_S3_ENDPOINT"
             })
         ));
     }

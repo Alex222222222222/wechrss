@@ -5,8 +5,8 @@
 //! completion atomic without exposing SQLx transactions to application code.
 //!
 //! `UnitOfWorkFactory::begin` creates one short-lived SQLx transaction. Its
-//! returned handle exposes transaction-scoped job, source, article, sync-run,
-//! and feed-cache views today. Only the unit of work can commit; dropping it
+//! returned handle exposes transaction-scoped job, source, article, asset,
+//! sync-run, and feed-cache views today. Only the unit of work can commit; dropping it
 //! or returning an error rolls all component writes back. Repository views
 //! borrow the unit of work and therefore cannot outlive or independently commit
 //! their transaction.
@@ -19,14 +19,15 @@
 //! - `job_enqueue()` borrows only the transaction-scoped enqueue port;
 //! - `source()` borrows the transaction-scoped source mutation view;
 //! - `articles()` borrows the transaction-scoped article mutation view;
+//! - `assets(policy)` borrows the transaction-scoped asset storage view;
 //! - `feed_cache()` borrows the transaction-scoped feed-cache publication view;
 //! - `database_now()` samples the PostgreSQL clock for persisted ordering
 //!   timestamps;
 //! - `commit(self)` is the only successful exit for a completed unit of work;
 //! - `rollback(self)` is available for explicit cleanup in tests or callers
 //!   that need to await rollback; and
-//! - future `verify_fence` and archive commands will be added to views that
-//!   borrow this same transaction; and
+//! - archive acquisition and URL rewriting use `assets(policy)` while
+//!   borrowing this same transaction; and
 //! - article upserts return feed-visible change information so the caller can
 //!   decide whether to bump the source revision in this same transaction.
 //!
@@ -44,9 +45,10 @@
 //! 1. perform browser/network acquisition and normalization without a database
 //!    transaction;
 //! 2. keep the job lease alive through a separate pool connection;
-//! 3. begin a unit of work and verify the job owner, fencing token, and live
-//!    lease;
-//! 4. verify the expected base feed revision, persist idempotent article/archive
+//! 3. begin a unit of work and, when assets are present, preflight their
+//!    checksums/raw-byte candidates before source/article row locks;
+//! 4. verify the job owner, fencing token, and live lease, then verify the
+//!    expected base feed revision and persist idempotent article/archive
 //!    changes, and advance to the candidate revision when feed-visible data
 //!    changed;
 //! 5. persist an already-rendered cache payload only for that exact revision,
@@ -71,10 +73,14 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use thiserror::Error;
 
-use crate::domain::job::{Job, NewJob};
+use crate::{
+    archive::asset_store::{AssetCachePolicy, AssetInput},
+    domain::job::{Job, NewJob},
+};
 
 use super::repositories::{
     article_repository::PostgresArticleTransaction,
+    asset_repository::{prepare_asset_batch, AssetRepositoryError, PostgresAssetTransaction},
     feed_cache_repository::PostgresFeedCacheTransaction,
     job_repository::PostgresJobTransaction,
     job_repository::{
@@ -90,6 +96,9 @@ pub enum UnitOfWorkError {
     /// SQLx could not start, commit, or roll back the transaction.
     #[error("unit of work transaction error: {0}")]
     Transaction(#[source] sqlx::Error),
+    /// Asset digest/collision preflight could not complete before persistence.
+    #[error("asset preflight error: {0}")]
+    AssetPreparation(#[source] AssetRepositoryError),
     /// SQLx could not sample the authoritative PostgreSQL clock.
     #[error("unit of work database clock error: {0}")]
     DatabaseClock(#[source] sqlx::Error),
@@ -118,11 +127,32 @@ impl UnitOfWorkFactory {
 
     /// Begins a transaction whose repository views share one commit boundary.
     pub async fn begin(&self) -> Result<UnitOfWork<'_>, UnitOfWorkError> {
+        self.begin_with_assets(&[]).await
+    }
+
+    /// Begins a transaction after preflighting asset digests and raw-byte
+    /// deduplication. This must be called before source/article row locks are
+    /// acquired when the unit of work will store asset inputs.
+    pub async fn begin_with_assets(
+        &self,
+        inputs: &[AssetInput],
+    ) -> Result<UnitOfWork<'_>, UnitOfWorkError> {
         tracing::trace!("beginning PostgreSQL unit of work");
-        let result = PostgresJobTransaction::begin(&self.pool)
+        let mut jobs = PostgresJobTransaction::begin(&self.pool)
             .await
-            .map(|jobs| UnitOfWork { jobs })
-            .map_err(UnitOfWorkError::Transaction);
+            .map_err(UnitOfWorkError::Transaction)?;
+        let asset_preparation = prepare_asset_batch(
+            jobs.transaction_mut().map_err(|error| {
+                UnitOfWorkError::AssetPreparation(AssetRepositoryError::Storage(error.to_string()))
+            })?,
+            inputs,
+        )
+        .await
+        .map_err(UnitOfWorkError::AssetPreparation)?;
+        let result = Ok(UnitOfWork {
+            jobs,
+            asset_preparation: Some(asset_preparation),
+        });
         if let Err(error) = &result {
             tracing::warn!(error = %error, "unable to begin PostgreSQL unit of work");
         }
@@ -149,6 +179,7 @@ impl UnitOfWorkFactory {
 /// A short-lived transaction-scoped persistence unit.
 pub struct UnitOfWork<'a> {
     jobs: PostgresJobTransaction<'a>,
+    asset_preparation: Option<super::repositories::asset_repository::AssetBatchPreparation>,
 }
 
 /// Outcome-only view over the job transaction owned by [`UnitOfWork`].
@@ -217,6 +248,11 @@ impl<'a> UnitOfWork<'a> {
     /// Borrows the transaction-scoped article mutation view.
     pub fn articles(&mut self) -> PostgresArticleTransaction<'_, 'a> {
         PostgresArticleTransaction::new(&mut self.jobs)
+    }
+
+    /// Borrows the transaction-scoped binary asset mutation view.
+    pub fn assets(&mut self, policy: AssetCachePolicy) -> PostgresAssetTransaction<'_, 'a> {
+        PostgresAssetTransaction::new(&mut self.jobs, self.asset_preparation.clone(), policy)
     }
 
     /// Borrows the transaction-scoped feed-cache publication view.

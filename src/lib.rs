@@ -2,9 +2,9 @@
 //!
 //! This crate is being implemented incrementally. The module declarations
 //! establish dependency direction; configuration, pacing, durable job and
-//! feed-cache/source/article/sync-run persistence slices, and the shared
-//! transaction boundary are implemented while the remaining modules document
-//! their future contracts.
+//! feed-cache/source/article/sync-run persistence slices, the shared
+//! transaction boundary, and the optional PostgreSQL asset-cache slice are
+//! implemented while the remaining modules document their future contracts.
 
 pub mod acquisition;
 pub mod application;

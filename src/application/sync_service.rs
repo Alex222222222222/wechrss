@@ -32,7 +32,7 @@
 //! [`super::source_sync_handler::SourceSyncJobHandler`]: list metadata is used
 //! as a fallback for missing page metadata, public page HTML is sanitized and
 //! hashed through [`ArchiveService`], and the optional external-image set is
-//! retained for a later asset policy. This service also classifies typed
+//! retained for the database asset archiver. This service also classifies typed
 //! WeRead and public-page failures into the stable sync-run vocabulary without
 //! copying upstream response text into durable diagnostics. Transport and
 //! concrete browser/account composition remain behind the acquisition port.
@@ -53,6 +53,7 @@ use crate::{
         weread::{WeReadAdapterError, WeReadArticleReference},
     },
     application::archive_service::ArchiveService,
+    archive::asset_store::AssetInput,
     domain::{
         article::{ArticleError, ArticleObservationVersion, NewArticle},
         source::SourceId,
@@ -195,6 +196,7 @@ pub fn classify_acquisition_error(error: &SyncAcquisitionError) -> ClassifiedSyn
 pub struct PreparedArticle {
     article: NewArticle,
     external_assets: Vec<Url>,
+    fetched_assets: Vec<AssetInput>,
 }
 
 impl PreparedArticle {
@@ -207,12 +209,55 @@ impl PreparedArticle {
     pub fn external_assets(&self) -> &[Url] {
         &self.external_assets
     }
+
+    /// Returns successfully fetched asset bodies ready for the persistence
+    /// transaction. Failed downloads are intentionally absent.
+    pub fn fetched_assets(&self) -> &[AssetInput] {
+        &self.fetched_assets
+    }
+
+    /// Adds the best-effort asset responses collected outside the database
+    /// transaction.
+    pub fn with_fetched_assets(mut self, fetched_assets: Vec<AssetInput>) -> Self {
+        self.fetched_assets = fetched_assets;
+        self
+    }
 }
 
 /// Source synchronization preparation and failure-classification service.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SyncService {
     archive: ArchiveService,
+}
+
+/// Returns whether a successful full-content observation may reconcile its
+/// article-to-asset relationships.
+///
+/// Empty content is a partial observation and must preserve existing asset
+/// links. A lower observation version was superseded by a newer observation,
+/// so applying its links would reintroduce stale data.
+pub(crate) fn should_reconcile_assets(
+    incoming: &NewArticle,
+    persisted_version: ArticleObservationVersion,
+) -> bool {
+    !incoming.content_html.is_empty() && incoming.observation_version == persisted_version
+}
+
+/// Returns whether an incomplete asset observation must keep the previously
+/// archived article representation.
+///
+/// Asset acquisition is best effort. If the stored article already points at
+/// local asset routes, replacing its HTML with a partially archived response
+/// would make the existing `article_assets` rows disagree with the article.
+/// Keeping the old representation until a complete observation succeeds keeps
+/// those two pieces of state atomic from the feed's point of view.
+pub(crate) fn should_preserve_cached_asset_representation(
+    current_content_html: Option<&str>,
+    external_asset_count: usize,
+    fetched_asset_count: usize,
+) -> bool {
+    external_asset_count > fetched_asset_count
+        && current_content_html.is_some_and(|html| html.contains("/assets/"))
 }
 
 impl SyncService {
@@ -269,6 +314,7 @@ impl SyncService {
             Ok(PreparedArticle {
                 article,
                 external_assets: archived.external_assets().to_vec(),
+                fetched_assets: Vec::new(),
             })
         })();
         match &result {
@@ -465,6 +511,76 @@ mod tests {
             ),
             Err(SyncServiceError::MissingPublishedAt)
         );
+    }
+
+    #[test]
+    fn reconciles_assets_only_for_an_accepted_full_observation() {
+        let incoming = NewArticle {
+            source_id: source_id(),
+            review_id: "review-1".to_owned(),
+            title: "title".to_owned(),
+            author: None,
+            summary: None,
+            cover_url: None,
+            original_url: None,
+            published_at: Utc.timestamp_opt(1_700_000_000, 0).single().unwrap(),
+            content_html: "<p>body</p>".to_owned(),
+            content_hash: Some("hash".to_owned()),
+            observation_version: ArticleObservationVersion::from_u64(4),
+            fetched_at: Utc.timestamp_opt(1_700_000_100, 0).single().unwrap(),
+        };
+
+        assert!(should_reconcile_assets(
+            &incoming,
+            ArticleObservationVersion::from_u64(4)
+        ));
+    }
+
+    #[test]
+    fn does_not_reconcile_assets_for_partial_or_stale_observation() {
+        let mut incoming = NewArticle {
+            source_id: source_id(),
+            review_id: "review-1".to_owned(),
+            title: "title".to_owned(),
+            author: None,
+            summary: None,
+            cover_url: None,
+            original_url: None,
+            published_at: Utc.timestamp_opt(1_700_000_000, 0).single().unwrap(),
+            content_html: String::new(),
+            content_hash: None,
+            observation_version: ArticleObservationVersion::from_u64(4),
+            fetched_at: Utc.timestamp_opt(1_700_000_100, 0).single().unwrap(),
+        };
+
+        assert!(!should_reconcile_assets(
+            &incoming,
+            ArticleObservationVersion::from_u64(4)
+        ));
+
+        incoming.content_html = "<p>older</p>".to_owned();
+        assert!(!should_reconcile_assets(
+            &incoming,
+            ArticleObservationVersion::from_u64(5)
+        ));
+    }
+
+    #[test]
+    fn preserves_cached_representation_when_asset_acquisition_is_incomplete() {
+        assert!(should_preserve_cached_asset_representation(
+            Some("<p>cached</p><img src=\"/assets/asset-id\">"),
+            2,
+            1,
+        ));
+    }
+
+    #[test]
+    fn does_not_preserve_cached_representation_after_complete_asset_acquisition() {
+        assert!(!should_preserve_cached_asset_representation(
+            Some("<p>cached</p><img src=\"/assets/asset-id\">"),
+            1,
+            1,
+        ));
     }
 
     #[test]

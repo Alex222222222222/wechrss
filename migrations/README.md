@@ -11,6 +11,11 @@ to be created from a known WeRead `book_id` without inventing a public article
 URL. Existing URLs remain unchanged and new URLs are still validated by the
 domain before persistence.
 
+The forward `0004_asset_cache.sql` migration adds PostgreSQL-backed asset
+metadata, deduplicated binary blobs, and article-to-asset relationships. Binary
+eviction clears only blob data and retains referenced URL/version metadata for
+future repair; orphan cleanup removes rows that no longer belong to an article.
+
 The initial schema provides:
 
 - the active non-failure `deferred` job state;
@@ -33,6 +38,9 @@ The initial schema provides:
 - normalized `articles` keyed by `(source_id, review_id)`, including sanitized
   HTML, optional external URLs, the pre-acquisition observation version, and
   the feed-order index; and
+- `asset_blobs`, `asset_records`, and `article_assets` for the optional
+  database asset cache, including checksum/raw-byte deduplication and
+  stable metadata after binary eviction; and
 - `sync_runs` audit rows with typed outcomes, bounded counters, safe failure
   summaries, and optional published feed revisions.
 

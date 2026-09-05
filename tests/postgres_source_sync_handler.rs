@@ -1,10 +1,14 @@
 //! PostgreSQL integration coverage for source-sync job finalization.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration as StdDuration};
 
 use chrono::{Duration, TimeZone, Utc};
 use sqlx::{PgPool, Row};
-use tokio::sync::Notify;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    sync::Notify,
+};
 use uuid::Uuid;
 use werrss::{
     acquisition::{
@@ -12,6 +16,7 @@ use werrss::{
         weread::{WeReadAdapterError, WeReadArticleReference},
     },
     application::{
+        asset_archive_service::AssetArchiveService,
         source_sync_handler::{
             SourceSyncAcquirer, SourceSyncJobHandler, SourceSyncJobHandlerConfig,
             SourceSyncJobHandlerDependencies, SourceSyncReferences,
@@ -19,6 +24,7 @@ use werrss::{
         sync_service::SyncAcquisitionError,
         worker::{JobExecution, JobHandler},
     },
+    archive::asset_store::AssetCachePolicy,
     domain::{
         job::{JobType, NewJob},
         pacing::QuietHours,
@@ -200,6 +206,273 @@ async fn source_sync_commits_article_run_schedule_and_feed_rebuild(pool: PgPool)
     assert_eq!(run.get::<i64, _>("articles_failed"), 0);
     assert_eq!(run.get::<i64, _>("archived_articles"), 1);
     assert_eq!(run.get::<i64, _>("archived_assets"), 0);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn source_sync_with_asset_archiving_does_not_bump_revision_for_unchanged_article(
+    pool: PgPool,
+) {
+    let (asset_archiver, asset_server, asset_url) = asset_archiver_fixture(2).await;
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_id).await;
+
+    let reference = reference(
+        "asset-idempotent",
+        "https://mp.weixin.qq.com/s/asset-idempotent",
+    );
+    let mut article_page = page(
+        "https://mp.weixin.qq.com/s/asset-idempotent",
+        "Asset idempotent article",
+    );
+    article_page.content_html = format!("<p>content</p><img src=\"{asset_url}\">");
+
+    let first_job_id = enqueue_source_sync(&pool, source_id).await;
+    let first_lease = claim(&pool, Utc::now()).await;
+    let first_handler = handler_with_archiver(
+        pool.clone(),
+        FakeAcquirer::successful(reference.clone(), article_page.clone()),
+        SourceSyncJobHandlerConfig::default(),
+        Some(asset_archiver.clone()),
+    );
+    assert_eq!(
+        first_handler.execute(&first_lease, Utc::now()).await,
+        JobExecution::Committed
+    );
+
+    let second_job_id = enqueue_source_sync(&pool, source_id).await;
+    let second_lease = claim(&pool, Utc::now()).await;
+    let second_handler = handler_with_archiver(
+        pool.clone(),
+        FakeAcquirer::successful(reference, article_page),
+        SourceSyncJobHandlerConfig::default(),
+        Some(asset_archiver),
+    );
+    assert_eq!(
+        second_handler.execute(&second_lease, Utc::now()).await,
+        JobExecution::Committed
+    );
+
+    let revision: i64 = sqlx::query_scalar("SELECT feed_revision FROM sources WHERE id = $1")
+        .bind(source_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        revision, 1,
+        "the unchanged archived article must be idempotent"
+    );
+
+    let second_run =
+        sqlx::query("SELECT articles_created, articles_updated FROM sync_runs WHERE job_id = $1")
+            .bind(second_job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(second_run.get::<i64, _>("articles_created"), 0);
+    assert_eq!(second_run.get::<i64, _>("articles_updated"), 0);
+
+    let stored_html: String = sqlx::query_scalar(
+        "SELECT content_html FROM articles WHERE source_id = $1 AND review_id = $2",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-idempotent")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(stored_html.contains("/assets/"));
+
+    let first_status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+        .bind(first_job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(first_status, "succeeded");
+    asset_server
+        .await
+        .expect("asset fixture should serve both fetches");
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn source_sync_preserves_cached_article_when_asset_fetch_is_incomplete(pool: PgPool) {
+    let (asset_archiver, asset_server, asset_url) = asset_archiver_fixture(1).await;
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_id).await;
+
+    let reference = reference(
+        "asset-fetch-failure",
+        "https://mp.weixin.qq.com/s/asset-fetch-failure",
+    );
+    let mut article_page = page(
+        "https://mp.weixin.qq.com/s/asset-fetch-failure",
+        "Asset fetch failure",
+    );
+    article_page.content_html = format!("<p>content</p><img src=\"{asset_url}\">");
+
+    enqueue_source_sync(&pool, source_id).await;
+    let first_lease = claim(&pool, Utc::now()).await;
+    let first_handler = handler_with_archiver(
+        pool.clone(),
+        FakeAcquirer::successful(reference.clone(), article_page.clone()),
+        SourceSyncJobHandlerConfig::default(),
+        Some(asset_archiver.clone()),
+    );
+    assert_eq!(
+        first_handler.execute(&first_lease, Utc::now()).await,
+        JobExecution::Committed
+    );
+
+    let cached_html: String = sqlx::query_scalar(
+        "SELECT content_html FROM articles WHERE source_id = $1 AND review_id = $2",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-fetch-failure")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(cached_html.contains("/assets/"));
+
+    enqueue_source_sync(&pool, source_id).await;
+    let second_lease = claim(&pool, Utc::now()).await;
+    let second_handler = handler_with_archiver(
+        pool.clone(),
+        FakeAcquirer::successful(reference, article_page),
+        SourceSyncJobHandlerConfig::default(),
+        Some(asset_archiver),
+    );
+    assert_eq!(
+        second_handler.execute(&second_lease, Utc::now()).await,
+        JobExecution::Committed
+    );
+
+    let persisted_html: String = sqlx::query_scalar(
+        "SELECT content_html FROM articles WHERE source_id = $1 AND review_id = $2",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-fetch-failure")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted_html, cached_html);
+
+    let relationship_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM article_assets WHERE source_id = $1 AND review_id = $2",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-fetch-failure")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(relationship_count, 1);
+
+    asset_server
+        .await
+        .expect("asset fixture should serve the initial fetch");
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn source_sync_preserves_cached_article_when_asset_capacity_is_exceeded(pool: PgPool) {
+    let (initial_archiver, initial_server, initial_url) = asset_archiver_fixture(1).await;
+    let constrained_policy = AssetCachePolicy::new(
+        5,
+        StdDuration::from_secs(30),
+        10_000_000,
+        100,
+        100_000_000,
+        StdDuration::from_secs(120),
+        StdDuration::from_secs(30),
+        5,
+    )
+    .unwrap();
+    let (constrained_archiver, constrained_server, constrained_url) =
+        asset_archiver_fixture_with_policy_and_body(
+            1,
+            constrained_policy,
+            b"\x89PNG\r\n\x1a\nnew-asset-body",
+        )
+        .await;
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_id).await;
+
+    let reference = reference(
+        "asset-capacity-failure",
+        "https://mp.weixin.qq.com/s/asset-capacity-failure",
+    );
+    let mut initial_page = page(
+        "https://mp.weixin.qq.com/s/asset-capacity-failure",
+        "Asset capacity failure",
+    );
+    initial_page.content_html = format!("<p>content</p><img src=\"{initial_url}\">");
+
+    enqueue_source_sync(&pool, source_id).await;
+    let first_lease = claim(&pool, Utc::now()).await;
+    let first_handler = handler_with_archiver(
+        pool.clone(),
+        FakeAcquirer::successful(reference.clone(), initial_page),
+        SourceSyncJobHandlerConfig::default(),
+        Some(initial_archiver),
+    );
+    assert_eq!(
+        first_handler.execute(&first_lease, Utc::now()).await,
+        JobExecution::Committed
+    );
+
+    let cached_html: String = sqlx::query_scalar(
+        "SELECT content_html FROM articles WHERE source_id = $1 AND review_id = $2",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-capacity-failure")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(cached_html.contains("/assets/"));
+
+    let mut constrained_page = page(
+        "https://mp.weixin.qq.com/s/asset-capacity-failure",
+        "Asset capacity failure",
+    );
+    constrained_page.content_html = format!("<p>new</p><img src=\"{constrained_url}\">");
+    enqueue_source_sync(&pool, source_id).await;
+    let second_lease = claim(&pool, Utc::now()).await;
+    let second_handler = handler_with_archiver(
+        pool.clone(),
+        FakeAcquirer::successful(reference, constrained_page),
+        SourceSyncJobHandlerConfig::default(),
+        Some(constrained_archiver),
+    );
+    assert_eq!(
+        second_handler.execute(&second_lease, Utc::now()).await,
+        JobExecution::Committed
+    );
+
+    let persisted_html: String = sqlx::query_scalar(
+        "SELECT content_html FROM articles WHERE source_id = $1 AND review_id = $2",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-capacity-failure")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted_html, cached_html);
+
+    let relationship_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM article_assets WHERE source_id = $1 AND review_id = $2",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-capacity-failure")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(relationship_count, 1);
+
+    initial_server
+        .await
+        .expect("initial asset fixture should serve one fetch");
+    constrained_server
+        .await
+        .expect("constrained asset fixture should serve one fetch");
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -779,6 +1052,15 @@ fn handler(
     acquirer: FakeAcquirer,
     config: SourceSyncJobHandlerConfig,
 ) -> SourceSyncJobHandler<PostgresSourceRepository, PostgresArticleRepository, FakeAcquirer> {
+    handler_with_archiver(pool, acquirer, config, None)
+}
+
+fn handler_with_archiver(
+    pool: PgPool,
+    acquirer: FakeAcquirer,
+    config: SourceSyncJobHandlerConfig,
+    asset_archiver: Option<AssetArchiveService>,
+) -> SourceSyncJobHandler<PostgresSourceRepository, PostgresArticleRepository, FakeAcquirer> {
     SourceSyncJobHandler::new(
         SourceSyncJobHandlerDependencies {
             sources: PostgresSourceRepository::new(pool.clone()),
@@ -786,9 +1068,81 @@ fn handler(
             unit_of_work: UnitOfWorkFactory::new(pool),
             acquirer,
             sync_service: werrss::application::sync_service::SyncService::new(),
+            asset_archiver,
         },
         config,
     )
+}
+
+async fn asset_archiver_fixture(
+    requests: usize,
+) -> (AssetArchiveService, tokio::task::JoinHandle<()>, String) {
+    asset_archiver_fixture_with_policy(requests, AssetCachePolicy::default()).await
+}
+
+async fn asset_archiver_fixture_with_policy(
+    requests: usize,
+    policy: AssetCachePolicy,
+) -> (AssetArchiveService, tokio::task::JoinHandle<()>, String) {
+    asset_archiver_fixture_with_policy_and_body(requests, policy, b"\x89PNG\r\n\x1a\nasset-fixture")
+        .await
+}
+
+async fn asset_archiver_fixture_with_policy_and_body(
+    requests: usize,
+    policy: AssetCachePolicy,
+    body: &'static [u8],
+) -> (AssetArchiveService, tokio::task::JoinHandle<()>, String) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("asset fixture listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("asset fixture listener should have an address");
+    let server = tokio::spawn(async move {
+        for _ in 0..requests {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("asset fixture request should connect");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("asset fixture request should be readable");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("asset fixture response headers should be writable");
+            stream
+                .write_all(body)
+                .await
+                .expect("asset fixture response body should be writable");
+        }
+    });
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("assets.example.test", address)
+        .build()
+        .expect("asset fixture client should be constructible");
+    let asset_url = "http://assets.example.test/image.png".to_owned();
+    let service = AssetArchiveService::with_client_for_test(policy, None, client);
+    (service, server, asset_url)
 }
 
 async fn create_source(factory: &UnitOfWorkFactory, source_id: SourceId) {

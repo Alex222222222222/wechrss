@@ -3,9 +3,10 @@
 //! ArchiveService is the application boundary between extracted article HTML
 //! and article persistence. It delegates HTML policy to the pure archive
 //! sanitizer, computes a stable SHA-256 content hash over the normalized HTML,
-//! and returns approved external image references for the optional asset path.
-//! Version one does not download or persist binary assets; the returned HTML
-//! therefore keeps approved external URLs in its src attributes.
+//! and returns approved external image references for the optional database
+//! asset path. This service itself does not download or persist binary assets;
+//! the caller may fetch those references and rewrite the final HTML before
+//! persistence.
 //!
 //! Responsibilities:
 //!
@@ -15,7 +16,7 @@
 //! - produce a deterministic lowercase SHA-256 hash when non-empty content is
 //!   available; and
 //! - preserve the sanitizer's first-seen, deduplicated external image URLs for
-//!   a later asset-store implementation.
+//!   the optional asset-store implementation.
 //!
 //! Non-responsibilities: browser navigation, source scheduling, XML rendering,
 //! database writes, asset downloads, URL rewriting, or deciding whether an
@@ -118,7 +119,7 @@ impl Default for ArchiveService {
     }
 }
 
-fn sha256_hex(value: &[u8]) -> String {
+pub(crate) fn sha256_hex(value: &[u8]) -> String {
     format!("{:x}", Sha256::digest(value))
 }
 

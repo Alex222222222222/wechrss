@@ -21,13 +21,16 @@ use crate::{
     acquisition::{article_page::ExtractedArticlePage, weread::WeReadArticleReference},
     application::{
         article_backfill_handler::article_backfill_job,
+        asset_archive_service::AssetArchiveService,
         source_service::SourceReader,
         sync_service::{
-            classify_acquisition_error, ClassifiedSyncFailure, SyncAcquisitionError, SyncService,
+            classify_acquisition_error, should_preserve_cached_asset_representation,
+            should_reconcile_assets, ClassifiedSyncFailure, SyncAcquisitionError, SyncService,
             SyncServiceError,
         },
         worker::{JobExecution, JobHandler},
     },
+    archive::url_rewriter::rewrite_sanitized_html,
     domain::{
         credentials::WeReadAccountId,
         job::JobType,
@@ -38,6 +41,7 @@ use crate::{
     persistence::{
         repositories::{
             article_repository::{ArticleRepository, ArticleTransactionRepository},
+            asset_repository::{AssetRepositoryError, AssetTransactionRepository},
             job_repository::{JobEnqueueTransaction, JobLease, JobOutcome, JobOutcomeTransaction},
             source_repository::SourceTransactionRepository,
             sync_run_repository::SyncRunTransactionRepository,
@@ -45,6 +49,12 @@ use crate::{
         unit_of_work::UnitOfWorkFactory,
     },
 };
+
+/// Bounds the bytes retained while a source-sync batch is prepared outside
+/// the database transaction. A source can contain many articles, so retaining
+/// every successful response until the final transaction must not scale
+/// without a bound with the number of articles.
+const MAX_PENDING_ASSET_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Article references and the account selected for their synchronization job.
 ///
@@ -183,6 +193,8 @@ pub struct SourceSyncJobHandlerDependencies<S, A, C> {
     pub acquirer: C,
     /// Normalization and archive policy.
     pub sync_service: SyncService,
+    /// Optional best-effort anonymous asset fetcher. `None` is disabled mode.
+    pub asset_archiver: Option<AssetArchiveService>,
 }
 
 /// Executes one claimed source-sync job.
@@ -447,6 +459,7 @@ where
             }
         };
         let mut prepared = Vec::with_capacity(observed.len());
+        let mut pending_asset_bytes = 0_u64;
         for (reference, page, observation_version) in observed {
             match self.dependencies.sync_service.prepare_article(
                 context.source.id(),
@@ -458,7 +471,10 @@ where
                 Ok(article) => {
                     context.stats.archived_articles =
                         context.stats.archived_articles.saturating_add(1);
-                    prepared.push(article);
+                    prepared.push(retain_asset_batch_within_memory_budget(
+                        self.archive_assets(article).await,
+                        &mut pending_asset_bytes,
+                    ));
                 }
                 Err(SyncServiceError::MissingPublishedAt | SyncServiceError::Article(_)) => {
                     tracing::debug!(
@@ -512,6 +528,29 @@ where
         unit_of_work.commit().await.map_err(|_| ())
     }
 
+    async fn archive_assets(
+        &self,
+        prepared: crate::application::sync_service::PreparedArticle,
+    ) -> crate::application::sync_service::PreparedArticle {
+        let Some(archiver) = &self.dependencies.asset_archiver else {
+            return prepared;
+        };
+        let Some(referer) = prepared.article().original_url.as_ref() else {
+            tracing::warn!(
+                review_id = %prepared.article().review_id,
+                "asset caching skipped because article referer is missing"
+            );
+            return prepared;
+        };
+        if prepared.external_assets().is_empty() {
+            return prepared;
+        }
+        let fetched = archiver
+            .fetch_assets(referer, prepared.external_assets())
+            .await;
+        prepared.with_fetched_assets(fetched)
+    }
+
     async fn persist_success(
         &self,
         lease: &JobLease,
@@ -521,10 +560,14 @@ where
     ) -> Result<(), ()> {
         let source_id = context.source.id();
         let run_id = context.run_id;
+        let asset_inputs = prepared
+            .iter()
+            .flat_map(|article| article.fetched_assets().iter().cloned())
+            .collect::<Vec<_>>();
         let mut unit_of_work = self
             .dependencies
             .unit_of_work
-            .begin()
+            .begin_with_assets(&asset_inputs)
             .await
             .map_err(|_| ())?;
         // Source-owned writes use the source row as their first lock. Source
@@ -536,20 +579,156 @@ where
         };
         let mut changed = false;
         let mut stats = context.stats;
-        {
-            let mut articles = unit_of_work.articles();
-            for article in prepared {
-                let result = articles
-                    .upsert(article.article().clone())
-                    .await
-                    .map_err(|_| ())?;
-                if result.created() {
-                    stats.articles_created = stats.articles_created.saturating_add(1);
-                } else if result.feed_visible_change() {
-                    stats.articles_updated = stats.articles_updated.saturating_add(1);
+        for prepared in prepared {
+            let article = prepared.article().clone();
+            let fetched_assets = prepared.fetched_assets().to_vec();
+            let mut article_to_persist = article.clone();
+
+            let (created, article_changed) = if let Some(archiver) =
+                &self.dependencies.asset_archiver
+            {
+                // Lock the stored observation before mutating asset
+                // relationships. The final article upsert is deliberately
+                // postponed until after asset persistence so its
+                // feed-visible result compares the final representation with
+                // the previously published representation.
+                let current_article = {
+                    let mut articles = unit_of_work.articles();
+                    articles
+                        .find_for_update(article.source_id, &article.review_id)
+                        .await
+                        .map_err(|_| ())?
+                };
+                let accepted = current_article.as_ref().is_none_or(|current| {
+                    article.observation_version >= current.observation_version()
+                });
+                if !accepted {
+                    // A delayed observation must not replace the article or
+                    // its asset relationships.
+                    (false, false)
+                } else {
+                    let current_has_cached_representation = current_article
+                        .as_ref()
+                        .is_some_and(|current| current.content_html().contains("/assets/"));
+                    let preserve_cached_representation =
+                        should_preserve_cached_asset_representation(
+                            current_article
+                                .as_ref()
+                                .map(|current| current.content_html()),
+                            prepared.external_assets().len(),
+                            fetched_assets.len(),
+                        );
+                    if preserve_cached_representation {
+                        if let Some(current) = current_article.as_ref() {
+                            tracing::warn!(
+                                source_id = %source_id,
+                                review_id = %article.review_id,
+                                fetched_assets = fetched_assets.len(),
+                                expected_assets = prepared.external_assets().len(),
+                                "asset acquisition was incomplete; preserving the previously archived article"
+                            );
+                            article_to_persist.content_html = current.content_html().to_owned();
+                            article_to_persist.content_hash =
+                                current.content_hash().map(str::to_owned);
+                        }
+                    } else if should_reconcile_assets(&article, article.observation_version) {
+                        let stored = {
+                            let mut assets = unit_of_work.assets(archiver.policy());
+                            assets
+                                .replace_for_article(
+                                    article.source_id,
+                                    &article.review_id,
+                                    &fetched_assets,
+                                )
+                                .await
+                        };
+                        match stored {
+                            Ok(stored) => {
+                                stats.archived_assets = stats.archived_assets.saturating_add(
+                                    u32::try_from(stored.len()).unwrap_or(u32::MAX),
+                                );
+                                let replacements = stored
+                                    .iter()
+                                    .map(|asset| {
+                                        (
+                                            asset.source_url().clone(),
+                                            format!("/assets/{}", asset.id()),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                let rewritten_html =
+                                    rewrite_sanitized_html(&article.content_html, &replacements);
+                                if rewritten_html != article.content_html {
+                                    article_to_persist.content_html = rewritten_html;
+                                    article_to_persist.content_hash =
+                                        Some(crate::application::archive_service::sha256_hex(
+                                            article_to_persist.content_html.as_bytes(),
+                                        ));
+                                }
+                            }
+                            Err(
+                                error @ (AssetRepositoryError::CapacityExceeded { .. }
+                                | AssetRepositoryError::AssetTooLarge { .. }
+                                | AssetRepositoryError::TooManyAssets { .. }),
+                            ) => {
+                                if current_has_cached_representation {
+                                    if let Some(current) = current_article.as_ref() {
+                                        article_to_persist.content_html =
+                                            current.content_html().to_owned();
+                                        article_to_persist.content_hash =
+                                            current.content_hash().map(str::to_owned);
+                                    }
+                                    tracing::warn!(
+                                        source_id = %source_id,
+                                        review_id = %article.review_id,
+                                        error = %error,
+                                        "asset replacement was rejected; preserving the previously archived article"
+                                    );
+                                } else {
+                                    let mut assets = unit_of_work.assets(archiver.policy());
+                                    assets
+                                        .clear_for_article(article.source_id, &article.review_id)
+                                        .await
+                                        .map_err(|_| ())?;
+                                    tracing::warn!(
+                                        source_id = %source_id,
+                                        review_id = %article.review_id,
+                                        error = %error,
+                                        "asset was not cached; article remains external and stale asset links were cleared"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    source_id = %source_id,
+                                    review_id = %article.review_id,
+                                    error = %error,
+                                    "asset persistence failed"
+                                );
+                                return Err(());
+                            }
+                        }
+                    }
+                    let result = {
+                        let mut articles = unit_of_work.articles();
+                        articles.upsert(article_to_persist).await.map_err(|_| ())?
+                    };
+                    (result.created(), result.feed_visible_change())
                 }
-                changed |= result.feed_visible_change();
+            } else {
+                let result = {
+                    let mut articles = unit_of_work.articles();
+                    articles.upsert(article_to_persist).await.map_err(|_| ())?
+                };
+                (result.created(), result.feed_visible_change())
+            };
+
+            if created {
+                stats.articles_created = stats.articles_created.saturating_add(1);
+            } else if article_changed {
+                stats.articles_updated = stats.articles_updated.saturating_add(1);
             }
+            changed |= article_changed;
         }
 
         let feed_revision = if changed {
@@ -804,6 +983,32 @@ where
     }
 }
 
+fn retain_asset_batch_within_memory_budget(
+    prepared: crate::application::sync_service::PreparedArticle,
+    pending_asset_bytes: &mut u64,
+) -> crate::application::sync_service::PreparedArticle {
+    let fetched_bytes = prepared
+        .fetched_assets()
+        .iter()
+        .map(|asset| asset.bytes.len() as u64)
+        .sum::<u64>();
+    let available = MAX_PENDING_ASSET_BYTES.saturating_sub(*pending_asset_bytes);
+    if fetched_bytes > available {
+        tracing::warn!(
+            source_id = %prepared.article().source_id,
+            review_id = %prepared.article().review_id,
+            fetched_bytes,
+            pending_asset_bytes = *pending_asset_bytes,
+            limit = MAX_PENDING_ASSET_BYTES,
+            "source-sync asset memory budget exhausted; leaving this article's assets external"
+        );
+        prepared.with_fetched_assets(Vec::new())
+    } else {
+        *pending_asset_bytes = (*pending_asset_bytes).saturating_add(fetched_bytes);
+        prepared
+    }
+}
+
 enum SourceSyncExecutionError {
     BeforeRun(JobExecution),
     AfterRun {
@@ -945,10 +1150,17 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     use super::*;
-    use crate::acquisition::weread::WeReadAdapterError;
     use crate::domain::job::{Job, NewJob};
     use crate::domain::sync::SyncFailureClass;
+    use crate::{
+        acquisition::{
+            article_page::ExtractedArticlePage,
+            weread::{WeReadAdapterError, WeReadArticleReference},
+        },
+        archive::asset_store::AssetInput,
+    };
     use serde_json::json;
+    use url::Url;
     use uuid::Uuid;
 
     fn at(seconds: i64) -> DateTime<Utc> {
@@ -1063,6 +1275,59 @@ mod tests {
         ));
         assert_eq!(error.outcome(), SyncOutcome::Failed);
         assert_eq!(error.failure().class(), SyncFailureClass::Permanent);
+    }
+
+    #[test]
+    fn drops_fetched_assets_that_would_exceed_the_source_batch_memory_bound() {
+        let reference = WeReadArticleReference {
+            review_id: "asset-memory-bound".to_owned(),
+            article_url: Some(
+                "https://mp.weixin.qq.com/s/asset-memory-bound"
+                    .parse()
+                    .unwrap(),
+            ),
+            title: Some("Asset memory bound".to_owned()),
+            summary: None,
+            author: None,
+            cover_url: None,
+            published_at: Some(at(1)),
+        };
+        let page = ExtractedArticlePage {
+            canonical_url: "https://mp.weixin.qq.com/s/asset-memory-bound"
+                .parse()
+                .unwrap(),
+            title: "Asset memory bound".to_owned(),
+            author: None,
+            summary: None,
+            published_at: Some(at(1)),
+            content_html: "<p>body</p><img src=\"https://cdn.example/image.png\">".to_owned(),
+            cover_url: None,
+        };
+        let prepared = SyncService::new()
+            .prepare_article(
+                SourceId::from_uuid(Uuid::from_u128(1)),
+                &reference,
+                page,
+                crate::domain::article::ArticleObservationVersion::from_u64(1),
+                at(2),
+            )
+            .unwrap()
+            .with_fetched_assets(vec![AssetInput::new(
+                Url::parse("https://cdn.example/image.png").unwrap(),
+                Url::parse("https://cdn.example/image.png").unwrap(),
+                "image/png".to_owned(),
+                vec![0, 1],
+                0,
+                Url::parse("https://mp.weixin.qq.com/s/asset-memory-bound").unwrap(),
+                Some("https://mp.weixin.qq.com".to_owned()),
+                None,
+            )]);
+        let mut pending_asset_bytes = MAX_PENDING_ASSET_BYTES - 1;
+
+        let retained = retain_asset_batch_within_memory_budget(prepared, &mut pending_asset_bytes);
+
+        assert!(retained.fetched_assets().is_empty());
+        assert_eq!(pending_asset_bytes, MAX_PENDING_ASSET_BYTES - 1);
     }
 
     fn claimed_job(

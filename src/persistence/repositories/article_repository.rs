@@ -15,15 +15,17 @@
 //! - allocate an observation version before upstream work starts;
 //! - refresh observation timestamps without bumping the feed revision for a
 //!   feed-invisible no-op; and
+//! - lock an existing article observation before a caller performs a
+//!   multi-step representation rewrite;
 //! - expose transaction-scoped upserts for the shared `UnitOfWork`.
 //!
 //! Non-responsibilities: fetching WeRead or WeChat pages, sanitizing HTML,
 //! downloading assets, rendering RSS XML, or advancing `sources.feed_revision`.
 //! The caller must sanitize `content_html` before persistence and must bump the
 //! source revision in the same unit of work when the returned result reports a
-//! feed-visible change. Version one intentionally has no asset table; cover
-//! and content URLs remain external values until optional asset archiving is
-//! added.
+//! feed-visible change. Asset download and relationship persistence belong to
+//! the transaction-scoped asset view; this repository only stores the final
+//! article representation.
 //!
 //! Upsert behavior is idempotent. Existing rows are locked before comparison;
 //! observations older than the stored monotonic version are ignored so a
@@ -191,6 +193,18 @@ impl ArticleRepository for PostgresArticleRepository {
 /// Operations on article rows inside the shared application transaction.
 #[async_trait::async_trait]
 pub trait ArticleTransactionRepository {
+    /// Locks one article row for an observation without changing its content.
+    ///
+    /// Asset-enabled synchronization uses this read-before-write boundary to
+    /// decide whether an observation is stale while keeping the previously
+    /// published representation available for the final upsert. The lock is
+    /// held by the surrounding unit of work until commit or rollback.
+    async fn find_for_update(
+        &mut self,
+        source_id: SourceId,
+        review_id: &str,
+    ) -> Result<Option<Article>, ArticleRepositoryError>;
+
     /// Inserts or updates one article and reports RSS-visible change.
     async fn upsert(
         &mut self,
@@ -219,6 +233,24 @@ impl<'borrow, 'pool> PostgresArticleTransaction<'borrow, 'pool> {
 
 #[async_trait::async_trait]
 impl ArticleTransactionRepository for PostgresArticleTransaction<'_, '_> {
+    async fn find_for_update(
+        &mut self,
+        source_id: SourceId,
+        review_id: &str,
+    ) -> Result<Option<Article>, ArticleRepositoryError> {
+        let review_id = validate_key(source_id, review_id)?;
+        sqlx::query(&format!(
+            "SELECT {ARTICLE_COLUMNS} FROM articles WHERE source_id = $1 AND review_id = $2 FOR UPDATE"
+        ))
+        .bind(source_id.as_uuid())
+        .bind(review_id)
+        .fetch_optional(&mut **self.transaction()?)
+        .await
+        .map_err(storage_error)?
+        .map(decode_article)
+        .transpose()
+    }
+
     async fn upsert(
         &mut self,
         article: NewArticle,

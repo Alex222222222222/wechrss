@@ -197,17 +197,36 @@ allow lazy page content to settle; they are not an anti-detection mechanism.
 | `SCROLL_MAX_PIXELS` | `4000` | Maximum cumulative CSS-pixel scroll distance per article page. Valid range: `1`–`1000000`. |
 | `SCROLL_MAX_OPERATION_SECONDS` | `30` | Maximum duration of one page interaction and scroll operation. It must be positive and no greater than one hour. |
 
-### Optional asset archiving
+### Asset caching
+
+The detailed, implementation-neutral contract is in
+[docs/ASSET_CACHING.md](docs/ASSET_CACHING.md). Asset caching is disabled by
+default. With the `database` backend, the worker fetches approved article
+images using a separate anonymous HTTP request with the article `Referer`,
+derived `Origin`, and configured User-Agent, validates the media type and
+signature, stores/deduplicates the bytes in PostgreSQL, and rewrites the
+article HTML to stable `/assets/{id}` paths. WeChat/WeRead cookies are never
+sent to asset hosts. Local-directory and S3 backends, and automatic repair
+jobs for evicted bytes, remain future work.
 
 | Variable | Default | Explanation |
 | --- | --- | --- |
-| `ASSET_ARCHIVE_BACKEND` | `disabled` | Asset mode: `disabled` keeps approved external URLs, `local` writes to a local directory, or `s3` uses an S3-compatible object store. |
-| `ASSET_ARCHIVE_LOCAL_PATH` | Unset | Required when the backend is `local`; persistent directory for archived binary assets. |
-| `ASSET_ARCHIVE_S3_ENDPOINT` | Unset | Required when the backend is `s3`; credential-free HTTP(S) S3-compatible endpoint. |
-| `ASSET_ARCHIVE_S3_BUCKET` | Unset | Required when the backend is `s3`; object-store bucket name. |
-| `ASSET_ARCHIVE_S3_REGION` | Unset | Required when the backend is `s3`; region or signing scope. |
-| `ASSET_ARCHIVE_S3_ACCESS_KEY` | Unset | Required when the backend is `s3`; object-store access key. Store it as a secret. |
-| `ASSET_ARCHIVE_S3_SECRET_KEY` | Unset | Required when the backend is `s3`; object-store secret key. Store it as a secret. |
+| `ASSET_ARCHIVE_BACKEND` | `disabled` | `disabled` keeps approved external URLs. `database` (or `postgres`) stores bytes and URL/version metadata in PostgreSQL. `local` and `s3` are not implemented and are rejected. |
+| `ASSET_CACHE_MAX_SIZE_MB` | `5000` | Aggregate limit for cached raw binary bytes, in decimal megabytes. `0` disables size-based eviction. |
+| `ASSET_CACHE_MAX_AGE_DAYS` | `30` | Maximum idle age since the last successful asset read before bytes are evicted. `0` disables age-based eviction. |
+| `ASSET_MAX_SIZE_MB` | `10` | Maximum size of one downloaded asset, in decimal megabytes. It is always enforced. |
+| `ASSET_MAX_COUNT_PER_ARTICLE` | `100` | Maximum number of assets fetched while processing one article. Excess assets remain external. |
+| `ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB` | `100` | Aggregate response-byte budget for one article, in decimal megabytes. Excess assets remain external. |
+| `ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS` | `120` | Wall-clock budget for fetching assets for one article. Excess assets remain external. |
+| `ASSET_FETCH_TIMEOUT_SECONDS` | `30` | Timeout for one asset request, including redirects and body transfer. |
+| `ASSET_MAX_REDIRECTS` | `5` | Maximum number of redirects followed for one asset request. |
+
+The database backend runs a best-effort maintenance pass hourly in the runtime
+supervisor. Age and size eviction clear only binary data and mark the retained
+URL/version metadata as `missing`; orphan cleanup removes records and blobs
+that no longer have an article relationship. A missing asset currently returns
+`503` with `Retry-After: 60`; repair-job admission and automatic re-fetching are
+planned follow-up work.
 
 ### Administration and encryption
 
@@ -257,10 +276,15 @@ included in the current runtime. The responsive administrator UI polish and the
 English, French, and Simplified Chinese panel translations are also included in
 the current panel. The remaining roadmap items are future work:
 
-1. **Persist archived assets and rewrite feed URLs.** Store approved media in
-   local or object storage so archived articles can remain useful when
-   upstream assets change or disappear.
-2. **Evaluate PGMQ as a queue transport optimization.** The current custom
+1. **Repair missing archived assets automatically.** The current database
+   cache retains URL metadata and returns a retryable miss after eviction;
+   durable repair jobs can re-fetch public assets with bounded admission,
+   retry, and circuit-breaker policies. The contract is documented in
+   [docs/ASSET_CACHING.md](docs/ASSET_CACHING.md).
+2. **Add local-directory and S3-compatible asset backends.** These can make
+   binary storage easier to operate at larger scale while preserving the
+   database metadata and stable asset IDs.
+3. **Evaluate PGMQ as a queue transport optimization.** The current custom
    `jobs` table remains the version-one transport; PGMQ can be evaluated later
    if queue throughput or operational overhead becomes a demonstrated
    bottleneck.
